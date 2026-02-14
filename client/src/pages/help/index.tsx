@@ -39,7 +39,7 @@ export const Help = () => {
           filamentCreateLink: <Link to="/filament/create" />,
           spoolCreateLink: <Link to="/spool/create" />,
           vendorCreateLink: <Link to="/vendor/create" />,
-          readmeLink: <Link to="https://github.com/Donkie/Spoolman#integration-status" target="_blank" />,
+          readmeLink: <Link to="https://github.com/OlyForge3D/Spoolman#integration-status" target="_blank" />,
           itemsHelp: (
             <List
               itemLayout="horizontal"
