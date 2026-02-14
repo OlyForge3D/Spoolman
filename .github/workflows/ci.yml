@@ -393,4 +393,4 @@ jobs:
           tag_name: ${{ github.ref_name }}
           files: /tmp/spoolman/spoolman.zip
           token: ${{ secrets.GITHUB_TOKEN }}
-          body: "⚠️ TODO ⚠️"
+          generate_release_notes: true
