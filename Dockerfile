@@ -6,7 +6,7 @@ ENV UV_NO_DEV=1
 ENV UV_PYTHON_DOWNLOADS=0
 
 # Install system dependencies
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     g++ \
     python3-dev \
     libpq-dev \
@@ -14,8 +14,8 @@ RUN apt-get update && apt-get install -y \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Install UV
-RUN pip install --no-cache-dir uv
+# Install UV from official image (pinned version for reproducibility)
+COPY --from=ghcr.io/astral-sh/uv:0.6 /uv /uvx /bin/
 
 # Install dependencies
 WORKDIR /home/app/spoolman
@@ -25,26 +25,24 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-install-project
 
 # Copy and install app
-COPY --chown=app:app migrations /home/app/spoolman/migrations
-COPY --chown=app:app spoolman /home/app/spoolman/spoolman
-COPY --chown=app:app alembic.ini README.md uv.lock pyproject.toml /home/app/spoolman/
+COPY migrations /home/app/spoolman/migrations
+COPY spoolman /home/app/spoolman/spoolman
+COPY alembic.ini README.md uv.lock pyproject.toml /home/app/spoolman/
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked
 
 FROM python:3.14-slim-bookworm AS python-runner
 
-LABEL org.opencontainers.image.source=https://github.com/Donkie/Spoolman
+LABEL org.opencontainers.image.source=https://github.com/OlyForge3D/Spoolman
 LABEL org.opencontainers.image.description="Keep track of your inventory of 3D-printer filament spools."
 LABEL org.opencontainers.image.licenses=MIT
 
-# Install gosu for privilege dropping
-RUN apt-get update && apt-get install -y \
+# Install gosu and set up non-root user
+RUN apt-get update && apt-get install -y --no-install-recommends \
     gosu \
     && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
-
-# Add local user so we don't run as root
-RUN groupmod -g 1000 users \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupmod -g 1000 users \
     && useradd -u 1000 -U app \
     && usermod -G users app \
     && mkdir -p /home/app/.local/share/spoolman \
@@ -56,8 +54,7 @@ COPY --chown=app:app ./client/dist /home/app/spoolman/client/dist
 # Copy built app
 COPY --chown=app:app --from=python-builder /home/app/spoolman /home/app/spoolman
 
-COPY entrypoint.sh /home/app/spoolman/entrypoint.sh
-RUN chmod +x /home/app/spoolman/entrypoint.sh
+COPY --chmod=755 entrypoint.sh /home/app/spoolman/entrypoint.sh
 
 WORKDIR /home/app/spoolman
 
