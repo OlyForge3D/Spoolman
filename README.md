@@ -24,6 +24,7 @@ Spoolman is a self-hosted web service designed to help you efficiently manage yo
   * Print labels with QR codes for easy spool identification and tracking.
   * Contribute to its translation into 18 languages via [Weblate](https://hosted.weblate.org/projects/spoolman/).
 * **Database Support**: SQLite, PostgreSQL, MySQL, and CockroachDB.
+* **Platform Support**: Docker images available for `linux/amd64` and `linux/arm64`. (Note: `armv7` is not supported.)
 * **Multi-Printer Management**: Handles spool updates from several printers simultaneously.
 * **Advanced Monitoring**: Integrate with [Prometheus](https://prometheus.io/) for detailed historical analysis of filament usage, helping you track and optimize your printing processes. See the [Wiki](https://github.com/OlyForge3D/Spoolman/wiki/Filament-Usage-History) for instructions on how to set it up.
 
