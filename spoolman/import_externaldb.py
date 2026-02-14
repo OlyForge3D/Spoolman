@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
 
 from spoolman import externaldb
 from spoolman.api.v1.models import MultiColorDirection
@@ -18,7 +21,7 @@ logger = logging.getLogger(__name__)
 def _normalize_hex(value: str | None) -> str | None:
     if not value:
         return None
-    return value[1:] if value.startswith("#") else value
+    return value.removeprefix("#")
 
 
 async def import_external_filaments(

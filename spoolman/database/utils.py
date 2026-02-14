@@ -93,17 +93,17 @@ def add_where_clause_search(
     """Add a where clause for a general search across multiple string fields."""
     if value is not None:
         conditions = []
-        for value_part in value.split(","):
-            value_part = value_part.strip()
-            if len(value_part) == 0:
+        for raw_part in value.split(","):
+            part = raw_part.strip()
+            if len(part) == 0:
                 continue
-            # Do exact match if value_part is surrounded by quotes
-            if value_part[0] == '"' and value_part[-1] == '"':
-                term = value_part[1:-1]
+            # Do exact match if part is surrounded by quotes
+            if part[0] == '"' and part[-1] == '"':
+                term = part[1:-1]
                 conditions.append(sqlalchemy.or_(*[field == term for field in fields]))
             # Do prefix match for better index usage
             else:
-                pattern = f"{value_part}%"
+                pattern = f"{part}%"
                 conditions.append(sqlalchemy.or_(*[field.ilike(pattern) for field in fields]))
 
         if conditions:
