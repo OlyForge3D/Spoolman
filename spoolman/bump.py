@@ -45,7 +45,7 @@ def bump() -> None:
     )
 
     # Commit the changes
-    subprocess.run(["git", "commit", "-m", f"Bump version to {new_version}"], cwd=project_root, check=True)
+    subprocess.run(["git", "commit", "-m", f"Bump version to {new_version} [skip ci]"], cwd=project_root, check=True)
 
     # Tag the commit, prefix with "v"
     subprocess.run(["git", "tag", f"v{new_version}"], cwd=project_root, check=True)
