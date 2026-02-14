@@ -364,6 +364,11 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
       - name: Download built spoolman
         uses: actions/download-artifact@v4.1.7
         with:
@@ -379,6 +384,32 @@ jobs:
             "version": "${{ github.ref_name }}"
           }' > release_info.json
 
+      - name: Generate changelog from commits
+        id: changelog
+        run: |
+          # Get previous tag
+          CURRENT_TAG="${{ github.ref_name }}"
+          PREVIOUS_TAG=$(git tag --sort=-version:refname | grep -A1 "^${CURRENT_TAG}$" | tail -1)
+          
+          if [ -z "$PREVIOUS_TAG" ] || [ "$PREVIOUS_TAG" = "$CURRENT_TAG" ]; then
+            echo "No previous tag found, using all commits"
+            COMMITS=$(git log --pretty=format:"- %s" $CURRENT_TAG)
+          else
+            echo "Generating changelog from $PREVIOUS_TAG to $CURRENT_TAG"
+            COMMITS=$(git log --pretty=format:"- %s" ${PREVIOUS_TAG}..${CURRENT_TAG} | grep -v "Bump version to" | grep -v "\[skip ci\]")
+          fi
+          
+          # Build release notes
+          {
+            echo "## What's Changed"
+            echo ""
+            echo "$COMMITS"
+            echo ""
+            echo "**Full Changelog**: https://github.com/OlyForge3D/Spoolman/compare/${PREVIOUS_TAG}...${CURRENT_TAG}"
+          } > /tmp/release_notes.md
+          
+          cat /tmp/release_notes.md
+
       - name: Zip
         run: |
           cd /tmp/spoolman
@@ -393,4 +424,4 @@ jobs:
           tag_name: ${{ github.ref_name }}
           files: /tmp/spoolman/spoolman.zip
           token: ${{ secrets.GITHUB_TOKEN }}
-          generate_release_notes: true
+          body_path: /tmp/release_notes.md
