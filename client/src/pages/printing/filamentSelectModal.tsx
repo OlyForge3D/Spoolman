@@ -33,28 +33,28 @@ const FilamentSelectModal = ({ description, initialSelectedIds, onExport, onPrin
 
   const { tableProps, sorters, filters, setFilters, currentPage, pageSize, setCurrentPage, setPageSize } =
     useTable<IFilamentCollapsed>({
-    resource: "filament",
-    syncWithLocation: false,
-    pagination: {
-      mode: "server",
-      currentPage: 1,
-      pageSize: 50,
-    },
-    sorters: {
-      mode: "server",
-    },
-    filters: {
-      mode: "server",
-    },
-    queryOptions: {
-      select(data) {
-        return {
-          total: data.total,
-          data: data.data.map(collapseFilament),
-        };
+      resource: "filament",
+      syncWithLocation: false,
+      pagination: {
+        mode: "server",
+        currentPage: 1,
+        pageSize: 50,
       },
-    },
-  });
+      sorters: {
+        mode: "server",
+      },
+      filters: {
+        mode: "server",
+      },
+      queryOptions: {
+        select(data) {
+          return {
+            total: data.total,
+            data: data.data.map(collapseFilament),
+          };
+        },
+      },
+    });
 
   const tableState: TableState = {
     sorters,
@@ -68,7 +68,7 @@ const FilamentSelectModal = ({ description, initialSelectedIds, onExport, onPrin
   );
   const selectedSet = useMemo(() => new Set(selectedItems), [selectedItems]);
 
-  const paginationTotal = tableProps.pagination ? tableProps.pagination.total ?? 0 : 0;
+  const paginationTotal = tableProps.pagination ? (tableProps.pagination.total ?? 0) : 0;
   const handlePageChange = (page: number, nextPageSize?: number) => {
     if (typeof nextPageSize === "number" && nextPageSize !== pageSize) {
       setPageSize(nextPageSize);

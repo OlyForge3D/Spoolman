@@ -53,33 +53,33 @@ const SpoolSelectModal = ({ description, initialSelectedIds, onExport, onPrint }
 
   const { tableProps, sorters, filters, setFilters, currentPage, pageSize, setCurrentPage, setPageSize } =
     useTable<ISpoolCollapsed>({
-    resource: "spool",
-    meta: {
-      queryParams: {
-        ["allow_archived"]: showArchived,
+      resource: "spool",
+      meta: {
+        queryParams: {
+          ["allow_archived"]: showArchived,
+        },
       },
-    },
-    syncWithLocation: false,
-    pagination: {
-      mode: "server",
-      currentPage: 1,
-      pageSize: 50,
-    },
-    sorters: {
-      mode: "server",
-    },
-    filters: {
-      mode: "server",
-    },
-    queryOptions: {
-      select(data) {
-        return {
-          total: data.total,
-          data: data.data.map(collapseSpool),
-        };
+      syncWithLocation: false,
+      pagination: {
+        mode: "server",
+        currentPage: 1,
+        pageSize: 50,
       },
-    },
-  });
+      sorters: {
+        mode: "server",
+      },
+      filters: {
+        mode: "server",
+      },
+      queryOptions: {
+        select(data) {
+          return {
+            total: data.total,
+            data: data.data.map(collapseSpool),
+          };
+        },
+      },
+    });
 
   // Store state in local storage
   const tableState: TableState = {
@@ -108,7 +108,7 @@ const SpoolSelectModal = ({ description, initialSelectedIds, onExport, onPrint }
     });
   }, [dataSource]);
 
-  const paginationTotal = tableProps.pagination ? tableProps.pagination.total ?? 0 : 0;
+  const paginationTotal = tableProps.pagination ? (tableProps.pagination.total ?? 0) : 0;
   const handlePageChange = (page: number, nextPageSize?: number) => {
     if (typeof nextPageSize === "number" && nextPageSize !== pageSize) {
       setPageSize(nextPageSize);
