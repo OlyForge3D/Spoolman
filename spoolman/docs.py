@@ -67,7 +67,21 @@ def generate_docs() -> None:
             <script src="https://cdn.jsdelivr.net/npm/redoc/bundles/redoc.standalone.js"> </script>
             <script>
                 var spec = {spec};
-                Redoc.init(spec, {{}}, document.getElementById("redoc-container"));
+                var isDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+                var theme = isDark ? {{
+                    colors: {{
+                        primary: {{ main: '#dc7734' }},
+                        text: {{ primary: '#e0e0e0', secondary: '#b0b0b0' }},
+                        http: {{ get: '#6bbd5b', post: '#248fb2', put: '#9b708b', delete: '#e27a7a' }}
+                    }},
+                    schema: {{ nestedBackground: '#1a1a1a' }},
+                    rightPanel: {{ backgroundColor: '#1a1a1a' }},
+                    typography: {{ headings: {{ fontFamily: 'Montserrat, sans-serif' }} }}
+                }} : {{}};
+                Redoc.init(spec, {{ theme: theme }}, document.getElementById("redoc-container"));
+                if (isDark) {{
+                    document.body.style.backgroundColor = '#1e1e1e';
+                }}
             </script>
         </body>
         </html>""",
