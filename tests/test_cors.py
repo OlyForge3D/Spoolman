@@ -136,8 +136,9 @@ def test_cors_allow_credentials_one():
 
 
 def test_cors_allow_credentials_invalid_raises():
-    with mock.patch.dict(os.environ, {"SPOOLMAN_CORS_ALLOW_CREDENTIALS": "INVALID"}), pytest.raises(
-        ValueError, match="SPOOLMAN_CORS_ALLOW_CREDENTIALS"
+    with (
+        mock.patch.dict(os.environ, {"SPOOLMAN_CORS_ALLOW_CREDENTIALS": "INVALID"}),
+        pytest.raises(ValueError, match="SPOOLMAN_CORS_ALLOW_CREDENTIALS"),
     ):
         env.get_cors_allow_credentials()
 
@@ -156,7 +157,8 @@ def test_cors_max_age_custom():
 
 
 def test_cors_max_age_invalid_raises():
-    with mock.patch.dict(os.environ, {"SPOOLMAN_CORS_MAX_AGE": "not_a_number"}), pytest.raises(
-        ValueError, match="SPOOLMAN_CORS_MAX_AGE"
+    with (
+        mock.patch.dict(os.environ, {"SPOOLMAN_CORS_MAX_AGE": "not_a_number"}),
+        pytest.raises(ValueError, match="SPOOLMAN_CORS_MAX_AGE"),
     ):
         env.get_cors_max_age()
