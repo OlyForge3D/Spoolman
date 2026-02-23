@@ -123,10 +123,11 @@ def add_cors_middleware() -> None:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=origins,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-        expose_headers=["X-Total-Count"],
+        allow_credentials=env.get_cors_allow_credentials(),
+        allow_methods=env.get_cors_allow_methods(),
+        allow_headers=env.get_cors_allow_headers(),
+        expose_headers=env.get_cors_expose_headers(),
+        max_age=env.get_cors_max_age(),
     )
 
 

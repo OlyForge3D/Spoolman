@@ -230,13 +230,95 @@ def get_cors_origin() -> list[str] | None:
     Returns None if no environment variable was set for the origin.
 
     Returns:
-        Optional[str]: The origin.
+        Optional[list[str]]: The origins.
 
     """
     cors = os.getenv("SPOOLMAN_CORS_ORIGIN")
     if cors is None:
         return None
-    return cors.split(",")
+    return [origin.strip() for origin in cors.split(",")]
+
+
+def get_cors_allow_methods() -> list[str]:
+    """Get the CORS allowed methods from environment variables.
+
+    Returns ["*"] if no environment variable was set.
+
+    Returns:
+        list[str]: The allowed methods.
+
+    """
+    methods = os.getenv("SPOOLMAN_CORS_ALLOW_METHODS")
+    if methods is None:
+        return ["*"]
+    return [m.strip() for m in methods.split(",")]
+
+
+def get_cors_allow_headers() -> list[str]:
+    """Get the CORS allowed headers from environment variables.
+
+    Returns ["*"] if no environment variable was set.
+
+    Returns:
+        list[str]: The allowed headers.
+
+    """
+    headers = os.getenv("SPOOLMAN_CORS_ALLOW_HEADERS")
+    if headers is None:
+        return ["*"]
+    return [h.strip() for h in headers.split(",")]
+
+
+def get_cors_expose_headers() -> list[str]:
+    """Get the CORS exposed headers from environment variables.
+
+    Returns ["X-Total-Count"] if no environment variable was set.
+
+    Returns:
+        list[str]: The exposed headers.
+
+    """
+    headers = os.getenv("SPOOLMAN_CORS_EXPOSE_HEADERS")
+    if headers is None:
+        return ["X-Total-Count"]
+    return [h.strip() for h in headers.split(",")]
+
+
+def get_cors_allow_credentials() -> bool:
+    """Get whether CORS allows credentials from environment variables.
+
+    Returns True if no environment variable was set.
+
+    Returns:
+        bool: Whether credentials are allowed.
+
+    """
+    creds = os.getenv("SPOOLMAN_CORS_ALLOW_CREDENTIALS", "TRUE").upper()
+    if creds in {"FALSE", "0"}:
+        return False
+    if creds in {"TRUE", "1"}:
+        return True
+    raise ValueError(
+        f"Failed to parse SPOOLMAN_CORS_ALLOW_CREDENTIALS variable: Unknown value '{creds}'.",
+    )
+
+
+def get_cors_max_age() -> int:
+    """Get the CORS max age (in seconds) from environment variables.
+
+    Returns 600 if no environment variable was set.
+
+    Returns:
+        int: The max age in seconds.
+
+    """
+    max_age = os.getenv("SPOOLMAN_CORS_MAX_AGE")
+    if max_age is None:
+        return 600
+    try:
+        return int(max_age)
+    except ValueError as exc:
+        raise ValueError(f"Failed to parse SPOOLMAN_CORS_MAX_AGE variable: {exc!s}") from exc
 
 
 def is_automatic_backup_enabled() -> bool:
