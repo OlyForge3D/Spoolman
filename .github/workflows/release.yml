@@ -1,0 +1,456 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        type: choice
+        description: Version to bump
+        required: true
+        default: minor
+        options:
+          - micro
+          - minor
+          - major
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  GHCR_IMAGE: olyforge3d/spoolman
+
+jobs:
+  #
+  # Bump version, commit, tag, and push
+  #
+  bump-version:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.get-tag.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.PAT }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.9.26"
+
+      - name: "Set up Python"
+        uses: actions/setup-python@v6
+        with:
+          python-version-file: "pyproject.toml"
+
+      - name: Install node
+        uses: actions/setup-node@v4.0.3
+        with:
+          node-version: '20'
+
+      - name: Bump version
+        run: |
+          git config --global user.name "${GITHUB_ACTOR}"
+          git config --global user.email "${GITHUB_ACTOR_ID}+${GITHUB_ACTOR}@users.noreply.github.com"
+          uv run poe bump ${{ github.event.inputs.bump }}
+
+      - name: Get tag
+        id: get-tag
+        run: |
+          TAG=$(git describe --tags --abbrev=0)
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Release tag: $TAG"
+
+      - name: Push
+        run: |
+          TAG=${{ steps.get-tag.outputs.tag }}
+          echo "Pushing branch master and tag $TAG"
+          git push --atomic origin master "$TAG"
+
+  #
+  # Linting
+  #
+  style:
+    needs: [bump-version]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.bump-version.outputs.tag }}
+
+      - name: Install node
+        uses: actions/setup-node@v4.0.3
+        with:
+          node-version: '20'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.9.26"
+
+      - name: "Set up Python"
+        uses: actions/setup-python@v6
+        with:
+          python-version-file: "pyproject.toml"
+
+      - name: Install lefthook
+        run: uv add --dev lefthook
+
+      - name: Install client dependencies
+        run: |
+          cd client
+          npm ci
+
+      - name: Run pre-commit
+        run: uv run lefthook run ci
+
+  #
+  # Build the Spoolman client for baking into the docker images
+  #
+  build-client:
+    needs: [bump-version]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.bump-version.outputs.tag }}
+
+      - name: Install node
+        uses: actions/setup-node@v4.0.3
+        with:
+          node-version: '20'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.9.26"
+
+      - name: "Set up Python"
+        uses: actions/setup-python@v6
+        with:
+          python-version-file: "pyproject.toml"
+
+      - name: Install client dependencies
+        run: |
+          cd client
+          npm ci
+
+      - name: Build
+        run: |
+          cd client
+          rm -f .env && echo "VITE_APIURL=/api/v1" > .env.production
+          npm run build
+
+      - name: Write build info
+        run: |
+          echo "GIT_COMMIT=$(git rev-parse --short HEAD)" > build.txt
+          echo "BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> build.txt
+
+      # Remove client source and keep only the built dist
+      - name: Clean
+        run: |
+          mv client/dist dist
+          rm -rf client
+          mkdir client
+          mv dist client/dist
+          rm -rf .git
+          rm -rf .venv
+
+      - name: Fix permissions
+        run: |
+          chmod +x scripts/*.sh
+
+      - name: Upload client Spoolman artifact
+        uses: actions/upload-artifact@v4.4.0
+        with:
+          name: client
+          path: client/dist
+
+      - name: Upload full Spoolman artifact
+        uses: actions/upload-artifact@v4.4.0
+        with:
+          include-hidden-files: true
+          name: spoolman
+          path: .
+
+  #
+  # Build native image for integration tests
+  #
+  build-amd64:
+    needs: [bump-version, build-client]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.bump-version.outputs.tag }}
+
+      - name: Download client
+        uses: actions/download-artifact@v4.1.7
+        with:
+          name: client
+          path: client/dist
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3.6.1
+
+      - name: Log in to the Github Container registry
+        uses: docker/login-action@v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Spoolman
+        uses: docker/build-push-action@v6.7.0
+        with:
+          context: .
+          tags: ${{ env.GHCR_IMAGE }}:test
+          outputs: type=docker,dest=/tmp/spoolman.tar
+          cache-from: type=registry,ref=ghcr.io/${{ env.GHCR_IMAGE }}:buildcache-amd64
+          cache-to: type=registry,ref=ghcr.io/${{ env.GHCR_IMAGE }}:buildcache-amd64,mode=max
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4.4.0
+        with:
+          name: spoolman-image
+          path: /tmp/spoolman.tar
+
+  #
+  # Build tester image for integration tests
+  #
+  build-tester:
+    needs: [bump-version]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.bump-version.outputs.tag }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3.6.1
+
+      - name: Log in to the Github Container registry
+        uses: docker/login-action@v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Spoolman Tester
+        uses: docker/build-push-action@v6.7.0
+        with:
+          context: ./tests_integration
+          tags: ${{ env.GHCR_IMAGE }}-tester:latest
+          outputs: type=docker,dest=/tmp/spoolman-tester.tar
+          cache-from: type=registry,ref=ghcr.io/${{ env.GHCR_IMAGE }}:buildcache-tester
+          cache-to: type=registry,ref=ghcr.io/${{ env.GHCR_IMAGE }}:buildcache-tester,mode=max
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4.4.0
+        with:
+          name: spoolman-tester-image
+          path: /tmp/spoolman-tester.tar
+
+  #
+  # Perform integration tests
+  #
+  test:
+    needs: [build-amd64, build-tester]
+    strategy:
+      matrix:
+        dbtype: ["postgres", "sqlite", "mariadb", "cockroachdb"]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download built images
+        uses: actions/download-artifact@v4.1.7
+        with:
+          pattern: spoolman*-image
+          path: /tmp
+
+      - name: Load built images
+        run: |
+          docker load --input /tmp/spoolman-image/spoolman.tar
+          docker load --input /tmp/spoolman-tester-image/spoolman-tester.tar
+
+      - name: Perform integration tests
+        uses: hoverkraft-tech/compose-action@v2.0.1
+        with:
+          compose-file: "./tests_integration/docker-compose-${{ matrix.dbtype }}.yml"
+          up-flags: "--abort-on-container-exit"
+          down-flags: "--volumes"
+
+  #
+  # Build arm64 image (only needed for publishing multi-arch)
+  #
+  build-arm64:
+    needs: [bump-version, build-client]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.bump-version.outputs.tag }}
+
+      - name: Download client
+        uses: actions/download-artifact@v4.1.7
+        with:
+          name: client
+          path: client/dist
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3.2.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3.6.1
+
+      - name: Log in to the Github Container registry
+        uses: docker/login-action@v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and cache Docker image
+        uses: docker/build-push-action@v6.7.0
+        with:
+          context: .
+          platforms: linux/arm64
+          cache-from: type=registry,ref=ghcr.io/${{ env.GHCR_IMAGE }}:buildcache-arm64
+          cache-to: type=registry,ref=ghcr.io/${{ env.GHCR_IMAGE }}:buildcache-arm64,mode=max
+
+  #
+  # Publish multi-arch images to GHCR
+  #
+  publish-images:
+    needs: [bump-version, test, build-amd64, build-arm64, style, build-client]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.bump-version.outputs.tag }}
+
+      - name: Download client
+        uses: actions/download-artifact@v4.1.7
+        with:
+          name: client
+          path: client/dist
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3.2.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3.6.1
+
+      - name: Log in to the Github Container registry
+        uses: docker/login-action@v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels) for GHCR
+        id: meta-ghcr
+        uses: docker/metadata-action@v5.5.1
+        with:
+          images: |
+            ghcr.io/${{ env.GHCR_IMAGE }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.bump-version.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.bump-version.outputs.tag }}
+            type=semver,pattern={{major}},value=${{ needs.bump-version.outputs.tag }}
+
+      - name: Store git commit and build date
+        run: |
+          echo "GIT_COMMIT=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> "$GITHUB_ENV"
+
+      - name: Build and push Docker images
+        uses: docker/build-push-action@v6.7.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta-ghcr.outputs.tags }}
+          labels: ${{ steps.meta-ghcr.outputs.labels }}
+          build-args: |
+            GIT_COMMIT
+            BUILD_DATE
+          cache-from: |
+            type=registry,ref=ghcr.io/${{ env.GHCR_IMAGE }}:buildcache-amd64
+            type=registry,ref=ghcr.io/${{ env.GHCR_IMAGE }}:buildcache-arm64
+
+  #
+  # Create GitHub Release with changelog and zip artifact
+  #
+  publish-release:
+    needs: [bump-version, publish-images]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.bump-version.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Download built spoolman
+        uses: actions/download-artifact@v4.1.7
+        with:
+          name: spoolman
+          path: /tmp/spoolman
+
+      - name: Generate release info
+        run: |
+          cd /tmp/spoolman
+          echo '{
+            "project_name": "Spoolman",
+            "project_owner": "OlyForge3D",
+            "version": "${{ needs.bump-version.outputs.tag }}"
+          }' > release_info.json
+
+      - name: Generate changelog from commits
+        id: changelog
+        run: |
+          CURRENT_TAG="${{ needs.bump-version.outputs.tag }}"
+          PREVIOUS_TAG=$(git tag --sort=-version:refname | grep -A1 "^${CURRENT_TAG}$" | tail -1)
+
+          if [ -z "$PREVIOUS_TAG" ] || [ "$PREVIOUS_TAG" = "$CURRENT_TAG" ]; then
+            echo "No previous tag found, using all commits"
+            COMMITS=$(git log --pretty=format:"- %s" "$CURRENT_TAG")
+          else
+            echo "Generating changelog from $PREVIOUS_TAG to $CURRENT_TAG"
+            COMMITS=$(git log --pretty=format:"- %s" "${PREVIOUS_TAG}..${CURRENT_TAG}" | grep -v "Bump version to" | grep -v "\[skip ci\]")
+          fi
+
+          {
+            echo "## What's Changed"
+            echo ""
+            echo "$COMMITS"
+            echo ""
+            echo "**Full Changelog**: https://github.com/OlyForge3D/Spoolman/compare/${PREVIOUS_TAG}...${CURRENT_TAG}"
+          } > /tmp/release_notes.md
+
+          cat /tmp/release_notes.md
+
+      - name: Zip
+        run: |
+          cd /tmp/spoolman
+          zip -r spoolman.zip .
+
+      - name: Create release and upload build
+        uses: softprops/action-gh-release@v1
+        with:
+          draft: true
+          name: ${{ needs.bump-version.outputs.tag }}
+          tag_name: ${{ needs.bump-version.outputs.tag }}
+          files: /tmp/spoolman/spoolman.zip
+          token: ${{ secrets.GITHUB_TOKEN }}
+          body_path: /tmp/release_notes.md
