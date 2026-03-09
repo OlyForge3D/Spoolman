@@ -340,6 +340,32 @@ async def notify_any(
 
 
 @router.get(
+    "/materials/available",
+    name="Get available spool materials",
+    description=(
+        "Get a sorted list of distinct materials from non-archived spools that have remaining filament "
+        "(remaining_weight > 0 or unknown)."
+    ),
+    response_model_exclude_none=True,
+    responses={
+        200: {
+            "description": "A sorted list of distinct available spool materials.",
+            "content": {
+                "application/json": {
+                    "example": ["ABS", "ASA", "PETG", "PLA", "TPU"],
+                },
+            },
+        },
+    },
+)
+async def get_available_materials(
+    *,
+    db: Annotated[AsyncSession, Depends(get_db_session)],
+) -> list[str]:
+    return await spool.find_available_materials(db=db)
+
+
+@router.get(
     "/{spool_id}",
     name="Get spool",
     description=(
