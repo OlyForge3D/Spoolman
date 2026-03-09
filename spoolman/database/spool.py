@@ -458,6 +458,7 @@ async def find_available_materials(
     stmt = (
         sqlalchemy.select(models.Filament.material)
         .distinct()
+        .select_from(models.Spool)
         .join(models.Filament, models.Spool.filament_id == models.Filament.id)
         .where(
             sqlalchemy.or_(
