@@ -449,6 +449,38 @@ async def find_lot_numbers(
     return [row[0] for row in rows.all() if row[0] is not None]
 
 
+async def find_available_materials(
+    *,
+    db: AsyncSession,
+) -> list[str]:
+    """Find distinct materials from non-archived spools with remaining filament (remaining_weight > 0 or unknown)."""
+    computed_weight = coalesce(models.Spool.initial_weight, models.Filament.weight)
+    stmt = (
+        sqlalchemy.select(models.Filament.material)
+        .distinct()
+        .join(models.Filament, models.Spool.filament_id == models.Filament.id)
+        .where(
+            sqlalchemy.or_(
+                models.Spool.archived.is_(False),
+                models.Spool.archived.is_(None),
+            ),
+        )
+        .where(
+            sqlalchemy.or_(
+                computed_weight.is_(None),
+                sqlalchemy.and_(
+                    computed_weight.is_not(None),
+                    computed_weight - models.Spool.used_weight > 0,
+                ),
+            ),
+        )
+        .where(models.Filament.material.is_not(None))
+        .order_by(models.Filament.material)
+    )
+    rows = await db.execute(stmt)
+    return [row[0] for row in rows.all()]
+
+
 async def spool_changed(spool: models.Spool, typ: EventType) -> None:
     """Notify websocket clients that a spool has changed."""
     try:
