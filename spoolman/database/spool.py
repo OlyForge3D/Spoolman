@@ -13,6 +13,7 @@ from sqlalchemy.sql.functions import coalesce
 
 from spoolman.api.v1.models import EventType, Spool, SpoolEvent
 from spoolman.database import filament, models
+from spoolman.database.extra_field_query import apply_extra_field_filters_and_sort
 from spoolman.database.utils import (
     SortOrder,
     add_where_clause_int,
@@ -23,6 +24,7 @@ from spoolman.database.utils import (
     parse_nested_field,
 )
 from spoolman.exceptions import ItemCreateError, ItemNotFoundError, SpoolMeasureError
+from spoolman.extra_field_registry import EntityType
 from spoolman.math import weight_from_length
 from spoolman.ws import websocket_manager
 
@@ -124,6 +126,7 @@ async def find(  # noqa: C901, PLR0912
     location: str | None = None,
     lot_nr: str | None = None,
     allow_archived: bool = False,
+    extra_field_filters: dict[str, str] | None = None,
     sort_by: dict[str, SortOrder] | None = None,
     limit: int | None = None,
     offset: int = 0,
@@ -172,20 +175,29 @@ async def find(  # noqa: C901, PLR0912
 
     total_count = None
 
-    if limit is not None:
-        total_count_stmt = stmt.with_only_columns(func.count(), maintain_column_froms=True)
-        total_count = (await db.execute(total_count_stmt)).scalar()
-
-        stmt = stmt.offset(offset).limit(limit)
+    stmt = await apply_extra_field_filters_and_sort(
+        db=db,
+        stmt=stmt,
+        base_obj=models.Spool,
+        entity_type=EntityType.spool,
+        extra_field_filters=extra_field_filters,
+        sort_by=sort_by,
+    )
 
     if sort_by is not None:
         for fieldstr, order in sort_by.items():
+            # Check if this is a custom field sort
+            if fieldstr.startswith("extra."):
+                continue
+
             sorts = []
             if fieldstr == "remaining_weight":
-                sorts.append(coalesce(models.Spool.initial_weight, models.Filament.weight) - models.Spool.used_weight)
+                sorts.append(
+                    coalesce(models.Spool.initial_weight, models.Filament.weight) - models.Spool.used_weight,
+                )
             elif fieldstr == "remaining_length":
-                # Simplified weight -> length formula. Absolute value is not correct but the proportionality is still
-                # kept, which means the sort order is correct.
+                # Simplified weight -> length formula. Absolute value is not correct but the proportionality
+                # is still kept, which means the sort order is correct.
                 sorts.append(
                     (coalesce(models.Spool.initial_weight, models.Filament.weight) - models.Spool.used_weight)
                     / models.Filament.density
@@ -209,6 +221,11 @@ async def find(  # noqa: C901, PLR0912
                 stmt = stmt.order_by(*(f.asc() for f in sorts))
             elif order == SortOrder.DESC:
                 stmt = stmt.order_by(*(f.desc() for f in sorts))
+
+    if limit is not None:
+        total_count_stmt = stmt.with_only_columns(func.count(), maintain_column_froms=True).order_by(None)
+        total_count = (await db.execute(total_count_stmt)).scalar()
+        stmt = stmt.offset(offset).limit(limit)
 
     rows = await db.execute(
         stmt,
@@ -255,8 +272,11 @@ async def update(
 async def delete(db: AsyncSession, spool_id: int) -> None:
     """Delete a spool object."""
     spool = await get_by_id(db, spool_id)
-    await spool_changed(spool, EventType.DELETED)
     await db.delete(spool)
+    # Commit before notifying so the deletion is durable and visible to subsequent
+    # requests; post-commit notification must be the last, infallible step.
+    await db.commit()
+    await spool_changed(spool, EventType.DELETED)
 
 
 async def clear_extra_field(db: AsyncSession, key: str) -> None:
@@ -264,6 +284,7 @@ async def clear_extra_field(db: AsyncSession, key: str) -> None:
     await db.execute(
         sqlalchemy.delete(models.SpoolField).where(models.SpoolField.key == key),
     )
+    await db.commit()
 
 
 async def use_weight_safe(db: AsyncSession, spool_id: int, weight: float) -> None:
@@ -520,3 +541,4 @@ async def rename_location(
     await db.execute(
         sqlalchemy.update(models.Spool).where(models.Spool.location == current_name).values(location=new_name),
     )
+    await db.commit()

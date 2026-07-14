@@ -24,7 +24,9 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
     uv sync --locked --no-install-project
 
-# Copy and install app
+# Copy and install app. No --chown here: the "app" user only exists in the
+# runner stage, and Podman (unlike Docker/BuildKit) refuses to resolve it. Final
+# ownership is set when these files are copied into the runner stage below.
 COPY migrations /home/app/spoolman/migrations
 COPY spoolman /home/app/spoolman/spoolman
 COPY alembic.ini README.md uv.lock pyproject.toml /home/app/spoolman/
