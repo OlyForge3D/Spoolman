@@ -47,7 +47,7 @@ jobs:
       - name: Install node
         uses: actions/setup-node@v4.0.3
         with:
-          node-version: '20'
+          node-version: '24'
 
       - name: Bump version
         run: |
@@ -83,7 +83,7 @@ jobs:
       - name: Install node
         uses: actions/setup-node@v4.0.3
         with:
-          node-version: '20'
+          node-version: '24'
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
@@ -101,6 +101,13 @@ jobs:
       - name: Install client dependencies
         run: |
           cd client
+          npm ci
+
+      # lefthook's `ci` hook lints/formats/type-checks and unit-tests client_v2 too,
+      # via hardcoded ./node_modules/.bin/* paths, so its deps must be present.
+      - name: Install client_v2 dependencies
+        run: |
+          cd client_v2
           npm ci
 
       - name: Run pre-commit
