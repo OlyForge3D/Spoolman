@@ -18,6 +18,13 @@ name: Guard Translations
 #                                  the files here are frozen at whatever shipped. Any change to a
 #                                  non-English file is blocked, including adding a new language:
 #                                  effort spent there is effort not spent on the client users get.
+#
+# Fork note: this repo is a fork that periodically merges upstream Donkie/Spoolman. An upstream sync
+# necessarily carries upstream's Weblate commits with it, which this guard cannot tell apart from a
+# hand edit — the diff against our base branch looks identical either way. Such a PR is exempted by
+# labelling it `upstream-sync`. The label is deliberate rather than automatic: applying it is a
+# maintainer asserting the translation changes came from upstream and not from a person editing
+# these files directly.
 
 on:
   pull_request:
@@ -25,6 +32,11 @@ on:
       - opened
       - synchronize
       - reopened
+      # Re-run when the exemption label is applied or removed. A re-run of an
+      # existing job replays its original event payload, so without these the
+      # label would have no effect until the next push.
+      - labeled
+      - unlabeled
 
 # NOTE: no `paths:` filter on purpose. If this check is marked "Required" in branch
 # protection, a paths filter would leave PRs that don't touch locales stuck "pending"
@@ -37,8 +49,11 @@ permissions:
 jobs:
   guard-translations:
     runs-on: ubuntu-latest
-    # Skip the guard for Weblate's own translation-sync PRs.
-    if: github.event.pull_request.user.login != 'weblate'
+    # Skip the guard for Weblate's own translation-sync PRs, and for upstream syncs
+    # (see the fork note above).
+    if: >-
+      github.event.pull_request.user.login != 'weblate' &&
+      !contains(github.event.pull_request.labels.*.name, 'upstream-sync')
     steps:
       - name: Checkout
         uses: actions/checkout@v4

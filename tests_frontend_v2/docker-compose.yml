@@ -19,7 +19,7 @@ services:
       retries: 30
 
   spoolman:
-    image: donkie/spoolman:test
+    image: olyforge3d/spoolman:test
     environment:
       - SPOOLMAN_DB_TYPE=postgres
       - SPOOLMAN_DB_HOST=db

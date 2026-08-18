@@ -100,7 +100,7 @@ def main() -> None:
     build_client_v2()
 
     print("Building Spoolman image...")
-    if run([ENGINE, "build", "-t", "donkie/spoolman:test", "."], cwd=REPO_ROOT) != 0:
+    if run([ENGINE, "build", "-t", "olyforge3d/spoolman:test", "."], cwd=REPO_ROOT) != 0:
         die("Failed to build Spoolman!")
 
     print("Installing Playwright and its browser...")
