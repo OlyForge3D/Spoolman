@@ -10,10 +10,16 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from spoolman.api.v1.models import Filament, FilamentEvent, Message, MultiColorDirection
+from spoolman.api.v1.models import (
+    Filament,
+    FilamentEvent,
+    Message,
+    MultiColorDirection,
+    extra_fields_request_description,
+)
 from spoolman.database import filament
 from spoolman.database.database import get_db_session
-from spoolman.database.utils import SortOrder
+from spoolman.database.utils import parse_sort
 from spoolman.exceptions import ItemDeleteError
 from spoolman.extra_fields import EntityType, get_extra_fields, validate_extra_field_dict
 from spoolman.ws import websocket_manager
@@ -114,9 +120,9 @@ class FilamentParameters(BaseModel):
         ),
         examples=["polymaker_pla_polysonicblack_1000_175"],
     )
-    extra: dict[str, str] | None = Field(
+    extra: dict[str, str | None] | None = Field(
         None,
-        description="Extra fields for this filament.",
+        description=extra_fields_request_description("filament"),
     )
 
     @field_validator("color_hex")
@@ -136,7 +142,7 @@ class FilamentParameters(BaseModel):
         if len(clr) not in (6, 8):
             raise ValueError("Color code must be 6 or 8 characters long.")
 
-        return v
+        return v.removeprefix("#")
 
     @field_validator("multi_color_hexes")
     @classmethod
@@ -144,6 +150,7 @@ class FilamentParameters(BaseModel):
         """Validate the multi_color_hexes field."""
         if not v:
             return None
+        colors = []
         for clr_raw in v.split(","):
             clr = clr_raw.upper()
             clr = clr.removeprefix("#")
@@ -155,7 +162,9 @@ class FilamentParameters(BaseModel):
             if len(clr) not in (6, 8):
                 raise ValueError("Color code must be 6 or 8 characters long.")
 
-        return v
+            colors.append(clr_raw.removeprefix("#"))
+
+        return ",".join(colors)
 
     @model_validator(mode="after")  # type: ignore[]
     def validate(self) -> "FilamentParameters":
@@ -290,7 +299,7 @@ async def find(
         str | None,
         Query(
             title="Filament Color",
-            description="Match filament by similar color. Slow operation!",
+            description="Match filament by similar color.",
         ),
     ] = None,
     color_similarity_threshold: Annotated[
@@ -331,11 +340,10 @@ async def find(
     ] = None,
     offset: Annotated[int, Query(title="Offset", description="Offset in the full result set if a limit is set.")] = 0,
 ) -> JSONResponse:
-    sort_by: dict[str, SortOrder] = {}
-    if sort is not None:
-        for sort_item in sort.split(","):
-            field, direction = sort_item.split(":")
-            sort_by[field] = SortOrder[direction.upper()]
+    try:
+        sort_by = parse_sort(sort)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content=Message(message=str(e)).dict())
 
     vendor_id = vendor_id if vendor_id is not None else vendor_id_old
     if vendor_id is not None:
@@ -344,12 +352,11 @@ async def find(
         vendor_ids = None
 
     if color_hex is not None:
-        matched_filaments = await filament.find_by_color(
+        filter_by_ids = await filament.find_by_color(
             db=db,
             color_query_hex=color_hex,
             similarity_threshold=color_similarity_threshold,
         )
-        filter_by_ids = [db_filament.id for db_filament in matched_filaments]
     else:
         filter_by_ids = None
 

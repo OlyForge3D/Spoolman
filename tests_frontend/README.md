@@ -31,7 +31,7 @@ uv run poe itest-frontend
 ```
 
 This builds the client (if `client/dist` is missing), builds the
-`donkie/spoolman:test` image, brings up the stack with Docker Compose, waits for
+`olyforge3d/spoolman:test` image, brings up the stack with Docker Compose, waits for
 it to become healthy, and runs Playwright. It tears the stack down afterwards.
 
 Useful environment variables:
@@ -58,6 +58,6 @@ uses).
 ## CI
 
 The `test-frontend` job in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml)
-reuses the same `donkie/spoolman:test` image built for the backend integration
+reuses the same `olyforge3d/spoolman:test` image built for the backend integration
 tests, so the frontend is verified against the exact artifact that ships.
 On failure it uploads the Playwright HTML report as a build artifact.
