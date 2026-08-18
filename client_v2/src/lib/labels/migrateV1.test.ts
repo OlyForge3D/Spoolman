@@ -1,5 +1,19 @@
-import { describe, expect, it } from 'vitest';
-import { migrateTemplate, presetToDesign } from './migrateV1';
+import { describe, expect, it, vi } from 'vitest';
+import { importV1Presets, migrateTemplate, presetToDesign } from './migrateV1';
+import { DEFAULT_LAYOUT } from './types';
+
+// The settings importV1Presets reads, stubbed per-test by the mocked getJson.
+const settings = vi.hoisted(() => ({ store: {} as Record<string, unknown[]> }));
+
+vi.mock('$lib/api/http', () => ({
+	getJson: vi.fn(async (path: string) => {
+		const key = path.replace('/setting/', '');
+		const presets = settings.store[key];
+		// Match the real server: an unregistered key 404s rather than replying.
+		if (presets === undefined) throw new Error(`404 ${key}`);
+		return { value: JSON.stringify(presets), is_set: true, type: 'array' };
+	})
+}));
 
 // migrateV1 rewrites label templates and print presets that users authored in the
 // v1 client. It runs unattended at first load and its output is what they see in
@@ -74,6 +88,50 @@ describe('migrateTemplate', () => {
 	it('does not rewrite a v1 path that is only a prefix of a token', () => {
 		// `{id}` must not match inside `{identifier}`.
 		expect(migrateTemplate('{identifier}')).toBe('{identifier}');
+	});
+
+	// The fork's filament presets root their paths at the filament, so the same
+	// bare token means a different field than it does in a spool preset. Getting
+	// this wrong would silently point a filament label at spool fields that don't
+	// exist for it.
+	describe('filament presets', () => {
+		it('roots bare paths at the filament, not the spool', () => {
+			expect(migrateTemplate('{id}', 'filament')).toBe('{filament.id}');
+			expect(migrateTemplate('{name}', 'filament')).toBe('{filament.name}');
+			expect(migrateTemplate('{material}', 'filament')).toBe('{filament.material}');
+		});
+
+		it('rewrites snake_case fields to camelCase', () => {
+			expect(migrateTemplate('{settings_extruder_temp}', 'filament')).toBe('{filament.nozzleTemp}');
+			expect(migrateTemplate('{spool_weight}', 'filament')).toBe('{filament.spoolWeight}');
+			expect(migrateTemplate('{article_number}', 'filament')).toBe('{filament.articleNumber}');
+		});
+
+		it('leaves vendor paths alone, since v1 filament presets already used vendor.*', () => {
+			expect(migrateTemplate('{vendor.name}', 'filament')).toBe('{vendor.name}');
+			expect(migrateTemplate('{vendor.comment}', 'filament')).toBe('{vendor.comment}');
+			expect(migrateTemplate('{vendor.empty_spool_weight}', 'filament')).toBe('{vendor.emptyWeight}');
+		});
+
+		it("treats extras as the filament's own", () => {
+			expect(migrateTemplate('{extra.foo}', 'filament')).toBe('{filament.extra.foo}');
+			expect(migrateTemplate('{vendor.extra.bar}', 'filament')).toBe('{vendor.extra.bar}');
+		});
+
+		it('rewrites inside the wrapped form and preserves literals', () => {
+			expect(migrateTemplate('{Article: {article_number}}', 'filament')).toBe(
+				'{Article: {filament.articleNumber}}'
+			);
+			expect(migrateTemplate('**{vendor.name} - {name}\n#{id}**', 'filament')).toBe(
+				'**{vendor.name} - {filament.name}\n#{filament.id}**'
+			);
+		});
+
+		it('does not apply the spool mapping', () => {
+			// `lot_nr` is a spool-only field; a filament preset has no spool, so it
+			// must not be rewritten into one.
+			expect(migrateTemplate('{lot_nr}', 'filament')).toBe('{lot_nr}');
+		});
 	});
 });
 
@@ -184,7 +242,146 @@ describe('presetToDesign', () => {
 		expect(presetToDesign({ labelSettings: { printSettings: { name: '' } } }).name).toBe('Imported label');
 	});
 
-	it('always produces a spool design, since v1 only printed spool labels', () => {
-		expect(presetToDesign({}).kind).toBe('spool');
+	it('defaults to a sheet-printed spool design, matching upstream v1', () => {
+		const d = presetToDesign({});
+		expect(d.kind).toBe('spool');
+		expect(d.layout.mode).toBe('sheet');
+	});
+
+	// The fork's v1 added filament labels and a file-export mode, each stored in
+	// its own setting. The source decides both, and the QR target follows the kind.
+	describe('fork preset sources', () => {
+		it('carries the kind and mode from the source setting', () => {
+			const d = presetToDesign({}, { kind: 'filament', mode: 'image' });
+			expect(d.kind).toBe('filament');
+			expect(d.layout.mode).toBe('image');
+		});
+
+		it('uses the filament default template for a filament preset', () => {
+			const d = presetToDesign({}, { kind: 'filament', mode: 'sheet' });
+			const text = d.elements.find((e) => e.type === 'text');
+			if (text?.type !== 'text') throw new Error('expected a text element');
+			// Already migrated, and rooted at the filament rather than a spool.
+			expect(text.template).toContain('{filament.name}');
+			expect(text.template).toContain('#{filament.id}');
+			expect(text.template).not.toContain('{spool.');
+		});
+
+		it('carries the export DPI and format across', () => {
+			const { layout } = presetToDesign(
+				{ labelSettings: { printSettings: { exportDpi: 203, exportFormat: 'aml' } } },
+				{ kind: 'spool', mode: 'image' }
+			);
+			expect(layout.dpi).toBe(203);
+			expect(layout.exportFormat).toBe('aml');
+		});
+
+		it('falls back to the defaults when the preset stored neither', () => {
+			const { layout } = presetToDesign({});
+			expect(layout.dpi).toBe(DEFAULT_LAYOUT.dpi);
+			expect(layout.exportFormat).toBe(DEFAULT_LAYOUT.exportFormat);
+		});
+
+		it('clamps an out-of-range DPI rather than trusting it', () => {
+			const dpi = (exportDpi: number) =>
+				presetToDesign({ labelSettings: { printSettings: { exportDpi } } }).layout.dpi;
+			expect(dpi(10)).toBe(96);
+			expect(dpi(5000)).toBe(600);
+			expect(dpi(203.4)).toBe(203);
+		});
+
+		it('falls back to PNG for a format this build does not know', () => {
+			const { layout } = presetToDesign({
+				// A hand-edited or newer-client value.
+				labelSettings: { printSettings: { exportFormat: 'svg' as 'png' } }
+			});
+			expect(layout.exportFormat).toBe('png');
+		});
+
+		it('prefers the stored AML label size over the size implied by the grid', () => {
+			const d = presetToDesign(
+				{
+					labelSettings: {
+						printSettings: { amlLabelSize: { width: 50, height: 25 }, columns: 3, rows: 8 }
+					}
+				},
+				{ kind: 'spool', mode: 'image' }
+			);
+			expect(d.label).toEqual({ w: 50, h: 25 });
+		});
+
+		it('ignores a degenerate stored AML size and derives one instead', () => {
+			const d = presetToDesign({
+				labelSettings: { printSettings: { amlLabelSize: { width: 0, height: 0 } } }
+			});
+			expect(d.label.w).toBeGreaterThan(0);
+			expect(d.label.h).toBeGreaterThan(0);
+		});
+	});
+});
+
+// importV1Presets is what actually runs on a real upgrade. Upstream stored only
+// `print_presets`; this fork added three more, and losing any of them silently
+// costs the user work they can't recover.
+describe('importV1Presets', () => {
+	const preset = (name: string, printSettings: Record<string, unknown> = {}) => ({
+		labelSettings: { printSettings: { name, ...printSettings } }
+	});
+
+	it('imports all four v1 preset settings, tagged with the right kind and mode', async () => {
+		settings.store = {
+			print_presets: [preset('spool sheet')],
+			print_presets_filament: [preset('filament sheet')],
+			image_presets: [preset('spool image')],
+			image_presets_filament: [preset('filament image')]
+		};
+		const designs = await importV1Presets();
+		expect(designs.map((d) => [d.name, d.kind, d.layout.mode])).toEqual([
+			['spool sheet', 'spool', 'sheet'],
+			['filament sheet', 'filament', 'sheet'],
+			['spool image', 'spool', 'image'],
+			['filament image', 'filament', 'image']
+		]);
+	});
+
+	it('still imports upstream presets when the fork-only settings are absent', async () => {
+		// An instance upgraded from upstream Spoolman has only this one key; the
+		// others 404 and must not abort the import.
+		settings.store = { print_presets: [preset('only one')] };
+		const designs = await importV1Presets();
+		expect(designs).toHaveLength(1);
+		expect(designs[0].name).toBe('only one');
+	});
+
+	it('returns nothing when v1 was never used', async () => {
+		settings.store = {};
+		expect(await importV1Presets()).toEqual([]);
+	});
+
+	it('gives every imported design a distinct id', async () => {
+		settings.store = {
+			print_presets: [preset('a'), preset('b')],
+			image_presets_filament: [preset('c')]
+		};
+		const ids = (await importV1Presets()).map((d) => d.id);
+		expect(new Set(ids).size).toBe(ids.length);
+	});
+
+	it('preserves the fork export settings end to end', async () => {
+		settings.store = {
+			image_presets_filament: [
+				preset('Filament AML', {
+					amlLabelSize: { width: 50, height: 25 },
+					exportDpi: 203,
+					exportFormat: 'aml'
+				})
+			]
+		};
+		const [d] = await importV1Presets();
+		expect(d.kind).toBe('filament');
+		expect(d.layout.mode).toBe('image');
+		expect(d.layout.exportFormat).toBe('aml');
+		expect(d.layout.dpi).toBe(203);
+		expect(d.label).toEqual({ w: 50, h: 25 });
 	});
 });
