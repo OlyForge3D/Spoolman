@@ -3,15 +3,23 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import sqlalchemy
-from sqlalchemy import Select
+from sqlalchemy import Alias, ColumnElement, Select
 from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.orm import aliased
 from sqlalchemy.sql.expression import FunctionElement
 
 from spoolman.database import models
-from spoolman.database.utils import SortOrder
+from spoolman.database.utils import (
+    LIKE_ESCAPE,
+    SortOrder,
+    escape_like,
+    order_by_clauses,
+    split_datetime_range_filter,
+)
 from spoolman.extra_field_registry import EntityType, ExtraField, ExtraFieldType, get_extra_fields
 
 if TYPE_CHECKING:
@@ -106,6 +114,64 @@ def _compile_json_array_second_default(element: _JsonArraySecondElement, compile
     return f"JSON_EXTRACT({col_sql}, '$[1]')"
 
 
+@dataclass
+class ExtraFieldJoin:
+    """One extra field pulled onto a query as a plain column, ready to group or order by.
+
+    Built by :func:`extra_field_join`, applied with :meth:`apply`. The two steps are separate
+    because the value expression has to exist before the SELECT is constructed, while the join
+    can only be added afterwards.
+    """
+
+    alias: Alias
+    field_key: str
+    id_column_name: str
+    #: The DB-decoded scalar, i.e. the string the user typed rather than its JSON encoding.
+    value: ColumnElement[str]
+
+    def apply(self, stmt: Select, base_id_column: InstrumentedAttribute[int]) -> Select:
+        """Outer-join the field's row onto `stmt`.
+
+        OUTER, so entities with no row for this key survive with a NULL value — the same
+        "unset" bucket a nullable built-in column produces.
+        """
+        return stmt.join(
+            self.alias,
+            sqlalchemy.and_(
+                self.alias.c[self.id_column_name] == base_id_column,
+                self.alias.c.key == self.field_key,
+            ),
+            isouter=True,
+        )
+
+
+def extra_field_value_text(column: ColumnElement[str]) -> ColumnElement[str]:
+    """Decode a stored extra-field value to its scalar, as plain TEXT.
+
+    Compare against this rather than a reconstructed JSON string, so matching doesn't depend
+    on how the value was encoded when it was written (quoting, non-ASCII escaping).
+    """
+    return _JsonScalarText(column)
+
+
+def extra_field_join(entity_type: EntityType, field_key: str) -> ExtraFieldJoin:
+    """Prepare an extra field to be selected as a column of an entity query.
+
+    The field table is aliased so it stays a distinct FROM element: the extra-field *filters*
+    reference the un-aliased table inside correlated subqueries, and without the alias those
+    subqueries would correlate to this join instead of standing on their own.
+    """
+    field_table = _get_field_table_for_entity(entity_type)
+    id_column_name = _get_entity_id_column(field_table).key
+    alias = field_table.__table__.alias()
+    return ExtraFieldJoin(
+        alias=alias,
+        field_key=field_key,
+        id_column_name=id_column_name,
+        value=extra_field_value_text(alias.c.value),
+    )
+
+
 def _get_field_table_for_entity(entity_type: EntityType) -> type[models.Base]:
     """Map an entity type to its extra-field table."""
     if entity_type == EntityType.spool:
@@ -126,18 +192,6 @@ def _get_entity_id_column(field_table: type[models.Base]) -> InstrumentedAttribu
     if field_table == models.VendorField:
         return models.VendorField.vendor_id
     raise ValueError(f"Unknown field table: {field_table}")
-
-
-# Escape character for LIKE patterns. Deliberately not backslash: a backslash ESCAPE clause is
-# ambiguous under MySQL/MariaDB string parsing. '/' renders safely on all four dialects.
-_LIKE_ESCAPE = "/"
-
-
-def _escape_like(value: str) -> str:
-    """Escape LIKE wildcards so user input is matched literally, not as a wildcard pattern."""
-    return (
-        value.replace(_LIKE_ESCAPE, _LIKE_ESCAPE * 2).replace("%", f"{_LIKE_ESCAPE}%").replace("_", f"{_LIKE_ESCAPE}_")
-    )
 
 
 def _parse_boolean_filter(value: str) -> bool:
@@ -167,14 +221,17 @@ async def apply_extra_field_filters_and_sort(
     extra_fields_dict: dict[str, ExtraField] = {field.key: field for field in extra_fields}
 
     if extra_field_filters:
+        field_table = _get_field_table_for_entity(entity_type)
+        id_select = sqlalchemy.select(_get_entity_id_column(field_table))
         for field_key, value in extra_field_filters.items():
             field = extra_fields_dict.get(field_key)
             if field is None:
                 continue
             stmt = add_where_clause_extra_field(
                 stmt=stmt,
-                base_obj=base_obj,
-                entity_type=entity_type,
+                link_column=base_obj.id,
+                id_select=id_select,
+                field_table=field_table,
                 field_key=field_key,
                 field_type=field.field_type,
                 value=value,
@@ -203,21 +260,82 @@ async def apply_extra_field_filters_and_sort(
     return stmt
 
 
+async def apply_spool_related_extra_filters(
+    *,
+    db: AsyncSession,
+    stmt: Select,
+    filament_filters: dict[str, str] | None,
+    vendor_filters: dict[str, str] | None,
+) -> Select:
+    """Filter a spool query by extra fields that live on the spool's filament or its vendor.
+
+    Spool extra fields are handled by apply_extra_field_filters_and_sort; this handles the two
+    related entities, linking through Spool.filament_id (a spool matches when its filament — or that
+    filament's vendor — matches the extra-field condition).
+    """
+    if filament_filters:
+        fields = {f.key: f for f in await get_extra_fields(db, EntityType.filament)}
+        for field_key, value in filament_filters.items():
+            field = fields.get(field_key)
+            if field is None:
+                continue
+            stmt = add_where_clause_extra_field(
+                stmt=stmt,
+                link_column=models.Spool.filament_id,
+                id_select=sqlalchemy.select(models.FilamentField.filament_id),
+                field_table=models.FilamentField,
+                field_key=field_key,
+                field_type=field.field_type,
+                value=value,
+                multi_choice=field.multi_choice if field.field_type == ExtraFieldType.choice else None,
+            )
+
+    if vendor_filters:
+        fields = {f.key: f for f in await get_extra_fields(db, EntityType.vendor)}
+        for field_key, value in vendor_filters.items():
+            field = fields.get(field_key)
+            if field is None:
+                continue
+            # Map matching vendors back to filament ids: a spool matches when its filament's vendor
+            # matches. Alias Filament so this subquery doesn't collide with the outer query's join.
+            fil = aliased(models.Filament)
+            id_select = sqlalchemy.select(fil.id).join(
+                models.VendorField,
+                models.VendorField.vendor_id == fil.vendor_id,
+            )
+            stmt = add_where_clause_extra_field(
+                stmt=stmt,
+                link_column=models.Spool.filament_id,
+                id_select=id_select,
+                field_table=models.VendorField,
+                field_key=field_key,
+                field_type=field.field_type,
+                value=value,
+                multi_choice=field.multi_choice if field.field_type == ExtraFieldType.choice else None,
+            )
+
+    return stmt
+
+
 def add_where_clause_extra_field(  # noqa: C901, PLR0912, PLR0915
     stmt: Select,
-    base_obj: type[models.Base],
-    entity_type: EntityType,
+    *,
+    link_column: InstrumentedAttribute[int],
+    id_select: Select,
+    field_table: type[models.Base],
     field_key: str,
     field_type: ExtraFieldType,
     value: str,
-    *,
     multi_choice: bool | None = None,
 ) -> Select:
-    """Add a where clause to a select statement for an extra field."""
-    field_table = _get_field_table_for_entity(entity_type)
-    entity_id_column = _get_entity_id_column(field_table)
-    base_id_column = base_obj.id
+    """Add a where clause to a select statement for an extra field.
 
+    `link_column` is the column on the outer query to constrain (e.g. Spool.id, or Spool.filament_id
+    when filtering spools by a filament/vendor extra field). `id_select` is a SELECT of ids in that
+    same space (with any join to `field_table` already applied); this function narrows a copy of it
+    by the field key/value conditions. This indirection is what lets one query filter by extra fields
+    that live on a related entity.
+    """
     conditions = []
     for value_part in value.split(","):
         # Empty-string filters follow the existing string-query API semantics.
@@ -225,18 +343,21 @@ def add_where_clause_extra_field(  # noqa: C901, PLR0912, PLR0915
             empty_conditions = [
                 field_table.value.is_(None),
                 field_table.value == "null",
+                # A stored empty string is unset too, the same way `location=` matches both NULL
+                # and '' on a built-in string column (add_where_clause_str_opt). Clearing a text
+                # box writes one of these, and without this they would be counted in the "no
+                # value" group by group_by but missing from the listing of that same group.
+                field_table.value == json.dumps(""),
             ]
             if field_type == ExtraFieldType.boolean:
                 empty_conditions.append(field_table.value == json.dumps(bool(0)))
 
-            field_has_empty_value = sqlalchemy.select(entity_id_column).where(
+            field_has_empty_value = id_select.where(
                 sqlalchemy.and_(field_table.key == field_key, sqlalchemy.or_(*empty_conditions))
             )
-            field_missing_entirely = sqlalchemy.select(base_id_column).where(
-                base_id_column.not_in(sqlalchemy.select(entity_id_column).where(field_table.key == field_key))
-            )
-            conditions.append(base_id_column.in_(field_has_empty_value))
-            conditions.append(base_id_column.in_(field_missing_entirely))
+            # The linked entity either stores an empty value, or has no row for this key at all.
+            conditions.append(link_column.in_(field_has_empty_value))
+            conditions.append(link_column.not_in(id_select.where(field_table.key == field_key)))
             continue
 
         exact_match = value_part.startswith('"') and value_part.endswith('"')
@@ -250,7 +371,7 @@ def add_where_clause_extra_field(  # noqa: C901, PLR0912, PLR0915
             field_condition = (
                 decoded == parsed_value
                 if exact_match
-                else decoded.ilike(f"%{_escape_like(parsed_value)}%", escape=_LIKE_ESCAPE)
+                else decoded.ilike(f"%{escape_like(parsed_value)}%", escape=LIKE_ESCAPE)
             )
         elif field_type == ExtraFieldType.integer:
             if ":" in parsed_value:
@@ -302,28 +423,31 @@ def add_where_clause_extra_field(  # noqa: C901, PLR0912, PLR0915
                 # substring. json.dumps gives the exact quoted, escaped form the array element
                 # is stored as, and LIKE wildcards in the token are escaped.
                 token = json.dumps(parsed_value, ensure_ascii=False)
-                field_condition = field_table.value.like(f"%{_escape_like(token)}%", escape=_LIKE_ESCAPE)
+                field_condition = field_table.value.like(f"%{escape_like(token)}%", escape=LIKE_ESCAPE)
             else:
                 # Compare against the DB-decoded scalar, independent of JSON encoding.
                 field_condition = _JsonScalarText(field_table.value) == parsed_value
         elif field_type == ExtraFieldType.datetime:
             # Compare decoded ISO-8601 strings. Both bounds and stored values are the frontend's
-            # canonical toISOString() output, so lexicographic comparison is chronological.
+            # canonical toISOString() output, so lexicographic comparison is chronological. That
+            # assumption is what makes this differ from the built-in datetime columns, which parse
+            # the bound and compare real datetimes: here an equivalent spelling of the same instant
+            # (a UTC offset, or a missing '.000') compares as a different string.
+            #
+            # The *grammar* is shared even though the comparison is not, so the split comes from
+            # the same helper the built-in columns use (see add_where_clause_datetime_opt).
             decoded = _JsonScalarText(field_table.value)
-            if "|" in parsed_value:
-                start_str, end_str = parsed_value.split("|", 1)
+            ends = split_datetime_range_filter(parsed_value, field_key)
+            if ends is None:
+                field_condition = decoded == parsed_value
+            else:
+                start_str, end_str = ends
                 dt_conditions = []
                 if start_str:
                     dt_conditions.append(decoded >= start_str)
                 if end_str:
                     dt_conditions.append(decoded <= end_str)
-                if not dt_conditions:
-                    raise ValueError(
-                        f"Invalid datetime range filter for '{field_key}': {parsed_value}. Expected '<start>|<end>'."
-                    )
                 field_condition = sqlalchemy.and_(*dt_conditions)
-            else:
-                field_condition = decoded == parsed_value
         elif field_type in (ExtraFieldType.integer_range, ExtraFieldType.float_range):
             if ":" not in parsed_value:
                 raise ValueError(
@@ -353,15 +477,34 @@ def add_where_clause_extra_field(  # noqa: C901, PLR0912, PLR0915
         else:
             raise ValueError(f"Unsupported extra field type for '{field_key}': {field_type}")
 
-        matching_entities = sqlalchemy.select(entity_id_column).where(
-            sqlalchemy.and_(field_table.key == field_key, field_condition)
-        )
-        conditions.append(base_id_column.in_(matching_entities))
+        matching_entities = id_select.where(sqlalchemy.and_(field_table.key == field_key, field_condition))
+        conditions.append(link_column.in_(matching_entities))
 
     if not conditions:
         return stmt
 
     return stmt.where(sqlalchemy.or_(*conditions))
+
+
+async def find_extra_field_values(
+    *,
+    db: AsyncSession,
+    entity_type: EntityType,
+    field_key: str,
+) -> list[str]:
+    """Find all distinct values currently stored for a scalar extra field.
+
+    Intended for text/single-choice/datetime fields, whose values are stored as JSON string
+    scalars. Values are DB-decoded (see _JsonScalarText) so the result is independent of JSON
+    encoding, mirroring the built-in distinct-value endpoints (materials, locations, ...). Empty
+    and null values are omitted; the result is sorted for a stable option order.
+    """
+    field_table = _get_field_table_for_entity(entity_type)
+    decoded = _JsonScalarText(field_table.value)
+    stmt = sqlalchemy.select(decoded).where(field_table.key == field_key).distinct()
+    rows = await db.execute(stmt)
+    values = {row[0] for row in rows.all() if row[0] is not None and row[0] != ""}
+    return sorted(values)
 
 
 def add_order_by_extra_field(
@@ -399,6 +542,6 @@ def add_order_by_extra_field(
     else:
         sort_expr = value_subq
 
-    if order == SortOrder.ASC:
-        return stmt.order_by(sort_expr.asc())
-    return stmt.order_by(sort_expr.desc())
+    # A spool that has no value for the field yields NULL here, and "not filled in" belongs at
+    # the bottom of the list in both directions -- see order_by_clauses.
+    return stmt.order_by(*order_by_clauses([sort_expr], order))
