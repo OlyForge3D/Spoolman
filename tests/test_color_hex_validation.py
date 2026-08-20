@@ -93,6 +93,7 @@ def test_from_db_survives_a_row_written_before_the_fix():
         weight=None,
         spool_weight=None,
         article_number=None,
+        gtin=None,
         comment=None,
         settings_extruder_temp=None,
         settings_bed_temp=None,

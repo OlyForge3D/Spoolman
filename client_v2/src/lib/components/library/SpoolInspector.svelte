@@ -31,6 +31,7 @@
 	import * as params from '$lib/library/params';
 	import { lengthMeters, pct, weightAuto } from '$lib/utils/format';
 	import { usageLabel } from '$lib/utils/library';
+	import { formatGtin } from '$lib/filament/gtin';
 	import { spoolSource } from '$lib/api/spoolSource';
 	import { classifyDeleteFailure } from '$lib/library/deletion';
 	import { toasts } from '$lib/stores/toasts.svelte';
@@ -575,6 +576,9 @@
 					label={m['filament.fields.articleNumber']()}
 					help={m['filament.fieldsHelp.articleNumber']()}
 					mono>{filament.articleNumber || '—'}</Field
+				>
+				<Field label={m['filament.fields.gtin']()} help={m['filament.fieldsHelp.gtin']()} mono
+					>{formatGtin(filament.gtin) || '—'}</Field
 				>
 				{#if filament.externalId}
 					<Field label={m['filament.fields.externalId']()} mono>{filament.externalId}</Field>

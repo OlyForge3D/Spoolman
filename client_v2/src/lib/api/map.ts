@@ -57,6 +57,7 @@ export function mapFilament(f: Json): Filament {
 		spoolWeight: f.spool_weight ?? undefined,
 		price: f.price ?? 0,
 		articleNumber: f.article_number ?? undefined,
+		gtin: f.gtin ?? undefined,
 		comment: f.comment ?? '',
 		externalId: f.external_id ?? undefined,
 		registeredLabel: formatShortDate(f.registered),
@@ -230,6 +231,9 @@ export function filamentPatchToApi(patch: FilamentPatch): Json {
 	if ('bedTemp' in patch) out.settings_bed_temp = patch.bedTemp;
 	if ('price' in patch) out.price = patch.price;
 	if ('articleNumber' in patch) out.article_number = patch.articleNumber ?? '';
+	// The API normalizes and validates this one, so it is only ever sent as a whole GTIN
+	// (see FilamentInspector) or as a blank, which clears it.
+	if ('gtin' in patch) out.gtin = patch.gtin ?? '';
 	if ('comment' in patch) out.comment = patch.comment ?? '';
 	if ('extra' in patch) out.extra = patch.extra;
 	return out;

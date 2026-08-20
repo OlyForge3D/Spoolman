@@ -58,6 +58,10 @@ class Filament(Base):
     weight: Mapped[float | None] = mapped_column(comment="The filament weight of a full spool (net weight).")
     spool_weight: Mapped[float | None] = mapped_column(comment="The weight of an empty spool.")
     article_number: Mapped[str | None] = mapped_column(String(64))
+    gtin: Mapped[str | None] = mapped_column(
+        String(14),
+        comment="Barcode of this filament type, normalized to a zero-padded 14 digit GTIN.",
+    )
     comment: Mapped[str | None] = mapped_column(String(1024))
     settings_extruder_temp: Mapped[int | None] = mapped_column(comment="Overridden extruder temperature.")
     settings_bed_temp: Mapped[int | None] = mapped_column(comment="Overridden bed temperature.")

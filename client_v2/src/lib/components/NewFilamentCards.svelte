@@ -309,6 +309,17 @@
 				{m['filament.fields.articleNumber']()}
 				<input class="mono" bind:value={draft.articleNumber} placeholder="—" />
 			</label>
+			<label data-field="gtin" onfocusout={() => touch('gtin')}>
+				{m['filament.fields.gtin']()}
+				<input
+					class="mono"
+					bind:value={draft.gtin}
+					placeholder="—"
+					aria-invalid={!!err('gtin')}
+					class:invalid={!!err('gtin')}
+				/>
+				{#if err('gtin')}<span class="err">{err('gtin')}</span>{/if}
+			</label>
 			<label class="wide">
 				{m['filament.fields.comment']()}
 				<input bind:value={draft.comment} placeholder="—" />

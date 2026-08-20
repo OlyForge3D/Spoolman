@@ -283,6 +283,7 @@ async def _search_filaments(
         ("name", models.Filament.name),
         ("material", models.Filament.material),
         ("article_number", models.Filament.article_number),
+        ("gtin", models.Filament.gtin),
         ("comment", models.Filament.comment),
     )
     # The vendor name is searched alongside the filament's own fields, so a query mixing

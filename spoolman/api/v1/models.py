@@ -199,6 +199,16 @@ class Filament(BaseModel):
         description="Vendor article number, e.g. EAN, QR code, etc.",
         examples=["PM70820"],
     )
+    gtin: str | None = Field(
+        None,
+        max_length=14,
+        description=(
+            "The barcode of this filament type, as a zero-padded 14 digit GTIN. UPC-A (GTIN-12) and "
+            "EAN-13 barcodes are stored in this padded form so that they match no matter which length "
+            "a scanner reports."
+        ),
+        examples=["00850078714923"],
+    )
     comment: str | None = Field(
         None,
         max_length=1024,
@@ -269,6 +279,7 @@ class Filament(BaseModel):
             weight=item.weight,
             spool_weight=item.spool_weight,
             article_number=item.article_number,
+            gtin=item.gtin,
             comment=item.comment,
             settings_extruder_temp=item.settings_extruder_temp,
             settings_bed_temp=item.settings_bed_temp,
@@ -516,7 +527,7 @@ class SearchResultFilament(BaseModel):
     match_field: str = Field(
         description=(
             "Which field matched the query: a native field name (e.g. 'name', 'material', "
-            "'article_number', 'comment'), 'color' for a color-similarity match, or 'extra.<key>'."
+            "'article_number', 'gtin', 'comment'), 'color' for a color-similarity match, or 'extra.<key>'."
         ),
         examples=["color"],
     )
