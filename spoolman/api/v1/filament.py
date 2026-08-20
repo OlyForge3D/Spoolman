@@ -46,7 +46,7 @@ def _normalize_gtin_param(value: str | None) -> str | None:
         return None
     normalized = normalize_gtin(value)
     if normalized is None:
-        raise ValueError(f"'{value}' is not a valid GTIN.")
+        raise ValueError(f"{value!r} is not a valid GTIN.")
     return normalized
 
 
@@ -85,7 +85,7 @@ class FilamentParameters(BaseModel):
     article_number: str | None = Field(
         None,
         max_length=64,
-        description="Vendor article number, e.g. EAN, QR code, etc.",
+        description="Vendor article number or SKU. For the barcode printed on the packaging, use gtin instead.",
         examples=["PM70820"],
     )
     gtin: str | None = Field(

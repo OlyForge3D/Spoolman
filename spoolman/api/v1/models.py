@@ -196,7 +196,7 @@ class Filament(BaseModel):
     article_number: str | None = Field(
         None,
         max_length=64,
-        description="Vendor article number, e.g. EAN, QR code, etc.",
+        description="Vendor article number or SKU. For the barcode printed on the packaging, use gtin instead.",
         examples=["PM70820"],
     )
     gtin: str | None = Field(
