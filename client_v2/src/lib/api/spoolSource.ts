@@ -50,6 +50,8 @@ export interface NewFilamentDraft {
 	bedTemp?: number;
 	price?: number;
 	articleNumber?: string;
+	/** Scannable retail barcode, already normalized to a 14 digit GTIN. */
+	gtin?: string;
 	comment?: string;
 	/** Custom-field values to carry over (used when duplicating a filament). */
 	extra?: Extra;
@@ -333,6 +335,7 @@ class HttpSpoolSource {
 			settings_bed_temp: draft.bedTemp || undefined,
 			price: draft.price || undefined,
 			article_number: draft.articleNumber || undefined,
+			gtin: draft.gtin || undefined,
 			comment: draft.comment || undefined,
 			extra: draft.extra && Object.keys(draft.extra).length ? draft.extra : undefined,
 			...colorFieldsToApi(draft.colors, draft.multiColorDirection)

@@ -22,6 +22,7 @@ from spoolman.database.database import get_db_session
 from spoolman.database.utils import parse_sort
 from spoolman.exceptions import ItemDeleteError
 from spoolman.extra_fields import EntityType, get_extra_fields, validate_extra_field_dict
+from spoolman.gtin import normalize_gtin
 from spoolman.ws import websocket_manager
 
 logger = logging.getLogger(__name__)
@@ -32,6 +33,21 @@ router = APIRouter(
 )
 
 # ruff: noqa: D103
+
+
+def _normalize_gtin_param(value: str | None) -> str | None:
+    """Normalize a GTIN supplied on create or update, rejecting one that isn't a valid barcode.
+
+    An empty value clears the field. Anything else has to be a real GTIN: storing a mis-scanned or
+    unnormalized barcode would defeat the point of having the column, since it would never match
+    the same product scanned again.
+    """
+    if not value:
+        return None
+    normalized = normalize_gtin(value)
+    if normalized is None:
+        raise ValueError(f"{value!r} is not a valid GTIN.")
+    return normalized
 
 
 class FilamentParameters(BaseModel):
@@ -69,8 +85,19 @@ class FilamentParameters(BaseModel):
     article_number: str | None = Field(
         None,
         max_length=64,
-        description="Vendor article number, e.g. EAN, QR code, etc.",
+        description="Vendor article number or SKU. For the barcode printed on the packaging, use gtin instead.",
         examples=["PM70820"],
+    )
+    gtin: str | None = Field(
+        None,
+        max_length=32,
+        description=(
+            "The barcode of this filament type. A GTIN-8/12/13/14 (EAN-8, UPC-A, EAN-13) is accepted in "
+            "any of those lengths, with or without separators, and is stored zero-padded to 14 digits so "
+            "that it matches no matter which length a scanner reports. A value that is not a valid GTIN "
+            "is rejected."
+        ),
+        examples=["00850078714923"],
     )
     comment: str | None = Field(
         None,
@@ -256,7 +283,8 @@ async def find(
         Query(
             title="Search",
             description=(
-                "General search across vendor name, filament name, material, article number, and external ID. "
+                "General search across vendor name, filament name, material, article number, GTIN, "
+                "and external ID. "
                 "Separate multiple terms with a comma. Surround a term with quotes for an exact match."
             ),
         ),
@@ -293,6 +321,20 @@ async def find(
                 "Specify an empty string to match filaments with no article number. "
                 "Surround a term with quotes to search for the exact term."
             ),
+        ),
+    ] = None,
+    gtin: Annotated[
+        str | None,
+        Query(
+            title="Filament GTIN",
+            description=(
+                "Partial case-insensitive search term for the filament GTIN. "
+                "Since GTINs are stored zero-padded to 14 digits, a bare UPC-A or EAN-13 matches as-is. "
+                "Separate multiple terms with a comma. "
+                "Specify an empty string to match filaments with no GTIN. "
+                "Surround a term with quotes to search for the exact term."
+            ),
+            examples=["850078714923"],
         ),
     ] = None,
     color_hex: Annotated[
@@ -378,6 +420,7 @@ async def find(
             name=name,
             material=material,
             article_number=article_number,
+            gtin=gtin,
             external_id=external_id,
             extra_field_filters=extra_field_filters if extra_field_filters else None,
             sort_by=sort_by,
@@ -471,6 +514,11 @@ async def create(  # noqa: ANN201
         except ValueError as e:
             return JSONResponse(status_code=400, content=Message(message=str(e)).dict())
 
+    try:
+        gtin = _normalize_gtin_param(body.gtin)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content=Message(message=str(e)).dict())
+
     db_item = await filament.create(
         db=db,
         density=body.density,
@@ -482,6 +530,7 @@ async def create(  # noqa: ANN201
         weight=body.weight,
         spool_weight=body.spool_weight,
         article_number=body.article_number,
+        gtin=gtin,
         comment=body.comment,
         settings_extruder_temp=body.settings_extruder_temp,
         settings_bed_temp=body.settings_bed_temp,
@@ -520,6 +569,12 @@ async def update(  # noqa: ANN201
         all_fields = await get_extra_fields(db, EntityType.filament)
         try:
             validate_extra_field_dict(all_fields, body.extra)
+        except ValueError as e:
+            return JSONResponse(status_code=400, content=Message(message=str(e)).dict())
+
+    if "gtin" in patch_data:
+        try:
+            patch_data["gtin"] = _normalize_gtin_param(body.gtin)
         except ValueError as e:
             return JSONResponse(status_code=400, content=Message(message=str(e)).dict())
 

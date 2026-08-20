@@ -14,6 +14,7 @@ import type { Extra, Filament, MultiColorDirection } from '$lib/types';
 import type { NewFilamentDraft } from '$lib/api/spoolSource';
 import { parseDecimal } from '$lib/utils/numeric';
 import { HEX_RE, numErr } from '$lib/utils/validate';
+import { normalizeGtin } from '$lib/filament/gtin';
 import type { MaterialSpec } from '$lib/data/materials';
 import * as m from '$lib/paraglide/messages';
 
@@ -29,6 +30,7 @@ export interface FilamentDraft {
 	nozzleTemp: string;
 	bedTemp: string;
 	articleNumber: string;
+	gtin: string;
 	comment: string;
 }
 
@@ -60,6 +62,7 @@ export function emptyFilamentDraft(name = ''): FilamentDraft {
 		nozzleTemp: '',
 		bedTemp: '',
 		articleNumber: '',
+		gtin: '',
 		comment: ''
 	};
 }
@@ -68,8 +71,9 @@ export function emptyFilamentDraft(name = ''): FilamentDraft {
  * A draft copied from an existing filament — the "I bought the same filament in
  * another colour" case. Everything that describes the *product* carries over;
  * everything that identifies the *variant* is left for the user: the colour is
- * cleared and the article number (a per-colour SKU) is dropped. The name is kept
- * as a starting point since it is usually one word away from the new one.
+ * cleared and the article number and barcode (both per-colour) are dropped. The
+ * name is kept as a starting point since it is usually one word away from the
+ * new one.
  */
 export function filamentDraftFrom(f: Filament, vendorName: string): FilamentDraft {
 	return {
@@ -83,6 +87,7 @@ export function filamentDraftFrom(f: Filament, vendorName: string): FilamentDraf
 		nozzleTemp: f.nozzleTemp ? String(f.nozzleTemp) : '',
 		bedTemp: f.bedTemp ? String(f.bedTemp) : '',
 		articleNumber: '',
+		gtin: '',
 		comment: f.comment
 	};
 }
@@ -138,7 +143,7 @@ export const FILAMENT_FIELD_ORDER = [
  * Callers add their own: a dialog that shows the weight trio in this component
  * puts spoolWeight and price in there too.
  */
-export const FILAMENT_ADVANCED_KEYS = ['density', 'diameter', 'nozzleTemp', 'bedTemp'];
+export const FILAMENT_ADVANCED_KEYS = ['density', 'diameter', 'nozzleTemp', 'bedTemp', 'gtin'];
 
 /**
  * Field errors for the filament half of a form, keyed by field name ('' entries
@@ -164,6 +169,9 @@ export function filamentDraftErrors(draft: FilamentDraft, weights?: FilamentWeig
 	e.nozzleTemp = numErr(draft.nozzleTemp, { min: 0 });
 	e.bedTemp = numErr(draft.bedTemp, { min: 0 });
 	if (draft.colors.some((c) => c.trim() && !HEX_RE.test(c.trim()))) e.colorHex = m['validation.hexDigits']();
+	// The API stores a barcode normalized and refuses anything that isn't a real GTIN, so
+	// catch a mistyped or partial one here rather than as a failed request.
+	if (draft.gtin.trim() && normalizeGtin(draft.gtin) === null) e.gtin = m['validation.gtin']();
 	if (weights) {
 		e.netWeight = numErr(weights.weight, { gt: 0 });
 		e.spoolWeight = numErr(weights.spoolWeight, { min: 0 });
@@ -209,6 +217,7 @@ export function toNewFilamentDraft(
 		bedTemp: numPos(draft.bedTemp),
 		price: numPos(weights.price),
 		articleNumber: draft.articleNumber.trim() || undefined,
+		gtin: normalizeGtin(draft.gtin) ?? undefined,
 		comment: draft.comment.trim() || undefined,
 		extra
 	};

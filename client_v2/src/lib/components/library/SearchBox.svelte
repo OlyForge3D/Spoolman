@@ -189,6 +189,7 @@
 			name: m['filament.fields.name'],
 			material: m['filament.fields.material'],
 			article_number: m['filament.fields.articleNumber'],
+			gtin: m['filament.fields.gtin'],
 			comment: m['filament.fields.comment'],
 			id: m['filament.fields.id'],
 			color: m['filament.fields.colorHex'],

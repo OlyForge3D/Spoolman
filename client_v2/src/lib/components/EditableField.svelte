@@ -20,9 +20,19 @@
 		 * the links sit next to the field rather than replacing it.
 		 */
 		linkify?: boolean;
+		/** Mark the current text as not yet acceptable, e.g. a half-typed barcode. */
+		invalid?: boolean;
 	}
 
-	let { value, placeholder = '—', mono = false, oninput, ariaLabel, linkify = false }: Props = $props();
+	let {
+		value,
+		placeholder = '—',
+		mono = false,
+		oninput,
+		ariaLabel,
+		linkify = false,
+		invalid = false
+	}: Props = $props();
 
 	// Named by the enclosing <Field>'s label cell when there is one; see fieldLabel.ts.
 	const labelId = getFieldLabelId();
@@ -34,10 +44,12 @@
 	<input
 		class="edit"
 		class:mono
+		class:invalid
 		{value}
 		{placeholder}
 		aria-label={ariaLabel}
 		aria-labelledby={ariaLabel ? undefined : labelId}
+		aria-invalid={invalid}
 		oninput={(e) => oninput?.(e.currentTarget.value)}
 	/>
 	{#each urls as url (url)}
@@ -72,6 +84,11 @@
 	}
 	.edit:focus {
 		border-bottom-color: var(--accent);
+	}
+	.edit.invalid,
+	.edit.invalid:focus {
+		border-bottom-style: solid;
+		border-bottom-color: var(--danger);
 	}
 	.open {
 		position: relative;

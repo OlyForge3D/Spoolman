@@ -1,6 +1,7 @@
 import type { Spool, Filament, Vendor } from '$lib/types';
 import type { FieldDef, EntityType } from '$lib/api/fields';
 import type { LabelKind } from './types';
+import { formatGtin } from '$lib/filament/gtin';
 import * as m from '$lib/paraglide/messages';
 
 // Resolves `{placeholder}` templates against a spool and its filament/vendor.
@@ -59,6 +60,7 @@ const RESOLVERS: Record<string, (b: LabelBinding) => string | number | null | un
 	'filament.bedTemp': (b) => fmtNum(b.filament?.bedTemp),
 	'filament.color': (b) => b.filament?.colors[0],
 	'filament.articleNumber': (b) => b.filament?.articleNumber,
+	'filament.gtin': (b) => formatGtin(b.filament?.gtin) || undefined,
 	'filament.comment': (b) => b.filament?.comment,
 	'filament.externalId': (b) => b.filament?.externalId,
 	'filament.registered': (b) => b.filament?.registeredLabel,
@@ -175,6 +177,7 @@ const FIXED_GROUPS: PlaceholderGroup[] = [
 			{ token: 'filament.bedTemp', labelKey: m['labels.fields.bedTemp'] },
 			{ token: 'filament.color', labelKey: m['inspector.colorHex'] },
 			{ token: 'filament.articleNumber', labelKey: m['filament.fields.articleNumber'] },
+			{ token: 'filament.gtin', labelKey: m['filament.fields.gtin'] },
 			{ token: 'filament.externalId', labelKey: m['filament.fields.externalId'] },
 			{ token: 'filament.registered', labelKey: m['filament.fields.registered'] },
 			{ token: 'filament.comment', labelKey: m['filament.fields.comment'] }

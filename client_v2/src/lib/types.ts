@@ -47,6 +47,8 @@ export interface Filament {
 	price: number;
 	/** Manufacturer article/SKU number. */
 	articleNumber?: string;
+	/** Scannable retail barcode, as a zero-padded 14 digit GTIN. */
+	gtin?: string;
 	comment: string;
 	/** SpoolmanDB id if this filament was imported from the external database. */
 	externalId?: string;

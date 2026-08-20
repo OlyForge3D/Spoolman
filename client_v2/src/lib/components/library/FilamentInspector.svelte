@@ -37,6 +37,7 @@
 	import { classifyDeleteFailure, planFilamentDelete } from '$lib/library/deletion';
 	import { toasts } from '$lib/stores/toasts.svelte';
 	import { loadMaterials } from '$lib/data/materials';
+	import { formatGtin, normalizeGtin } from '$lib/filament/gtin';
 	import { live } from '$lib/api/live';
 	import { makeSaver, makeExtraSaver } from '$lib/utils/saver';
 	import { trackSave } from '$lib/utils/autosave';
@@ -123,6 +124,23 @@
 	function set(patch: Partial<Filament>) {
 		inventory.patchFilament(filament.id, patch);
 		saver.push(filament.id, patch);
+	}
+
+	// A GTIN is stored normalized and the API refuses anything that isn't a whole, valid
+	// barcode, so a half-typed one is held back instead of being sent and rejected on every
+	// keystroke. The field marks itself invalid until what's in it is a real GTIN; clearing
+	// it is always allowed, since that just means the filament has no barcode.
+	let gtinInvalid = $state(false);
+
+	function setGtin(value: string) {
+		if (!value.trim()) {
+			gtinInvalid = false;
+			set({ gtin: '' });
+			return;
+		}
+		const normalized = normalizeGtin(value);
+		gtinInvalid = normalized === null;
+		if (normalized !== null && normalized !== filament.gtin) set({ gtin: normalized });
 	}
 
 	const extraSaver = makeExtraSaver(
@@ -434,6 +452,9 @@
 						mono
 						oninput={(v) => set({ articleNumber: v })}
 					/>
+				</Field>
+				<Field label={m['filament.fields.gtin']()} help={m['filament.fieldsHelp.gtin']()}>
+					<EditableField value={formatGtin(filament.gtin)} mono invalid={gtinInvalid} oninput={setGtin} />
 				</Field>
 				{#if filament.externalId}
 					<Field label={m['filament.fields.externalId']()} mono>{filament.externalId}</Field>

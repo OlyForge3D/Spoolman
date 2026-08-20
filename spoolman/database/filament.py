@@ -41,6 +41,7 @@ async def create(
     weight: float | None = None,
     spool_weight: float | None = None,
     article_number: str | None = None,
+    gtin: str | None = None,
     comment: str | None = None,
     settings_extruder_temp: int | None = None,
     settings_bed_temp: int | None = None,
@@ -69,6 +70,7 @@ async def create(
         weight=weight,
         spool_weight=spool_weight,
         article_number=article_number,
+        gtin=gtin,
         comment=comment,
         settings_extruder_temp=settings_extruder_temp,
         settings_bed_temp=settings_bed_temp,
@@ -106,6 +108,7 @@ async def find(
     name: str | None = None,
     material: str | None = None,
     article_number: str | None = None,
+    gtin: str | None = None,
     external_id: str | None = None,
     extra_field_filters: dict[str, str] | None = None,
     sort_by: dict[str, SortOrder] | None = None,
@@ -135,6 +138,7 @@ async def find(
             models.Filament.name,
             models.Filament.material,
             models.Filament.article_number,
+            models.Filament.gtin,
             models.Filament.external_id,
         ],
         search,
@@ -142,6 +146,7 @@ async def find(
     stmt = add_where_clause_str_opt(stmt, models.Filament.name, name)
     stmt = add_where_clause_str_opt(stmt, models.Filament.material, material)
     stmt = add_where_clause_str_opt(stmt, models.Filament.article_number, article_number)
+    stmt = add_where_clause_str_opt(stmt, models.Filament.gtin, gtin)
     stmt = add_where_clause_str_opt(stmt, models.Filament.external_id, external_id)
 
     total_count = None
