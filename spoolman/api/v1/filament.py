@@ -285,6 +285,8 @@ async def find(
             description=(
                 "General search across vendor name, filament name, material, article number, GTIN, "
                 "and external ID. "
+                "A term that is a valid GTIN also matches the barcode in the zero-padded 14 digit form "
+                "it is stored as, whichever GS1 length or separators the term carries. "
                 "Separate multiple terms with a comma. Surround a term with quotes for an exact match."
             ),
         ),
@@ -329,7 +331,9 @@ async def find(
             title="Filament GTIN",
             description=(
                 "Partial case-insensitive search term for the filament GTIN. "
-                "Since GTINs are stored zero-padded to 14 digits, a bare UPC-A or EAN-13 matches as-is. "
+                "GTINs are stored zero-padded to 14 digits, and a term that is a valid GTIN also "
+                "matches that stored form, so a barcode is found whichever GS1 length it is given in "
+                "and whether or not it carries the separators printed under it. "
                 "Separate multiple terms with a comma. "
                 "Specify an empty string to match filaments with no GTIN. "
                 "Surround a term with quotes to search for the exact term."

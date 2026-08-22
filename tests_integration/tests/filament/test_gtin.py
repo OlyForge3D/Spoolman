@@ -138,6 +138,11 @@ def test_update_filament_gtin_clear(random_filament: dict[str, Any]):
         pytest.param(UPC_A, id="as-printed"),
         pytest.param(UPC_A_STORED, id="as-stored"),
         pytest.param(f'"{UPC_A_STORED}"', id="exact"),
+        # The barcode as printed, asked for exactly: the padding is Spoolman's, not the label's,
+        # so a caller quoting what it scanned still has to find it.
+        pytest.param(f'"{UPC_A}"', id="exact-as-printed"),
+        # What a label reads with the separators printed under the bars.
+        pytest.param(f"{UPC_A[:1]}-{UPC_A[1:6]}-{UPC_A[6:]}", id="with-separators"),
     ],
 )
 def test_find_filament_by_gtin(query: str):
@@ -158,17 +163,67 @@ def test_find_filament_by_gtin(query: str):
         httpx.delete(f"{URL}/api/v1/filament/{filament['id']}").raise_for_status()
 
 
-def test_search_filament_by_gtin():
-    """The general search term matches a filament's GTIN."""
+def test_find_filament_by_gtin_partial():
+    """A partial-digit term is still a substring search, so widening a barcode has not narrowed it."""
     # Setup
-    wanted = add_filament(gtin=EAN_13)
+    wanted = add_filament(gtin=UPC_A)
+    other = add_filament(gtin=EAN_13)
 
     # Execute
-    result = httpx.get(f"{URL}/api/v1/filament", params={"search": EAN_13_STORED})
+    result = httpx.get(f"{URL}/api/v1/filament", params={"gtin": UPC_A[2:8]})
     result.raise_for_status()
 
     # Verify
     assert_lists_compatible(result.json(), [wanted])
 
     # Clean up
-    httpx.delete(f"{URL}/api/v1/filament/{wanted['id']}").raise_for_status()
+    for filament in (wanted, other):
+        httpx.delete(f"{URL}/api/v1/filament/{filament['id']}").raise_for_status()
+
+
+def test_find_filament_with_no_gtin():
+    """An empty term still means "no barcode recorded" rather than "any barcode"."""
+    # Setup
+    wanted = add_filament()
+    other = add_filament(gtin=UPC_A)
+
+    # Execute
+    result = httpx.get(f"{URL}/api/v1/filament", params={"gtin": ""})
+    result.raise_for_status()
+
+    # Verify
+    assert_lists_compatible(result.json(), [wanted])
+
+    # Clean up
+    for filament in (wanted, other):
+        httpx.delete(f"{URL}/api/v1/filament/{filament['id']}").raise_for_status()
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        pytest.param(EAN_13, id="as-printed"),
+        pytest.param(EAN_13_STORED, id="as-stored"),
+        pytest.param(f'"{EAN_13}"', id="exact-as-printed"),
+    ],
+)
+def test_search_filament_by_gtin(query: str):
+    """The general search term matches a filament's GTIN.
+
+    The search filter matches on a prefix, so the padding the column carries would otherwise put
+    a barcode scanned as printed out of its reach entirely.
+    """
+    # Setup
+    wanted = add_filament(gtin=EAN_13)
+    other = add_filament(gtin=UPC_A)
+
+    # Execute
+    result = httpx.get(f"{URL}/api/v1/filament", params={"search": query})
+    result.raise_for_status()
+
+    # Verify
+    assert_lists_compatible(result.json(), [wanted])
+
+    # Clean up
+    for filament in (wanted, other):
+        httpx.delete(f"{URL}/api/v1/filament/{filament['id']}").raise_for_status()

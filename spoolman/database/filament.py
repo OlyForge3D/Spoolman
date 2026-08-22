@@ -25,6 +25,7 @@ from spoolman.database.utils import (
 )
 from spoolman.exceptions import ItemDeleteError, ItemNotFoundError
 from spoolman.extra_field_registry import EntityType
+from spoolman.gtin import expand_gtin_query
 from spoolman.math import delta_e, hex_to_rgb, rgb_to_lab
 from spoolman.ws import websocket_manager
 
@@ -141,12 +142,12 @@ async def find(
             models.Filament.gtin,
             models.Filament.external_id,
         ],
-        search,
+        expand_gtin_query(search),
     )
     stmt = add_where_clause_str_opt(stmt, models.Filament.name, name)
     stmt = add_where_clause_str_opt(stmt, models.Filament.material, material)
     stmt = add_where_clause_str_opt(stmt, models.Filament.article_number, article_number)
-    stmt = add_where_clause_str_opt(stmt, models.Filament.gtin, gtin)
+    stmt = add_where_clause_str_opt(stmt, models.Filament.gtin, expand_gtin_query(gtin))
     stmt = add_where_clause_str_opt(stmt, models.Filament.external_id, external_id)
 
     total_count = None

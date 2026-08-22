@@ -50,6 +50,37 @@ def normalize_gtin(value: str | None) -> str | None:
     return digits.zfill(_GTIN_STORED_LENGTH)
 
 
+def expand_gtin_query(value: str | None) -> str | None:
+    """Widen a filter value so a barcode term also matches the 14 digit form it is stored as.
+
+    A query carries whatever the label or the scanner produced -- a bare UPC-A, or an EAN-13 with
+    the separators printed under it -- while the column holds the zero-padded 14 digit form. The
+    two only line up by chance: the ``gtin`` filter's substring match happens to cover a bare
+    barcode, but its quoted exact form does not, and the ``search`` filter matches on a prefix, so
+    ``850078714923`` misses ``00850078714923`` outright.
+
+    Every term that is a valid GTIN therefore gains an extra exact-match term for its normalized
+    form. Terms are OR'd together by the filter helpers, and the original term is kept, so this
+    only ever widens the filter -- a partial-digit search such as ``8500787`` still behaves as
+    before, as does an empty term's "field is unset" meaning.
+    """
+    if not value:
+        return value
+
+    terms = value.split(",")
+    extra: list[str] = []
+    for term in terms:
+        quoted = len(term) > 1 and term[0] == '"' and term[-1] == '"'
+        normalized = normalize_gtin(term[1:-1] if quoted else term)
+        if normalized is None:
+            continue
+        exact = f'"{normalized}"'
+        if exact not in terms and exact not in extra:
+            extra.append(exact)
+
+    return ",".join(terms + extra)
+
+
 def format_gtin(value: str | None) -> str | None:
     """Render a stored GTIN in the shortest GS1 length that fits it.
 
