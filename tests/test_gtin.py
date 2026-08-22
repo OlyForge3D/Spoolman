@@ -2,7 +2,7 @@
 
 import pytest
 
-from spoolman.gtin import format_gtin, normalize_gtin
+from spoolman.gtin import expand_gtin_query, format_gtin, normalize_gtin
 
 
 @pytest.mark.parametrize(
@@ -99,3 +99,46 @@ def test_format_gtin_round_trip(value: str):
     normalized = normalize_gtin(value)
     assert normalized is not None
     assert format_gtin(normalized) == value
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        pytest.param("850078714923", '850078714923,"00850078714923"', id="as-printed"),
+        pytest.param('"850078714923"', '"850078714923","00850078714923"', id="quoted"),
+        pytest.param("8-500787-14923", '8-500787-14923,"00850078714923"', id="separators"),
+        pytest.param("96385074", '96385074,"00000096385074"', id="gtin-8"),
+        pytest.param(
+            "850078714923,6938936709947",
+            '850078714923,6938936709947,"00850078714923","06938936709947"',
+            id="two-barcodes",
+        ),
+    ],
+)
+def test_expand_gtin_query_adds_the_stored_form(value: str, expected: str):
+    """A barcode term gains an exact-match term for the 14 digit form the column holds."""
+    assert expand_gtin_query(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        # Already the stored form, quoted: the term it would gain is the one it already is.
+        pytest.param('"00850078714923"', id="already-stored"),
+        # Too few digits to be a GTIN, so it stays a partial-digit search.
+        pytest.param("8500787", id="partial"),
+        # A bad check digit is not a barcode, so there is no stored form to add.
+        pytest.param("850078714924", id="bad-check-digit"),
+        pytest.param("PM70820", id="article-number"),
+        # An empty term means "no GTIN recorded" and must keep meaning that.
+        pytest.param("", id="empty"),
+        pytest.param("PLA,", id="trailing-empty"),
+    ],
+)
+def test_expand_gtin_query_leaves_a_non_barcode_alone(value: str):
+    """Only a valid GTIN is widened, so every other filter keeps its exact prior meaning."""
+    assert expand_gtin_query(value) == value
+
+
+def test_expand_gtin_query_none():
+    assert expand_gtin_query(None) is None
