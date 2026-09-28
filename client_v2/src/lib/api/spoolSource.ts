@@ -168,7 +168,8 @@ class HttpSpoolSource {
 			sort: sortParam(query.sort),
 			limit: query.limit,
 			offset: query.offset,
-			allow_archived: query.allowArchived ? 'true' : undefined
+			allow_archived: query.allowArchived ? 'true' : undefined,
+			include_empty: query.includeEmpty ? 'true' : undefined
 		};
 		applyFilters(params, query.filters);
 
@@ -235,12 +236,18 @@ class HttpSpoolSource {
 		return filaments.map((m) => m.entity).slice(0, limit);
 	}
 
-	async searchExternalFilaments(query: string, limit = 8): Promise<ExternalFilament[]> {
+	async searchExternalFilaments(
+		query: string,
+		limit: number,
+		offset = 0,
+		signal?: AbortSignal
+	): Promise<Page<ExternalFilament>> {
 		// Filtering happens server-side (/external/filament/search) so the whole catalog
 		// — thousands of entries — never has to be downloaded to the client.
 		const q = query.trim();
-		if (!q) return [];
-		return getJson<ExternalFilament[]>('/external/filament/search', { query: q, limit });
+		if (!q) return { items: [], total: 0 };
+		const { items, total } = await getList('/external/filament/search', { query: q, limit, offset }, signal);
+		return { items: items as ExternalFilament[], total };
 	}
 
 	/**

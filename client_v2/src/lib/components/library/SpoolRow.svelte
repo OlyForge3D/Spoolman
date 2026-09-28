@@ -6,6 +6,7 @@
 	import ProgressBar from '../ProgressBar.svelte';
 	import { rowIdentity, type RowContext, type SpoolVM } from '$lib/utils/library';
 	import * as params from '$lib/library/params';
+	import { truncTitle } from '$lib/actions/truncated';
 	import { page } from '$app/state';
 	import * as m from '$lib/paraglide/messages';
 
@@ -36,7 +37,8 @@
 	{#if showSwatch}
 		<Swatch colors={vm.filament.colors} direction={vm.filament.multiColorDirection} size={22} />
 	{/if}
-	<span class="name">
+	<!-- Both columns fall back to a hover tooltip when they run out of room (#1093). -->
+	<span class="name" use:truncTitle>
 		{#if identity.title}<span class="title">{identity.title}</span>{/if}
 		{#if identity.sub}<span class="sub">{identity.sub}</span>{/if}
 	</span>
@@ -45,7 +47,7 @@
 	{/if}
 	<ProgressBar value={vm.pctValue} danger={vm.low} width="56px" />
 	<span class="rem mono" class:low={vm.low}>{vm.remLabel}</span>
-	<span class="right">{vm.location}</span>
+	<span class="right" use:truncTitle>{vm.location}</span>
 </a>
 
 <style>
@@ -110,8 +112,11 @@
 	.rem {
 		font-size: 11px;
 		color: var(--text-2);
-		width: 44px;
+		/* A floor, not a fixed width: "987.5 g" and "10.2 kg" run past 44px and would
+		   wrap the unit onto its own line (#1124). */
+		min-width: 44px;
 		text-align: right;
+		white-space: nowrap;
 		flex: none;
 	}
 	.rem.low {

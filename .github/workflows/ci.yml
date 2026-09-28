@@ -3,7 +3,15 @@ name: CI
 on:
   push:
     branches:
-      - master
+      # Every branch builds, so a fix can be handed to a bug reporter as a Docker
+      # image before it merges (see publish-images). Weblate pushes locale-only
+      # commits constantly and dependabot's branches arrive as PRs anyway, so
+      # neither is worth a full multi-arch run.
+      - "**"
+      - "!weblate*"
+      - "!dependabot/**"
+    tags:
+      - "v*"
   pull_request:
     branches:
       - master
@@ -13,12 +21,12 @@ permissions:
   contents: read
   packages: read
 
-# A new push to a PR makes the previous run's result irrelevant, so cancel it and
-# let the new one have the runners. Gated on the event: the push triggers are
-# master and v* tags, and a cancelled tag run is a half-published release.
+# A new push makes the previous run's result irrelevant, so cancel it and let the
+# new one have the runners. Master and tags are exempt: both publish images, and a
+# cancelled run there is a half-published release.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' && !startsWith(github.ref, 'refs/tags/') }}
 
 env:
   GHCR_IMAGE: olyforge3d/spoolman
@@ -28,6 +36,11 @@ jobs:
   # Linting
   #
   style:
+    # Same-repo branches already got a full run from the push trigger, so skip the
+    # duplicate pull_request run. Forks still need it: a fork's push fires no event
+    # here. Skipping the three jobs that have no `needs` cascades to every other
+    # job, since a skipped dependency skips its dependents.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -70,6 +83,11 @@ jobs:
   # This is done on native hardware to speed things up, vite is very slow on emulated hardware
   #
   build-client:
+    # Same-repo branches already got a full run from the push trigger, so skip the
+    # duplicate pull_request run. Forks still need it: a fork's push fires no event
+    # here. Skipping the three jobs that have no `needs` cascades to every other
+    # job, since a skipped dependency skips its dependents.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -217,6 +235,11 @@ jobs:
   # Build tester image for integration tests
   #
   build-tester:
+    # Same-repo branches already got a full run from the push trigger, so skip the
+    # duplicate pull_request run. Forks still need it: a fork's push fires no event
+    # here. Skipping the three jobs that have no `needs` cascades to every other
+    # job, since a skipped dependency skips its dependents.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository }}
     runs-on: ubuntu-latest
     permissions:
       packages: write
@@ -395,3 +418,393 @@ jobs:
       - name: Stop Spoolman
         if: always()
         run: docker compose -f tests_frontend_v2/docker-compose.yml down -v
+  #
+  # Build arm64 image
+  # Also exported to a tar so test-multiarch-smoke can boot it under QEMU.
+  # On pull requests we can't push to buildcache (forks don't have registry
+  # write access), so cache-to is skipped and we only read from it.
+  #
+  build-arm64:
+    needs: [build-client]
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download client
+        uses: actions/download-artifact@v4.1.7
+        with:
+          name: client
+          path: client/dist
+
+      - name: Download client_v2
+        uses: actions/download-artifact@v4.1.7
+        with:
+          name: client_v2
+          path: client_v2/build
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3.2.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3.6.1
+
+      - name: Log in to the Github Container registry
+        uses: docker/login-action@v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and cache Docker image
+        if: ${{ github.event_name != 'pull_request' }}
+        uses: docker/build-push-action@v6.7.0
+        with:
+          context: .
+          platforms: linux/arm64
+          tags: ${{ env.GHCR_IMAGE }}:test-arm64
+          outputs: type=docker,dest=/tmp/spoolman-arm64.tar
+          cache-from: type=registry,ref=ghcr.io/${{ env.GHCR_IMAGE }}:buildcache-arm64
+          cache-to: type=registry,ref=ghcr.io/${{ env.GHCR_IMAGE }}:buildcache-arm64,mode=max
+
+      # Separate build for pull requests since PRs dont have access to store cache
+      - name: Build and cache Docker image (PR)
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: docker/build-push-action@v6.7.0
+        with:
+          context: .
+          platforms: linux/arm64
+          tags: ${{ env.GHCR_IMAGE }}:test-arm64
+          outputs: type=docker,dest=/tmp/spoolman-arm64.tar
+          cache-from: type=registry,ref=ghcr.io/${{ env.GHCR_IMAGE }}:buildcache-arm64
+
+      - name: Upload arm64 image artifact
+        uses: actions/upload-artifact@v4.4.0
+        with:
+          name: spoolman-image-arm64
+          path: /tmp/spoolman-arm64.tar
+  #
+  # Build arm/v7 image
+  # Also exported to a tar so test-multiarch-smoke can boot it under QEMU.
+  # On pull requests we can't push to buildcache (forks don't have registry
+  # write access), so cache-to is skipped and we only read from it.
+  #
+  build-armv7:
+    needs: [build-client]
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download client
+        uses: actions/download-artifact@v4.1.7
+        with:
+          name: client
+          path: client/dist
+
+      - name: Download client_v2
+        uses: actions/download-artifact@v4.1.7
+        with:
+          name: client_v2
+          path: client_v2/build
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3.2.0
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v3.6.1
+
+      # Keep uv's cache of wheels built from source (asyncpg, greenlet, ...) across
+      # runs. They have no armv7 wheels, and compiling them under QEMU is ~9 of the
+      # ~11 minutes of a build that misses the layer cache (lockfile or base image
+      # changed). The Dockerfile prunes the cache down to just those wheels, so it's
+      # small enough to save on every run and always restore the newest one.
+      - name: Cache uv wheels
+        uses: actions/cache@v4
+        with:
+          path: uv-cache
+          key: uv-cache-armv7-${{ github.run_id }}
+          restore-keys: uv-cache-armv7-
+
+      - name: Inject uv cache into BuildKit
+        uses: reproducible-containers/buildkit-cache-dance@v3.4.0
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          cache-map: |
+            { "uv-cache": "/root/.cache/uv" }
+
+      - name: Log in to the Github Container registry
+        uses: docker/login-action@v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and cache Docker image
+        if: ${{ github.event_name != 'pull_request' }}
+        uses: docker/build-push-action@v6.7.0
+        with:
+          context: .
+          platforms: linux/arm/v7
+          tags: ${{ env.GHCR_IMAGE }}:test-armv7
+          outputs: type=docker,dest=/tmp/spoolman-armv7.tar
+          cache-from: type=registry,ref=ghcr.io/${{ env.GHCR_IMAGE }}:buildcache-armv7
+          cache-to: type=registry,ref=ghcr.io/${{ env.GHCR_IMAGE }}:buildcache-armv7,mode=max
+
+      # Separate build for pull requests since PRs dont have access to store cache
+      - name: Build and cache Docker image (PR)
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: docker/build-push-action@v6.7.0
+        with:
+          context: .
+          platforms: linux/arm/v7
+          tags: ${{ env.GHCR_IMAGE }}:test-armv7
+          outputs: type=docker,dest=/tmp/spoolman-armv7.tar
+          cache-from: type=registry,ref=ghcr.io/${{ env.GHCR_IMAGE }}:buildcache-armv7
+
+      - name: Upload armv7 image artifact
+        uses: actions/upload-artifact@v4.4.0
+        with:
+          name: spoolman-image-armv7
+          path: /tmp/spoolman-armv7.tar
+  #
+  # Smoke test the arm64 and armv7 images under QEMU emulation: boot the
+  # container with no config (defaults to SQLite, no external DB needed) and
+  # confirm /api/v1/health comes up. Emulated boot (interpreter start +
+  # alembic migrations) is slow, hence the generous retry budget.
+  #
+  test-multiarch-smoke:
+    needs: [build-arm64, build-armv7]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            platform: linux/arm64
+            artifact: spoolman-image-arm64
+            tarball: spoolman-arm64.tar
+          - arch: armv7
+            platform: linux/arm/v7
+            artifact: spoolman-image-armv7
+            tarball: spoolman-armv7.tar
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3.2.0
+
+      - name: Download built image
+        uses: actions/download-artifact@v4.1.7
+        with:
+          name: ${{ matrix.artifact }}
+          path: /tmp/spoolman-image
+
+      - name: Load built image
+        run: docker load --input /tmp/spoolman-image/${{ matrix.tarball }}
+
+      - name: Start Spoolman (${{ matrix.arch }}, emulated via QEMU)
+        run: |
+          docker run -d --name spoolman-smoke \
+            --platform ${{ matrix.platform }} \
+            -p 8000:8000 \
+            ${{ env.GHCR_IMAGE }}:test-${{ matrix.arch }}
+
+      - name: Wait for /health endpoint
+        run: |
+          for i in $(seq 1 90); do
+            if curl -fsS http://localhost:8000/api/v1/health; then
+              echo
+              echo "Spoolman (${{ matrix.arch }}) is healthy"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Spoolman (${{ matrix.arch }}) did not become healthy in time" >&2
+          exit 1
+
+      - name: Dump Spoolman logs on failure
+        if: failure()
+        run: docker logs spoolman-smoke
+
+      - name: Stop Spoolman
+        if: always()
+        run: docker rm -f spoolman-smoke
+  #
+  # Release images GHCR and Docker Hub if tests pass
+  # Don't run this for pull requests
+  #
+  publish-images:
+    if: ${{ github.event_name != 'pull_request' }}
+    needs:
+      [
+        test,
+        test-frontend,
+        test-frontend-v2,
+        test-multiarch-smoke,
+        build-amd64,
+        build-arm64,
+        build-armv7,
+        style,
+        build-client,
+      ]
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      # Lets cosign fetch an OIDC token from Github and sign without a private key.
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download client
+        uses: actions/download-artifact@v4.1.7
+        with:
+          name: client
+          path: client/dist
+
+      - name: Download client_v2
+        uses: actions/download-artifact@v4.1.7
+        with:
+          name: client_v2
+          path: client_v2/build
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3.2.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3.6.1
+
+      - name: Log in to the Github Container registry
+        uses: docker/login-action@v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The trailing type=ref,event=branch is what gives an unmerged branch a
+      # pullable image (ghcr.io/olyforge3d/spoolman:my-branch) for a bug reporter to
+      # test. It is GHCR-only and skips master (already published as :edge), so
+      # Docker Hub keeps carrying nothing but :edge and tagged releases.
+      - name: Extract metadata (tags, labels) for GHCR
+        id: meta-ghcr
+        uses: docker/metadata-action@v5.5.1
+        with:
+          images: |
+            ghcr.io/${{ env.GHCR_IMAGE }}
+          tags: |
+            type=edge
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=ref,event=branch,enable=${{ github.ref_name != 'master' }}
+
+      - name: Extract metadata (tags, labels) for Docker Hub
+        id: meta-dh
+        uses: docker/metadata-action@v5.5.1
+        with:
+          images: |
+            ${{ vars.REMOTE_REGISTRY_URL }}/${{ vars.REMOTE_REGISTRY_NAMESPACE }}/${{ vars.REMOTE_REGISTRY_REPOSITORY }}
+          tags: |
+            type=edge
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+
+      - name: Log in to DockerHub
+        uses: docker/login-action@v3.3.0
+        with:
+          registry: ${{ vars.REMOTE_REGISTRY_URL }}
+          username: ${{ secrets.REMOTE_REGISTRY_USERNAME }}
+          password: ${{ secrets.REMOTE_REGISTRY_PASSWORD }}
+      - name: Store git commit and build date
+        run: |
+          echo "GIT_COMMIT=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> "$GITHUB_ENV"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v4.1.2
+        with:
+          # Installer v4+ verifies cosign v3 downloads via the Sigstore bundle
+          # format; pin an explicit, current cosign release for reproducibility.
+          cosign-release: v3.1.1
+
+      - name: Build and push Docker images
+        id: build
+        uses: docker/build-push-action@v6.7.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          push: true
+          tags: |
+            ${{ steps.meta-ghcr.outputs.tags }}
+            ${{ steps.meta-dh.outputs.tags }}
+          labels: ${{ steps.meta-ghcr.outputs.labels }}
+          build-args: |
+            GIT_COMMIT
+            BUILD_DATE
+          cache-from: |
+            type=registry,ref=ghcr.io/${{ env.GHCR_IMAGE }}:buildcache-amd64
+            type=registry,ref=ghcr.io/${{ env.GHCR_IMAGE }}:buildcache-arm64
+            type=registry,ref=ghcr.io/${{ env.GHCR_IMAGE }}:buildcache-armv7
+
+      # Sign the manifest by digest rather than by tag: all the tags above point
+      # at the same digest, and the same digest is valid in both registries, so
+      # signing every tag would just repeat the same signature.
+      - name: Sign the published images
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAGS: |
+            ${{ steps.meta-ghcr.outputs.tags }}
+            ${{ steps.meta-dh.outputs.tags }}
+        run: |
+          echo "${TAGS}" | while read -r tag; do
+            [ -n "${tag}" ] || continue
+            echo "${tag%:*}"
+          done | sort --unique | while read -r repository; do
+            echo "Signing ${repository}@${DIGEST}"
+            cosign sign --yes "${repository}@${DIGEST}"
+          done
+  #
+  # Create Github Release if CI was triggered by a tag
+  #
+  publish-release:
+    if: ${{ (github.event_name != 'pull_request') && startsWith(github.event.ref, 'refs/tags/v') }}
+    needs: [publish-images]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download built spoolman
+        uses: actions/download-artifact@v4.1.7
+        with:
+          name: spoolman
+          path: /tmp/spoolman
+      - name: Generate release info
+        run: |
+          cd /tmp/spoolman
+          echo '{
+            "project_name": "Spoolman",
+            "project_owner": "OlyForge3D",
+            "version": "${{ github.ref_name }}"
+          }' > release_info.json
+
+      - name: Zip
+        run: |
+          cd /tmp/spoolman
+          zip -r spoolman.zip .
+
+      - name: Create release and upload build
+        uses: softprops/action-gh-release@v1
+        id: create-release
+        with:
+          draft: true
+          name: ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          files: /tmp/spoolman/spoolman.zip
+          token: ${{ secrets.GITHUB_TOKEN }}
+          body: "⚠️ TODO ⚠️"

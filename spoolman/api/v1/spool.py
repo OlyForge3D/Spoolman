@@ -5,7 +5,7 @@ import logging
 from datetime import datetime
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Path, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, Path, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
@@ -18,13 +18,19 @@ from spoolman.api.v1.models import (
     Spool,
     SpoolEvent,
     SpoolGroup,
+    Tag,
+    TagConflictMessage,
     Vendor,
     extra_fields_request_description,
 )
+from spoolman.api.v1.tag import TagLinkParameters
+
+# Aliased: `tag` is taken by the find endpoint's query parameter, whose name is API surface.
 from spoolman.database import spool
+from spoolman.database import tag as tag_db
 from spoolman.database.database import get_db_session
 from spoolman.database.utils import parse_sort
-from spoolman.exceptions import ItemCreateError, SpoolMeasureError
+from spoolman.exceptions import ItemCreateError, SpoolMeasureError, TagConflictError
 from spoolman.extra_fields import EntityType, get_extra_fields, validate_extra_field_dict
 from spoolman.ws import websocket_manager
 
@@ -334,6 +340,20 @@ async def find(
             ),
         ),
     ] = None,
+    tag: Annotated[
+        str | None,
+        Query(
+            title="Tag UID",
+            description=(
+                "Match the spool that an NFC/RFID tag with this UID is linked to. Exact match on the "
+                "normalized UID: separators are ignored and case does not matter, so 04:a2:b3:c4, "
+                "04-A2-B3-C4 and 04a2b3c4 all find the same spool. A tag is linked to at most one "
+                "spool, so this returns either one spool or none. Returns 400 if the UID is not "
+                "hexadecimal."
+            ),
+            examples=["04A2B3C4D5E6F7", "04:a2:b3:c4:d5:e6:f7"],
+        ),
+    ] = None,
     allow_archived: Annotated[
         bool,
         Query(title="Allow Archived", description="Whether to include archived spools in the search results."),
@@ -390,6 +410,7 @@ async def find(
             search=search,
             location=location,
             lot_nr=lot_nr,
+            tag=tag,
             allow_archived=allow_archived,
             first_used=first_used,
             last_used=last_used,
@@ -559,6 +580,20 @@ async def find_groups(
         bool,
         Query(title="Allow Archived", description="Whether to include archived spools in the aggregates."),
     ] = False,
+    include_empty: Annotated[
+        bool,
+        Query(
+            title="Include Empty",
+            description=(
+                "Also return matching filaments that hold no matching spools, as groups of zero, "
+                "instead of omitting them. Only valid together with group_by=filament: every "
+                "other axis is keyed by a value read off the spools themselves and so has no "
+                "empty groups to list. Filters on the spools themselves (location, lot_nr, the "
+                "date filters, spool extra fields) are rejected in combination with it, since a "
+                "filament with no spools has no value for them."
+            ),
+        ),
+    ] = False,
     first_used: FirstUsedFilter = None,
     last_used: LastUsedFilter = None,
     registered: RegisteredFilter = None,
@@ -615,6 +650,7 @@ async def find_groups(
             sort_by=sort_by,
             limit=limit,
             offset=offset,
+            include_empty=include_empty,
         )
     except ValueError as e:
         return JSONResponse(status_code=400, content=Message(message=str(e)).dict())
@@ -849,6 +885,72 @@ async def delete(
 ) -> Message:
     await spool.delete(db, spool_id)
     return Message(message="Success!")
+
+
+@router.post(
+    "/{spool_id}/tag",
+    name="Link a tag to a spool",
+    description=(
+        "Link a physical NFC/RFID tag to this spool, so that the tag's UID identifies it. "
+        "A tag identifies exactly one spool or filament; linking a UID that something else already "
+        "holds returns 409 with the holder's id, so a client can offer to move it instead. "
+        "Re-linking a tag to the spool that already holds it succeeds and changes nothing, "
+        "except that a format sent now refines one recorded earlier."
+    ),
+    status_code=201,
+    response_model_exclude_none=True,
+    response_model=Tag,
+    responses={
+        400: {"model": Message},
+        404: {"model": Message},
+        409: {"model": TagConflictMessage},
+    },
+)
+async def link_tag(  # noqa: ANN201
+    db: Annotated[AsyncSession, Depends(get_db_session)],
+    spool_id: int,
+    body: TagLinkParameters,
+):
+    try:
+        db_item = await tag_db.link_spool(db=db, spool_id=spool_id, uid=body.uid, tag_format=body.format)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content=Message(message=str(e)).dict())
+    except TagConflictError as e:
+        return JSONResponse(
+            status_code=409,
+            content=TagConflictMessage(message=str(e), spool_id=e.spool_id, filament_id=e.filament_id).dict(),
+        )
+    return Tag.from_db(db_item)
+
+
+@router.delete(
+    "/{spool_id}/tag/{uid}",
+    name="Unlink a tag from a spool",
+    description=(
+        "Unlink a physical NFC/RFID tag from this spool. The UID is matched the same way it is "
+        "stored: separators are ignored and case does not matter. Deleting a spool unlinks its "
+        "tags on its own, so this is only for taking one tag off a spool that keeps existing."
+    ),
+    status_code=204,
+    responses={400: {"model": Message}, 404: {"model": Message}},
+)
+async def unlink_tag(
+    db: Annotated[AsyncSession, Depends(get_db_session)],
+    spool_id: int,
+    uid: Annotated[
+        str,
+        Path(
+            title="Tag UID",
+            description="The tag's UID, in any shape. Normalized before matching.",
+            examples=["04A2B3C4D5E6F7"],
+        ),
+    ],
+) -> Response:
+    try:
+        await tag_db.unlink_spool(db=db, spool_id=spool_id, uid=uid)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content=Message(message=str(e)).dict())
+    return Response(status_code=204)
 
 
 @router.put(

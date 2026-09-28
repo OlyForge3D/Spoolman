@@ -1,6 +1,6 @@
 [project]
 name = "spoolman"
-version = "0.26.6"
+version = "0.27.0"
 description = "A web service that keeps track of 3D printing spools."
 license = "MIT"
 readme = "README.md"
@@ -24,6 +24,7 @@ dependencies = [
     "httpx~=0.28",
     "hishel~=0.1",
     "aiomysql[rsa]~=0.3",
+    "influxdb-client>=1.50.0",
 ]
 requires-python = ">=3.10"
 
@@ -59,6 +60,10 @@ help = "Fill a running dev instance with a large generated dataset. Never point 
 [tool.poe.tasks.demo-seed]
 cmd = "python scripts/demo_seed.py"
 help = "Fill a running dev instance with the curated screenshot inventory. Never point it at real data."
+
+[tool.poe.tasks.fake-reader]
+cmd = "python scripts/fake_reader.py"
+help = "Act as an NFC tag reader against a running instance, so the tag features need no hardware."
 
 [tool.poe.tasks.itest]
 cmd = "python tests_integration/run.py"

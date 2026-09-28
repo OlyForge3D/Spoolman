@@ -87,6 +87,31 @@ class Message(BaseModel):
     message: str = Field()
 
 
+class TagConflictMessage(Message):
+    """A tag UID is already linked to something else.
+
+    Subclasses Message so the `message` key is where it is in every other error body, and
+    adds the holder's ID so a client can offer to move the tag here instead of making the
+    user go and find it.
+
+    At most one of `spool_id` and `filament_id` is set, naming whichever holds the tag. Both
+    are null when the holder is not a row (see `models.Tag`), in which case `message` still
+    says what; a client that cannot offer "move it here" without an id should fall back to
+    reporting the message.
+    """
+
+    spool_id: int | None = Field(
+        None,
+        description="The spool the tag is already linked to, if it is a spool that holds it.",
+        examples=[42],
+    )
+    filament_id: int | None = Field(
+        None,
+        description="The filament the tag is already linked to, if it is a filament that holds it.",
+        examples=[7],
+    )
+
+
 class SettingResponse(BaseModel):
     value: str = Field(description="Setting value.")
     is_set: bool = Field(description="Whether the setting has been set. If false, 'value' contains the default value.")
@@ -157,6 +182,32 @@ class MultiColorDirection(Enum):
 
     COAXIAL = "coaxial"
     LONGITUDINAL = "longitudinal"
+
+
+class Tag(BaseModel):
+    """A physical NFC/RFID tag linked to a spool or a filament."""
+
+    uid: str = Field(
+        description=(
+            "The tag's hardware UID, normalized to uppercase hexadecimal with separators "
+            "stripped. Unique across everything tagged: one tag identifies exactly one spool or filament."
+        ),
+        examples=["04A2B3C4D5E6F7"],
+    )
+    format: str | None = Field(
+        None,
+        description=(
+            "What kind of tag this is, e.g. openprinttag, ntag, bambu, tigertag. "
+            "Informational, free-form, and not validated against a fixed list."
+        ),
+        examples=["ntag"],
+    )
+    added: SpoolmanDateTime = Field(description="When the tag was linked. UTC Timezone.")
+
+    @staticmethod
+    def from_db(item: models.Tag) -> "Tag":
+        """Create a new Pydantic tag object from a database tag object."""
+        return Tag(uid=item.uid, format=item.format, added=item.added)
 
 
 class Filament(BaseModel):
@@ -263,6 +314,14 @@ class Filament(BaseModel):
     extra: dict[str, str] = Field(
         description=_extra_fields_description("filament"),
     )
+    tags: list[Tag] = Field(
+        default_factory=list,
+        description=(
+            "NFC/RFID tags that identify this filament type itself, rather than one spool of it. "
+            "A tag identifies exactly one spool or filament, so a tag listed here is on no spool. "
+            "Empty if none are linked."
+        ),
+    )
 
     @staticmethod
     def from_db(item: models.Filament) -> "Filament":
@@ -290,6 +349,7 @@ class Filament(BaseModel):
             ),
             external_id=item.external_id,
             extra={field.key: field.value for field in item.extra},
+            tags=[Tag.from_db(tag) for tag in item.tags],
         )
 
 
@@ -373,6 +433,13 @@ class Spool(BaseModel):
     extra: dict[str, str] = Field(
         description=_extra_fields_description("spool"),
     )
+    tags: list[Tag] = Field(
+        default_factory=list,
+        description=(
+            "NFC/RFID tags linked to this spool. A spool can carry more than one tag, e.g. when a "
+            "vendor tag has been copied onto a blank sticker. Empty if none are linked."
+        ),
+    )
 
     @staticmethod
     def from_db(item: models.Spool) -> "Spool":
@@ -421,6 +488,7 @@ class Spool(BaseModel):
             comment=item.comment,
             archived=item.archived if item.archived is not None else False,
             extra={field.key: field.value for field in item.extra},
+            tags=[Tag.from_db(tag) for tag in item.tags],
         )
 
 
@@ -574,6 +642,93 @@ class SearchResults(BaseModel):
     )
 
 
+class TagScan(BaseModel):
+    """One tag read reported by a reader-side agent.
+
+    Scans are ephemeral: they are broadcast to the scan websockets and never stored. The
+    match is resolved server-side and included, so an agent that ignores websockets
+    entirely can use the scan endpoint as a one-shot lookup.
+    """
+
+    uid: str = Field(
+        description="The scanned tag's UID, normalized to uppercase hexadecimal with separators stripped.",
+        examples=["04A2B3C4D5E6F7"],
+    )
+    reader_id: str = Field(
+        description=(
+            "Which reader reported the scan. Either the id the agent sent, or one derived from its "
+            "network address when it sent none."
+        ),
+        examples=["printer-voron"],
+    )
+    name: str | None = Field(
+        None,
+        description="Human-readable name for the reader, if it sent one.",
+        examples=["Voron spool holder"],
+    )
+    format: str | None = Field(
+        None,
+        description="What kind of tag this is, if the agent could tell.",
+        examples=["ntag"],
+    )
+    payload_b64: str | None = Field(
+        None,
+        description=(
+            "The tag's raw contents, base64-encoded, if the agent read them. Carried through "
+            "untouched: Spoolman does not decode tag contents."
+        ),
+    )
+    matched_spool_id: int | None = Field(
+        None,
+        description=(
+            "The spool this tag is linked to, or null if it is not linked to a spool: either the tag "
+            "is not known to Spoolman, or it identifies a filament (see matched_filament_id)."
+        ),
+        examples=[42],
+    )
+    spool: Spool | None = Field(
+        None,
+        description="The matched spool, so a client needs no follow-up request. Null unless a spool matched.",
+    )
+    matched_filament_id: int | None = Field(
+        None,
+        description=(
+            "The filament this tag is linked to, or null if it is not linked to a filament. A tag "
+            "linked to a spool leaves this null; that spool's filament is inside `spool`."
+        ),
+        examples=[7],
+    )
+    filament: Filament | None = Field(
+        None,
+        description="The matched filament, so a client needs no follow-up request. Null unless a filament matched.",
+    )
+
+
+class TagReader(BaseModel):
+    """A reader that has reported a scan recently.
+
+    The registry is in-memory and is not persisted: a reader reappears the moment it
+    scans again, and the list is empty after a restart until one does.
+    """
+
+    reader_id: str = Field(description="The reader's id.", examples=["printer-voron"])
+    name: str | None = Field(
+        None,
+        description="Human-readable name for the reader, if it has sent one.",
+        examples=["Voron spool holder"],
+    )
+    last_seen: SpoolmanDateTime = Field(description="When this reader last reported a scan. UTC Timezone.")
+    last_uid: str | None = Field(
+        None,
+        description=(
+            "The last tag UID this reader reported, normalized. Lets a client offer what is "
+            "already on the reader instead of waiting for another tap. Null if the reader has "
+            "not scanned since the server started."
+        ),
+        examples=["04A2B3C4D5E6F7"],
+    )
+
+
 class Info(BaseModel):
     version: str = Field(examples=["0.7.0"])
     debug_mode: bool = Field(examples=[False])
@@ -588,6 +743,19 @@ class Info(BaseModel):
     )
     git_commit: str | None = Field(None, examples=["a1b2c3d"])
     build_date: SpoolmanDateTime | None = Field(None, examples=["2021-01-01T00:00:00Z"])
+    latest_version: str | None = Field(
+        None,
+        description=(
+            "Latest Spoolman release on GitHub. Null until the server has checked, "
+            "or if the check is disabled via SPOOLMAN_UPDATE_CHECK."
+        ),
+        examples=["0.28.0"],
+    )
+    update_available: bool = Field(
+        default=False,
+        description="True if latest_version is newer than the running version.",
+        examples=[False],
+    )
 
 
 class HealthCheck(BaseModel):
@@ -596,7 +764,6 @@ class HealthCheck(BaseModel):
 
 class BackupResponse(BaseModel):
     path: str = Field(
-        default=None,
         description="Path to the created backup file.",
         examples=["/home/app/.local/share/spoolman/backups/spoolman.db"],
     )
@@ -618,6 +785,9 @@ class EventType(str, Enum):
     ADDED = "added"
     UPDATED = "updated"
     DELETED = "deleted"
+    # Only ever emitted on the dedicated scan websockets (see TagScanEvent), never on the
+    # entity ones, so no existing consumer can receive it.
+    SCANNED = "scanned"
 
 
 class Event(BaseModel):
@@ -655,3 +825,15 @@ class SettingEvent(Event):
 
     payload: SettingKV = Field(description="Updated setting.")
     resource: Literal["setting"] = Field(description="Resource type.")
+
+
+class TagScanEvent(Event):
+    """A tag was scanned by a reader.
+
+    Travels ONLY on the dedicated scan websockets, which are a separate subscription tree
+    from the entity ones. It therefore never reaches the root /api/v1/ websocket, whose
+    subscribers asked to hear about changes to data -- and a scan changes nothing.
+    """
+
+    payload: TagScan = Field(description="The scan.")
+    resource: Literal["tag_scan"] = Field(description="Resource type.")

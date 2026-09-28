@@ -17,6 +17,7 @@
 	import ProgressBar from '../ProgressBar.svelte';
 	import SectionLabel from '../SectionLabel.svelte';
 	import ExtraFieldsSection from '../ExtraFieldsSection.svelte';
+	import TagsSection from '../TagsSection.svelte';
 	import Breadcrumbs from '../Breadcrumbs.svelte';
 	import FieldGrid from '../FieldGrid.svelte';
 	import Field from '../Field.svelte';
@@ -239,6 +240,7 @@
 		<div class="titles">
 			<div class="title">
 				{filament.name}
+				<span class="idmono mono">#{filament.id}</span>
 				{#if filament.externalId}<span
 						class="ext-badge"
 						title={serverInfo.externalDbName + ' · ' + filament.externalId}>{serverInfo.externalDbName}</span
@@ -466,6 +468,8 @@
 			</FieldGrid>
 
 			<ExtraFieldsSection entity="filament" extra={filament.extra} onchange={extraSaver.change} manage />
+
+			<TagsSection kind="filament" id={filament.id} tags={filament.tags} />
 		</div>
 
 		<div class="col">
@@ -493,6 +497,11 @@
 	.title {
 		font-weight: 700;
 		font-size: 16px;
+	}
+	.idmono {
+		font-size: 12px;
+		color: var(--text-muted);
+		font-weight: 400;
 	}
 	.ext-badge {
 		font-size: 10px;

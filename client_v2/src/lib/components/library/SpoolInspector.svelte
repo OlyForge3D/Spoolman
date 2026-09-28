@@ -18,6 +18,7 @@
 	import DateTimeField from '../DateTimeField.svelte';
 	import SectionLabel from '../SectionLabel.svelte';
 	import ExtraFieldsSection from '../ExtraFieldsSection.svelte';
+	import TagsSection from '../TagsSection.svelte';
 	import Breadcrumbs from '../Breadcrumbs.svelte';
 	import FieldGrid from '../FieldGrid.svelte';
 	import Field from '../Field.svelte';
@@ -57,6 +58,7 @@
 		price: 0,
 		comment: '',
 		registeredLabel: '',
+		tags: [],
 		extra: {}
 	};
 
@@ -514,6 +516,8 @@
 			</FieldGrid>
 
 			<ExtraFieldsSection entity="spool" extra={spool.extra} onchange={extraSaver.change} manage />
+
+			<TagsSection kind="spool" id={spool.id} tags={spool.tags} />
 		</div>
 
 		<div class="col">

@@ -9,6 +9,7 @@
 	import { searchAll } from '$lib/api/search';
 	import type { SearchResults } from '$lib/api/types';
 	import { openSearchResult, searchResultHref } from '$lib/library/params';
+	import { truncTitle } from '$lib/actions/truncated';
 	import { page } from '$app/state';
 	import { inventory } from '$lib/stores/inventory.svelte';
 	import { fields } from '$lib/stores/fields.svelte';
@@ -274,8 +275,9 @@
 							<span class="id mono">#{spool.entity.id}</span>
 							<Swatch colors={filament?.colors ?? []} direction={filament?.multiColorDirection} size={20} />
 							<span class="text">
-								<span class="title">{filament?.name || m['search.unknownFilament']()}</span>
-								{#if spool.entity.location}<span class="sub">{spool.entity.location}</span>{/if}
+								<span class="title" use:truncTitle>{filament?.name || m['search.unknownFilament']()}</span>
+								{#if spool.entity.location}<span class="sub" use:truncTitle>{spool.entity.location}</span
+									>{/if}
 							</span>
 							<span class="match">{matchLabel('spool', spool.matchField)}</span>
 						</a>
@@ -308,12 +310,12 @@
 								     the trailing "matched" tag which describes the search hit. Two chips
 								     of the same shape side by side read as the same kind of fact. -->
 								<span class="line">
-									<span class="title">{filament.entity.name}</span>
+									<span class="title" use:truncTitle>{filament.entity.name}</span>
 									{#if filament.entity.material}
 										<MaterialBadge label={filament.entity.material} variant="outline" />
 									{/if}
 								</span>
-								{#if vendor?.name}<span class="sub">{vendor.name}</span>{/if}
+								{#if vendor?.name}<span class="sub" use:truncTitle>{vendor.name}</span>{/if}
 							</span>
 							<span class="match">{matchLabel('filament', filament.matchField)}</span>
 						</a>
@@ -370,7 +372,7 @@
 						>
 							<span class="vendor-icon" aria-hidden="true"><Factory size={14} /></span>
 							<span class="text">
-								<span class="title">{vendor.entity.name}</span>
+								<span class="title" use:truncTitle>{vendor.entity.name}</span>
 							</span>
 							<span class="match">{matchLabel('vendor', vendor.matchField)}</span>
 						</a>
