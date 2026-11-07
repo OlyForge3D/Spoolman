@@ -22,7 +22,7 @@ export function spoolHasFieldValue(spool: Spool, field: GroupField, value: strin
 	try {
 		return JSON.parse(raw) === value;
 	} catch (error) {
-		console.warn(`Invalid cached spool extra field ${key}`, error);
+		console.warn('Invalid cached spool extra field %s', key, error);
 		return false;
 	}
 }

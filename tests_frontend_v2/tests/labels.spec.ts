@@ -55,7 +55,10 @@ test("create a label design and persist it to the server", async ({ page }) => {
   await navTab(page, "Labels", "Labels | Spoolman");
 
   await test.step("create and name a design", async () => {
+    const select = page.getByLabel("Select label design");
+    const previous = await select.inputValue();
     await page.getByRole("button", { name: "New", exact: true }).click();
+    await expect.poll(() => select.inputValue()).not.toBe(previous);
 
     // A fresh design starts from a working template rather than a blank canvas.
     const nameField = page.getByPlaceholder("Design name");

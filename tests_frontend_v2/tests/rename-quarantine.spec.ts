@@ -36,6 +36,17 @@ async function deleteSpool(request: APIRequestContext, spoolId: number, filament
   await request.delete(`${API_BASE}/filament/${filamentId}`);
 }
 
+async function openTemporaryLabelDesign(page: Page) {
+  await page.route("**/api/v1/setting/label_designs", (route) =>
+    route.request().method() === "POST" ? route.fulfill({ json: {} }) : route.fallback(),
+  );
+  await navTab(page, "Labels", "Labels | Spoolman");
+  const select = page.getByLabel("Select label design");
+  const previous = await select.inputValue();
+  await page.getByRole("button", { name: "New", exact: true }).click();
+  await expect.poll(() => select.inputValue()).not.toBe(previous);
+}
+
 test("a failed refresh hides the inspector without losing its pending draft", async ({ page, request }) => {
   const item = await createRenamedSpool(page, request);
   let releaseWrite = () => {};
@@ -106,8 +117,7 @@ test("uncertain spools cannot be previewed, printed, or exported without losing 
         ? route.fulfill({ status: 503, contentType: "application/json", body: "{}" })
         : route.fallback(),
     );
-    await navTab(page, "Labels", "Labels | Spoolman");
-    await page.getByRole("button", { name: "New", exact: true }).click();
+    await openTemporaryLabelDesign(page);
     const preview = page.getByLabel("Preview with");
     await preview.selectOption(String(item.spoolId));
     await expect(page.locator(".stage canvas").first()).toBeVisible();
@@ -193,8 +203,7 @@ for (const mode of ["print", "export"] as const) {
         Object.defineProperty(window, "Image", { configurable: true, writable: true, value: DelayedImage });
         window.print = () => (target.printCount = (target.printCount ?? 0) + 1);
       });
-      await navTab(page, "Labels", "Labels | Spoolman");
-      await page.getByRole("button", { name: "New", exact: true }).click();
+      await openTemporaryLabelDesign(page);
       await expect
         .poll(() => page.evaluate(() => typeof (window as Window & { releaseLabelLogo?: () => void }).releaseLabelLogo))
         .toBe("function");

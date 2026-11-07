@@ -295,10 +295,10 @@ class HttpSpoolSource {
 			this.eventRefreshesInFlight++;
 			void this.refreshUncertainSpools([id])
 				.then((refreshed) => {
-					if (!refreshed) console.error(`Failed to verify spool ${id} after a potentially stale event`);
+					if (!refreshed) console.error('Failed to verify spool %s after a potentially stale event', id);
 				})
 				.catch((error) =>
-					console.error(`Failed to verify spool ${id} after a potentially stale event`, error)
+					console.error('Failed to verify spool %s after a potentially stale event', id, error)
 				)
 				.finally(() => {
 					this.eventRefreshes.delete(id);
@@ -942,7 +942,7 @@ class HttpSpoolSource {
 							refreshed = false;
 						}
 					} catch (error) {
-						console.error(`Failed to refresh spool ${id} after rename`, error);
+						console.error('Failed to refresh spool %s after rename', id, error);
 						refreshed = false;
 					}
 				}
