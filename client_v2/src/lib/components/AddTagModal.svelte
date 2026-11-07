@@ -14,6 +14,7 @@
 	// pressing a second one. A 409 on submit is still handled: the lookup can be
 	// stale, and the server is the authority.
 	import Button from './Button.svelte';
+	import UncertainSpools from './UncertainSpools.svelte';
 	import X from '@lucide/svelte/icons/x';
 	import Nfc from '@lucide/svelte/icons/nfc';
 	import Smartphone from '@lucide/svelte/icons/smartphone';
@@ -67,6 +68,18 @@
 		| { state: 'bad' }
 		| { state: 'unknown' };
 	let lookup = $state<Lookup>({ state: 'empty' });
+	let uncertainIds = $derived.by(() => {
+		const ids: number[] = [];
+		if (target.kind === 'spool' && inventory.isSpoolUncertain(Number(target.id))) ids.push(Number(target.id));
+		if (
+			lookup.state === 'taken' &&
+			lookup.holder.kind === 'spool' &&
+			inventory.isSpoolUncertain(lookup.holder.spool.id) &&
+			!ids.includes(lookup.holder.spool.id)
+		)
+			ids.push(lookup.holder.spool.id);
+		return ids;
+	});
 
 	let nfcReading = $state(false);
 	let nfcError = $state<NfcErrorReason | null>(null);
@@ -200,7 +213,9 @@
 		if (holder.kind === 'filament') {
 			return m['tags.modal.filamentNamed']({ name: nameOf(holder.filament) });
 		}
-		const other: Spool = holder.spool;
+		const other: Spool | undefined = inventory.spoolById(holder.spool.id);
+		if (!other || inventory.isSpoolUncertain(other.id))
+			return m['tags.modal.spoolShort']({ id: holder.spool.id });
 		const filament = inventory.filamentById(other.filamentId);
 		if (!filament) return m['tags.modal.spoolShort']({ id: other.id });
 		return m['tags.modal.spoolNamed']({ id: other.id, name: nameOf(filament) });
@@ -219,6 +234,10 @@
 	async function submit() {
 		const value = uid.trim();
 		if (!value || busy) return;
+		if (uncertainIds.length) {
+			error = m['spool.uncertainDetails']();
+			return;
+		}
 		busy = true;
 		error = null;
 		try {
@@ -255,6 +274,10 @@
 	async function move(from: TagHolder) {
 		const value = uid.trim();
 		if (!value || busy) return;
+		if (uncertainIds.length) {
+			error = m['spool.uncertainDetails']();
+			return;
+		}
 		busy = true;
 		error = null;
 		try {
@@ -346,6 +369,10 @@
 					{/if}
 				</div>
 
+				{#if uncertainIds.length}
+					<UncertainSpools ids={uncertainIds} />
+				{/if}
+
 				<div class="ways">
 					<div class="way">
 						<Radio size={14} class="way-ico" />
@@ -392,7 +419,7 @@
 				<Button variant="ghost" onclick={close}>{m['buttons.cancel']()}</Button>
 				{#if lookup.state === 'taken'}
 					{@const other = lookup.holder}
-					<Button variant="primary" disabled={busy} onclick={() => move(other)}>
+					<Button variant="primary" disabled={busy || uncertainIds.length > 0} onclick={() => move(other)}>
 						<Nfc size={15} />
 						{#if busy}
 							{m['tags.modal.moving']()}
@@ -405,7 +432,11 @@
 				{:else}
 					<Button
 						variant="primary"
-						disabled={busy || !uid.trim() || lookup.state === 'here' || lookup.state === 'bad'}
+						disabled={busy ||
+							uncertainIds.length > 0 ||
+							!uid.trim() ||
+							lookup.state === 'here' ||
+							lookup.state === 'bad'}
 						onclick={submit}
 					>
 						<Nfc size={15} />

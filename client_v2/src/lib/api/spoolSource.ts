@@ -39,6 +39,7 @@ import { type ExternalFilament } from './external';
 import { searchAll } from './search';
 import { loadLayout } from '$lib/dashboard/layout';
 import { withExtraDefaults } from '$lib/utils/extraDefaults';
+import { cacheSpoolRead } from './cacheSpoolRead';
 import {
 	isCurrentSpoolRead,
 	noteSpoolRename,
@@ -202,13 +203,8 @@ function swallow404(e: unknown): null {
 }
 
 function cacheMappedSpools(raw: unknown[], spools: Spool[]): void {
-	for (const s of raw as Json[]) {
-		if (s.filament) {
-			inventory.upsertFilament(mapFilament(s.filament));
-			if (s.filament.vendor) inventory.upsertVendor(mapVendor(s.filament.vendor));
-		}
-	}
-	inventory.upsertSpools(spools);
+	for (const [index, spool] of spools.entries())
+		spools[index] = cacheSpoolRead((raw as Json[])[index], spool);
 }
 
 function cacheSpools(raw: unknown[]): Spool[] {
@@ -247,7 +243,10 @@ class HttpSpoolSource {
 	private readonly ambiguousRenames: { field: GroupField; value: string }[] = [];
 	private readonly eventRefreshes = new Set<number>();
 	private readonly eventRefreshQueue: number[] = [];
+	private readonly eventRefreshGenerations = new Map<number, number>();
+	private readonly eventFullRefreshNeeded = new Set<number>();
 	private eventRefreshesInFlight = 0;
+	private spoolDeletionRevision = 0;
 	private nextSpoolCreation = 0;
 
 	constructor() {
@@ -283,6 +282,12 @@ class HttpSpoolSource {
 	}
 
 	private refreshEventSpool(id: number) {
+		this.eventRefreshGenerations.set(id, (this.eventRefreshGenerations.get(id) ?? 0) + 1);
+		this.eventFullRefreshNeeded.add(id);
+		this.enqueueEventRefresh(id);
+	}
+
+	private enqueueEventRefresh(id: number) {
 		if (this.eventRefreshes.has(id)) return;
 		this.eventRefreshes.add(id);
 		this.eventRefreshQueue.push(id);
@@ -292,6 +297,7 @@ class HttpSpoolSource {
 	private drainEventRefreshes() {
 		while (this.eventRefreshesInFlight < RENAME_REFRESH_CONCURRENCY && this.eventRefreshQueue.length) {
 			const id = this.eventRefreshQueue.shift()!;
+			const generation = this.eventRefreshGenerations.get(id);
 			this.eventRefreshesInFlight++;
 			void this.refreshUncertainSpools([id])
 				.then((refreshed) => {
@@ -303,25 +309,34 @@ class HttpSpoolSource {
 				.finally(() => {
 					this.eventRefreshes.delete(id);
 					this.eventRefreshesInFlight--;
+					if (this.eventRefreshGenerations.get(id) !== generation) this.enqueueEventRefresh(id);
+					else this.eventRefreshGenerations.delete(id);
 					this.drainEventRefreshes();
 				});
 		}
 	}
 
 	ingestLiveEvent(event: LiveEvent): void {
+		if (event.resource === 'spool' && event.type === 'deleted') this.spoolDeletionRevision++;
 		const spool =
 			event.resource === 'spool' && event.type !== 'deleted' && event.payload
 				? mapSpool(event.payload)
 				: undefined;
-		const uncertain = spool ? this.quarantineEventSpool(spool) : false;
-		inventory.ingest(event);
+		const possiblyStale = spool ? this.quarantineEventSpool(spool) : false;
+		const uncertain = spool ? !inventory.considerSpool(spool) || possiblyStale : false;
 		if (spool && uncertain) this.refreshEventSpool(spool.id);
+		else inventory.ingest(event);
 	}
 
-	ingestScannedSpool(spool: Spool): void {
-		const uncertain = this.quarantineEventSpool(spool);
+	ingestScannedSpool(spool: Spool): boolean {
+		const possiblyStale = this.quarantineEventSpool(spool);
+		const uncertain = !inventory.considerSpool(spool) || possiblyStale;
+		if (uncertain) {
+			this.refreshEventSpool(spool.id);
+			return false;
+		}
 		inventory.upsertSpool(spool);
-		if (uncertain) this.refreshEventSpool(spool.id);
+		return true;
 	}
 
 	// Full write responses replace the cached entity, so writes to the same
@@ -858,7 +873,13 @@ class HttpSpoolSource {
 	 * with its `locations` setting (#1261).
 	 */
 	async locationChoices(): Promise<string[]> {
-		const [inUse, layout] = await Promise.all([this.locations(), loadLayout().catch(() => null)]);
+		const [inUse, layout] = await Promise.all([
+			this.locations(),
+			loadLayout().catch((error: unknown) => {
+				console.error('Failed to load saved dashboard locations', error);
+				return null;
+			})
+		]);
 		return [...new Set([...inUse, ...(layout?.groups.location ?? [])])].filter(Boolean).sort();
 	}
 
@@ -886,30 +907,62 @@ class HttpSpoolSource {
 			}
 			const current = inventory.spoolById(id);
 			const uncertainty = inventory.spoolUncertainty(id, field);
-			if (!current) {
-				if (uncertainty !== undefined) inventory.resolveSpoolUncertainty(id, field, uncertainty);
-				if (inventory.spoolUncertainty(id, field) === undefined) return true;
-				continue;
-			}
+			const fullRefresh = this.eventFullRefreshNeeded.has(id);
+			const eventGeneration = this.eventRefreshGenerations.get(id);
+			const uncertainties = fullRefresh
+				? inventory.uncertainSpoolFields(id).map((uncertainField) => ({
+						field: uncertainField,
+						revision: inventory.spoolUncertainty(id, uncertainField)!
+					}))
+				: uncertainty === undefined
+					? []
+					: [{ field, revision: uncertainty }];
+			if (!current && uncertainty === undefined && !fullRefresh) return true;
 			const revision = this.spoolBulkRevision;
+			const deletionRevision = this.spoolDeletionRevision;
 			attempt++;
 			const raw = await getJson<Json | null>(`/spool/${id}`, {}, signal).catch(swallow404);
 			if (
 				this.spoolBulkRevision !== revision ||
+				this.spoolDeletionRevision !== deletionRevision ||
 				this.pendingWrites.has(`spool:${id}`) ||
 				this.pendingSpoolBulk !== undefined ||
-				inventory.spoolById(id) !== current
+				inventory.spoolById(id) !== current ||
+				this.eventRefreshGenerations.get(id) !== eventGeneration
 			)
 				continue;
 			if (raw) {
 				const server = mapSpool(raw);
-				inventory.upsertSpool(withServerSpoolField(current, server, field));
-				if (uncertainty !== undefined) {
-					const pendingValues = inventory.pendingSpoolRenameValues(id, field, uncertainty);
-					if (pendingValues.some((value) => spoolHasFieldValue(server, field, value))) return false;
-					inventory.resolveSpoolUncertainty(id, field, uncertainty);
+				if (fullRefresh || !current) {
+					// Embedded relations may have newer optimistic edits of their own.
+					// Seed missing relations, but never replace an existing one here.
+					if (raw.filament) {
+						const filament = mapFilament(raw.filament);
+						if (!inventory.filamentById(filament.id) && !this.pendingWrites.has(`filament:${filament.id}`))
+							inventory.upsertFilament(filament);
+						if (raw.filament.vendor) {
+							const vendor = mapVendor(raw.filament.vendor);
+							if (!inventory.vendorById(vendor.id) && !this.pendingWrites.has(`vendor:${vendor.id}`))
+								inventory.upsertVendor(vendor);
+						}
+					}
+					inventory.upsertSpool(server);
+					this.eventFullRefreshNeeded.delete(id);
+				} else inventory.upsertSpool(withServerSpoolField(current, server, field));
+				let fieldStillPending = false;
+				for (const entry of uncertainties) {
+					const pendingValues = inventory.pendingSpoolRenameValues(id, entry.field, entry.revision);
+					if (pendingValues.some((value) => spoolHasFieldValue(server, entry.field, value))) {
+						if (entry.field === field) fieldStillPending = true;
+					} else {
+						inventory.resolveSpoolUncertainty(id, entry.field, entry.revision);
+					}
 				}
-			} else inventory.removeSpool(id);
+				if (fieldStillPending) return false;
+			} else {
+				inventory.removeSpool(id);
+				this.eventFullRefreshNeeded.delete(id);
+			}
 			if (inventory.spoolUncertainty(id, field) === undefined) return true;
 		}
 		console.warn(`Spool ${id} kept changing during rename reconciliation`);
@@ -1047,7 +1100,14 @@ class HttpSpoolSource {
 		} finally {
 			this.activeRenames.delete(active);
 			if (!sent || rejected) {
-				for (const [id, revision] of active.candidates) inventory.cancelSpoolUncertainty(id, field, revision);
+				const uncached: number[] = [];
+				for (const [id, revision] of active.candidates) {
+					if (inventory.spoolById(id)) inventory.cancelSpoolUncertainty(id, field, revision);
+					else uncached.push(id);
+				}
+				// A list may already be displaying an uncached candidate. Keep it
+				// quarantined until a full read supplies its spool and relations.
+				void this.refreshRenamedSpools(uncached, field);
 			}
 		}
 	}

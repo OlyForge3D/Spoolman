@@ -3,6 +3,7 @@ import { getList, postJson, deleteResource, HttpError } from './http';
 import { mapSpool, mapFilament, mapVendor } from './map';
 import { inventory } from '$lib/stores/inventory.svelte';
 import { readSpoolSnapshot } from './spoolReadFence';
+import { cacheSpoolRead } from './cacheSpoolRead';
 
 // Linking physical NFC/RFID tags to spools and filaments.
 //
@@ -142,15 +143,8 @@ export async function findTagHolder(uid: string, signal?: AbortSignal): Promise<
 		([spools, filaments]) => {
 			const rawSpool = spools.items[0] as Json | undefined;
 			if (rawSpool) {
-				// Seed the cache the way every other spool read does, so the inspector this
-				// may be about to open has its filament and manufacturer already.
-				if (rawSpool.filament) {
-					inventory.upsertFilament(mapFilament(rawSpool.filament));
-					if (rawSpool.filament.vendor) inventory.upsertVendor(mapVendor(rawSpool.filament.vendor));
-				}
 				const spool = mapSpool(rawSpool);
-				inventory.upsertSpool(spool);
-				return { kind: 'spool' as const, spool };
+				return { kind: 'spool' as const, spool: cacheSpoolRead(rawSpool, spool) };
 			}
 			const rawFilament = filaments.items[0] as Json | undefined;
 			if (rawFilament) {

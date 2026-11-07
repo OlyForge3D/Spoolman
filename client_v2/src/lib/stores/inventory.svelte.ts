@@ -20,6 +20,7 @@ class Inventory {
 	>({});
 	private nextUncertainty = 0;
 	private readonly spoolUpsertObservers = new Set<(spool: Spool) => void>();
+	private readonly spoolUncertaintyObservers = new Set<(id: number) => void>();
 
 	filamentById(id: string): Filament | undefined {
 		return this.filaments.find((f) => f.id === id);
@@ -49,6 +50,7 @@ class Inventory {
 			...this.uncertainSpools,
 			[id]: [...entries, { field, revision }]
 		};
+		for (const observer of this.spoolUncertaintyObservers) observer(id);
 		return revision;
 	}
 	holdSpoolUncertainty(id: number, field: GroupField, revision: number, pendingValue: string) {
@@ -114,8 +116,19 @@ class Inventory {
 		return () => this.spoolUpsertObservers.delete(observer);
 	}
 
-	upsertSpool(s: Spool) {
+	observeSpoolUncertainty(observer: (id: number) => void): () => void {
+		this.spoolUncertaintyObservers.add(observer);
+		return () => this.spoolUncertaintyObservers.delete(observer);
+	}
+
+	/** Register rename candidates before deciding whether a remote snapshot is safe to cache. */
+	considerSpool(s: Spool): boolean {
 		for (const observer of this.spoolUpsertObservers) observer(s);
+		return !this.isSpoolUncertain(s.id);
+	}
+
+	upsertSpool(s: Spool) {
+		this.considerSpool(s);
 		this.spools = this.spools.some((x) => x.id === s.id)
 			? this.spools.map((x) => (x.id === s.id ? s : x))
 			: [...this.spools, s];

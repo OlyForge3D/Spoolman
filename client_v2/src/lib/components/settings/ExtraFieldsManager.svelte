@@ -277,7 +277,11 @@
 </div>
 
 <Card>
-	{#if defs.length === 0}
+	{#if !fields.isLoaded(entity)}
+		<div class="empty">
+			{fields.failedEntities().includes(entity) ? m['fields.loadFailed']() : m.loading()}
+		</div>
+	{:else if defs.length === 0}
 		<div class="empty">{m['settings.extraFields.none']({ entity: entityLabel })}</div>
 	{:else}
 		<div class="table">

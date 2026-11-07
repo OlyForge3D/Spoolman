@@ -14,6 +14,7 @@
 	import { settings } from '$lib/stores/settings.svelte';
 	import { serverInfo } from '$lib/stores/serverInfo.svelte';
 	import { SpoolBatchError, spoolSource } from '$lib/api/spoolSource';
+	import { observeLayoutRenames } from '$lib/dashboard/layout';
 	import { fields } from '$lib/stores/fields.svelte';
 	import type { EntityType } from '$lib/api/fields';
 	import { externalColors, externalDirection, type ExternalFilament } from '$lib/api/external';
@@ -145,10 +146,6 @@
 			fields.ensure('spool');
 			fields.ensure('filament');
 			fields.ensure('vendor');
-			spoolSource
-				.locationChoices()
-				.then((l) => (locations = l))
-				.catch(() => {});
 			if (presetFilamentId) {
 				const f = inventory.filamentById(presetFilamentId);
 				if (f) choose({ source: 'catalog', filament: f });
@@ -159,6 +156,27 @@
 		} else if (!open) {
 			initialized = false;
 		}
+	});
+
+	let locationsRevision = $state(0);
+	$effect(() =>
+		observeLayoutRenames((field) => {
+			if (field === 'location') locationsRevision++;
+		})
+	);
+	$effect(() => {
+		if (!open) return;
+		void locationsRevision;
+		let active = true;
+		spoolSource
+			.locationChoices()
+			.then((l) => {
+				if (active) locations = l;
+			})
+			.catch((error: unknown) => console.error('Failed to load locations', error));
+		return () => {
+			active = false;
+		};
 	});
 
 	// Focus the search box whenever the search step is showing, so you can open

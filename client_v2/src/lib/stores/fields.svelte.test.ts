@@ -110,6 +110,7 @@ describe('required field definitions', () => {
 		await vi.advanceTimersByTimeAsync(10_000);
 		await failures;
 		expect(requests[0].signal?.aborted).toBe(true);
+		expect(fields.failedEntities()).toContain('spool');
 
 		const retry = fields.loadRequired('spool');
 		expect(fetch).toHaveBeenCalledTimes(2);
@@ -122,5 +123,29 @@ describe('required field definitions', () => {
 		);
 		await vi.advanceTimersByTimeAsync(0);
 		expect(fields.get('spool').map((field) => field.key)).toEqual(['fresh']);
+		expect(fields.failedEntities()).not.toContain('spool');
+	});
+
+	it('refetches when a delayed save response follows a newer definition load', async () => {
+		const requests: { method: string; respond: (response: Response) => void }[] = [];
+		vi.stubGlobal(
+			'fetch',
+			vi.fn(
+				(_url: string, init?: RequestInit) =>
+					new Promise<Response>((respond) => requests.push({ method: init?.method ?? 'GET', respond }))
+			)
+		);
+		const local = { key: 'local', entity_type: 'vendor', name: 'Local', order: 0, field_type: 'text' };
+		const remote = { key: 'remote', entity_type: 'vendor', name: 'Remote', order: 1, field_type: 'text' };
+		const saved = fields.save('vendor', 'local', { name: 'Local', order: 0, field_type: FieldType.text });
+		const loaded = fields.loadRequired('vendor');
+		requests[1].respond(Response.json([local, remote]));
+		await loaded;
+		expect(fields.get('vendor').map((field) => field.key)).toEqual(['local', 'remote']);
+		requests[0].respond(Response.json([local]));
+		await vi.waitFor(() => expect(requests.map((request) => request.method)).toEqual(['POST', 'GET', 'GET']));
+		requests[2].respond(Response.json([local, remote]));
+		await saved;
+		expect(fields.get('vendor').map((field) => field.key)).toEqual(['local', 'remote']);
 	});
 });

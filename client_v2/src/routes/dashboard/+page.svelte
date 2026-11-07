@@ -3,6 +3,7 @@
 	   Every href below comes from a src/lib/library/params.ts helper, which already
 	   resolves against the deploy base path; resolving again would double-apply it. */
 	import Swatch from '$components/Swatch.svelte';
+	import UncertainSpools from '$components/UncertainSpools.svelte';
 	import type { Spool } from '$lib/types';
 	import { inventory } from '$lib/stores/inventory.svelte';
 	import { settings } from '$lib/stores/settings.svelte';
@@ -126,6 +127,8 @@
 	// re-reading it on each switch would race with an order this page had only just saved.
 	let layout = $state<DashboardLayout>({ groups: {}, spoolOrders: {} });
 	let layoutLoaded = $state(false);
+	let layoutError = $state(false);
+	let layoutRetry = $state(0);
 	let groupOrder = $derived(layout.groups[field.key] ?? []);
 	let spoolOrders = $derived(layout.spoolOrders[field.key] ?? {});
 
@@ -169,6 +172,7 @@
 	let recoveryLoads: Record<string, number> = {};
 	let spoolStateVersion = 0;
 	let displayKeys = $derived(cards.map((c) => c.key));
+	let uncertainSpoolIds = $derived(inventory.uncertainSpoolIds());
 	// Nothing at all to show: no saved cards and no spools. Only decided once both loads have
 	// settled, so the help text doesn't flash on the way in.
 	let isEmpty = $derived(layoutLoaded && groupsLoaded && cards.length === 0);
@@ -305,6 +309,13 @@
 		refreshBoard();
 	});
 
+	let previousUncertainIds: number[] = [];
+	$effect(() => {
+		const current = uncertainSpoolIds;
+		if (previousUncertainIds.some((id) => !current.includes(id))) reloadAfterMoveFailure = true;
+		previousUncertainIds = [...current];
+	});
+
 	// A screenful can be a dozen cards, and firing that many requests at once both queues
 	// behind the browser's per-host connection limit (which the live-update sockets already
 	// eat into) and hammers the server. Cards are filled a few at a time instead; the rest
@@ -426,15 +437,17 @@
 
 	// Loaded once for the page, on its own controller — it outlives any single view mode.
 	$effect(() => {
+		void layoutRetry;
 		const abort = new AbortController();
+		layoutError = false;
 		(async () => {
 			try {
 				layout = await loadCurrentLayout(abort.signal);
+				layoutLoaded = true;
 			} catch (e) {
 				if (isAbortError(e, abort.signal)) return;
 				console.error('Failed to load dashboard layout', e);
-			} finally {
-				layoutLoaded = true;
+				layoutError = true;
 			}
 		})();
 		return () => abort.abort();
@@ -625,6 +638,15 @@
 	// order. Diff-based, so the duplicate finalize fired on the other zone of a cross-card
 	// move is a harmless no-op.
 	function commitSpoolLayout() {
+		if (
+			cards.some((card) =>
+				card.spools.some((spool) => inventory.isSpoolUncertain(spool.id) && field.valueOf(spool) !== card.key)
+			)
+		) {
+			cards = buildCards();
+			toasts.error(m['spool.uncertainDetails']());
+			return;
+		}
 		const changed: { spool: Spool; key: string }[] = [];
 		for (const card of cards) {
 			const b = bucket(card.key);
@@ -819,11 +841,13 @@
 			{/if}
 		</div>
 
-		{#if !isEmpty}
+		{#if layoutLoaded && !isEmpty}
 			<span class="hint">{m['dashboard.dragHint']({ field: field.label })}</span>
 		{/if}
 		{#if !field.choices}
-			<button class="add" onclick={addGroup}><Plus size={14} /> {m['dashboard.newGroup']()}</button>
+			<button class="add" onclick={addGroup} disabled={!layoutLoaded}
+				><Plus size={14} /> {m['dashboard.newGroup']()}</button
+			>
 		{/if}
 	</div>
 
@@ -832,6 +856,17 @@
 			<span>{m['dashboard.refreshFailed']()}</span>
 			<button onclick={() => refreshBoard()}>{m['buttons.retry']()}</button>
 		</div>
+	{/if}
+
+	{#if layoutError}
+		<div class="recovery-error" role="alert">
+			<span>{m['dashboard.layoutLoadFailed']()}</span>
+			<button onclick={() => layoutRetry++}>{m['buttons.retry']()}</button>
+		</div>
+	{/if}
+
+	{#if uncertainSpoolIds.length}
+		<div class="spool-recovery"><UncertainSpools ids={uncertainSpoolIds} /></div>
 	{/if}
 
 	<div
@@ -910,13 +945,20 @@
 						class="card-body"
 						style="min-height: min({bodyReserve(card.total)}px, var(--card-body-cap))"
 						onscroll={(e) => onBodyScroll(card.key, e)}
-						use:dndzone={{ items: card.spools, type: 'spool', flipDurationMs: FLIP, dropTargetStyle: {} }}
+						use:dndzone={{
+							items: card.spools,
+							type: 'spool',
+							flipDurationMs: FLIP,
+							dragDisabled: card.spools.some((spool) => inventory.isSpoolUncertain(spool.id)),
+							dropTargetStyle: {}
+						}}
 						onconsider={(e) => spoolConsider(idx, e as CustomEvent<DndEvent<Spool>>)}
 						onfinalize={(e) => spoolFinalize(idx, e as CustomEvent<DndEvent<Spool>>)}
 					>
 						{#each card.spools as s (s.id)}
-							{@const f = inventory.filamentById(s.filamentId)!}
-							{@const v = inventory.vendorOf(f)}
+							{@const current = inventory.spoolById(s.id) ?? s}
+							{@const f = inventory.filamentById(current.filamentId)}
+							{@const v = f ? inventory.vendorOf(f) : undefined}
 							<!-- A real link to the spool's inspector (open-in-new-tab, copy-link), but also
 							     a svelte-dnd-action drag item. `draggable=false` keeps the browser's native
 							     link drag from fighting the pointer-based dnd; a genuine drag never fires a
@@ -927,24 +969,38 @@
 								draggable="false"
 								animate:flip={{ duration: FLIP }}
 							>
-								<Swatch colors={f.colors} direction={f.multiColorDirection} size={22} radius={5} />
-								<div class="chip-info">
-									<!-- The optional parts are built as one expression rather than wrapped in
-									     an {#if}: at a block edge Svelte trims the adjacent whitespace, which ran
-									     the separator into the neighbouring word ("Bambu Lab -Bambu Green",
-									     "1 kg- Last used 2 days ago"). -->
-									<div class="chip-title" use:truncTitle>
+								{#if inventory.isSpoolUncertain(s.id)}
+									<div class="chip-title">
 										<span class="chip-id mono">#{s.id}</span>
-										{v.name === '?' ? f.name : `${v.name} - ${f.name}`}
+										{m['spool.uncertainShort']()}
 									</div>
-									<div class="chip-subtitle" use:truncTitle>
-										{f.material} -
-										<span class:low={settings.isLow(s.remaining, s.unused)}>{weightAuto(s.remaining)}</span>
-										/ {weightAuto(s.initial)}{s.lastUsedLabel
-											? ` - ${m['dashboard.lastUsed']({ time: s.lastUsedLabel })}`
-											: ''}
+								{:else if f}
+									<Swatch colors={f.colors} direction={f.multiColorDirection} size={22} radius={5} />
+									<div class="chip-info">
+										<!-- The optional parts are built as one expression rather than wrapped in
+										     an {#if}: at a block edge Svelte trims the adjacent whitespace, which ran
+										     the separator into the neighbouring word ("Bambu Lab -Bambu Green",
+										     "1 kg- Last used 2 days ago"). -->
+										<div class="chip-title" use:truncTitle>
+											<span class="chip-id mono">#{s.id}</span>
+											{v?.name === '?' ? f.name : `${v?.name} - ${f.name}`}
+										</div>
+										<div class="chip-subtitle" use:truncTitle>
+											{f.material} -
+											<span class:low={settings.isLow(current.remaining, current.unused)}
+												>{weightAuto(current.remaining)}</span
+											>
+											/ {weightAuto(current.initial)}{current.lastUsedLabel
+												? ` - ${m['dashboard.lastUsed']({ time: current.lastUsedLabel })}`
+												: ''}
+										</div>
 									</div>
-								</div>
+								{:else}
+									<div class="chip-title">
+										<span class="chip-id mono">#{s.id}</span>
+										{m['search.unknownFilament']()}
+									</div>
+								{/if}
 							</a>
 						{/each}
 					</div>
@@ -995,6 +1051,9 @@
 		border-radius: var(--radius);
 		padding: 4px 8px;
 		cursor: pointer;
+	}
+	.spool-recovery {
+		margin-bottom: 16px;
 	}
 	.title {
 		font-weight: 700;

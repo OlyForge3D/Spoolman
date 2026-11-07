@@ -98,6 +98,18 @@ describe('makeExtraSaver', () => {
 		h.saver.flush();
 		expect(h.persisted).toEqual([]);
 	});
+
+	it('queues the change before an optimistic update can trigger a synchronous flush', async () => {
+		const persist = vi.fn();
+		const saver = makeExtraSaver<number>(
+			() => 1,
+			() => saver.flush(),
+			persist,
+			() => ({})
+		);
+		expect(await saver.change('shelf', '"B"')).toBe(true);
+		expect(persist).toHaveBeenCalledExactlyOnceWith(1, { shelf: '"B"' });
+	});
 });
 
 // Deleting the entity being edited is the one case where a pending patch must NOT

@@ -91,12 +91,12 @@ function toScan(payload: Json): TagScan {
 	const raw = payload.spool as Json | undefined;
 	let spool: Spool | undefined;
 	if (raw) {
-		if (raw.filament) {
+		spool = mapSpool(raw);
+		const accepted = spoolSource.ingestScannedSpool(spool);
+		if (accepted && raw.filament) {
 			inventory.upsertFilament(mapFilament(raw.filament));
 			if (raw.filament.vendor) inventory.upsertVendor(mapVendor(raw.filament.vendor));
 		}
-		spool = mapSpool(raw);
-		spoolSource.ingestScannedSpool(spool);
 	}
 	const rawFilament = payload.filament as Json | undefined;
 	let filament: Filament | undefined;

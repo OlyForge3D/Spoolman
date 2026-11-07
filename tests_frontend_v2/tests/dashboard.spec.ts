@@ -1,5 +1,6 @@
 import { expect, test } from "./fixtures";
-import { unique } from "./helpers";
+import { openToolbarMenu, unique } from "./helpers";
+import { removeTestLayoutEntries } from "./dashboard-layout";
 import type { APIRequestContext } from "@playwright/test";
 
 /**
@@ -9,8 +10,7 @@ import type { APIRequestContext } from "@playwright/test";
  * its whole first page has no scrollbar, so the rest would never load (#1242).
  */
 
-const API_BASE =
-  process.env.SPOOLMAN_API_URL ?? `${process.env.SPOOLMAN_BASE_URL ?? "http://localhost:8001"}/api/v1`;
+const API_BASE = process.env.SPOOLMAN_API_URL ?? `${process.env.SPOOLMAN_BASE_URL ?? "http://localhost:8001"}/api/v1`;
 
 type Groups = Record<string, string[]>;
 type Orders = Record<string, Record<string, number[]>>;
@@ -35,6 +35,26 @@ async function writeSetting(request: APIRequestContext, key: string, value: unkn
 
 test.use({ viewport: { width: 1920, height: 2160 } });
 
+test("a failed layout load blocks changes until retry succeeds", async ({ page }) => {
+  let fail = true;
+  let writes = 0;
+  await page.route("**/api/v1/setting/", (route) =>
+    fail ? route.fulfill({ status: 503, contentType: "application/json", body: "{}" }) : route.fallback(),
+  );
+  page.on("request", (req) => {
+    if (req.method() === "POST" && req.url().includes("/api/v1/setting/dashboard_")) writes++;
+  });
+  await page.goto("/dashboard?by=location");
+  const warning = page.getByRole("alert").filter({ hasText: "saved dashboard layout could not be loaded" });
+  await expect(warning).toBeVisible();
+  await expect(page.getByRole("button", { name: "New group", exact: true })).toBeDisabled();
+  expect(writes).toBe(0);
+  fail = false;
+  await warning.getByRole("button", { name: "Retry" }).click();
+  await expect(warning).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "New group", exact: true })).toBeEnabled();
+});
+
 test("a big group's card loads every spool on a tall screen", async ({ page, request }) => {
   const location = unique("Rack");
   const res = await request.post(`${API_BASE}/filament`, {
@@ -54,12 +74,14 @@ test("a big group's card loads every spool on a tall screen", async ({ page, req
     await page.goto("/dashboard?by=location");
     const card = page.locator(".card").filter({ has: page.getByText(location, { exact: true }) });
     const body = card.locator(".card-body");
+    await card.scrollIntoViewIfNeeded();
     await expect(body.locator(".chip")).toHaveCount(30);
 
     await body.evaluate((el) => el.scrollTo(0, el.scrollHeight));
     await expect(body.locator(".chip")).toHaveCount(40);
   } finally {
-    // Leave the shared database as the other specs expect it.
+    if (!page.isClosed()) await page.close();
+    await removeTestLayoutEntries(request, [location]);
     for (const id of ids) await request.delete(`${API_BASE}/spool/${id}`);
     await request.delete(`${API_BASE}/filament/${filamentId}`);
   }
@@ -84,6 +106,9 @@ test("a failed drag keeps the board and offers a retry when refresh also fails",
   let failPages = false;
   let failedPages = 0;
   try {
+    const { groups } = await readLayout(request);
+    groups.location = [firstLocation, secondLocation, ...(groups.location ?? [])];
+    await writeSetting(request, "dashboard_groups", groups);
     await page.route("**/api/v1/spool/group**", async (route) => {
       if (failRefresh) return route.fulfill({ status: 503, contentType: "application/json", body: "{}" });
       return route.fallback();
@@ -138,7 +163,11 @@ test("a failed drag keeps the board and offers a retry when refresh also fails",
     await expect(source.locator(".chip").filter({ hasText: `#${ids[0]}` })).toBeVisible();
     expect((await (await request.get(`${API_BASE}/spool/${ids[0]}`)).json()).location).toBe(firstLocation);
   } finally {
-    if (!page.isClosed()) await page.unrouteAll({ behavior: "wait" });
+    if (!page.isClosed()) {
+      await page.unrouteAll({ behavior: "wait" });
+      await page.close();
+    }
+    await removeTestLayoutEntries(request, [firstLocation, secondLocation]);
     for (const id of ids) await request.delete(`${API_BASE}/spool/${id}`);
     await request.delete(`${API_BASE}/filament/${filamentId}`);
   }
@@ -172,6 +201,7 @@ test("a concurrent move after a group rename stays in its server location", asyn
     });
     await page.goto("/dashboard?by=location");
     const from = page.locator(".card").filter({ has: page.getByText(oldLocation, { exact: true }) });
+    await from.scrollIntoViewIfNeeded();
     await expect(from.locator(".chip").filter({ hasText: `#${ids[0]}` })).toBeVisible();
     await from.locator(".card-name").click();
     const name = page.locator(".card-name-input");
@@ -192,7 +222,11 @@ test("a concurrent move after a group rename stays in its server location", asyn
     expect((await (await request.get(`${API_BASE}/spool/${ids[1]}`)).json()).location).toBe(oldLocation);
   } finally {
     releaseRename();
-    if (!page.isClosed()) await page.unrouteAll({ behavior: "wait" });
+    if (!page.isClosed()) {
+      await page.unrouteAll({ behavior: "wait" });
+      await page.close();
+    }
+    await removeTestLayoutEntries(request, [oldLocation, newLocation, otherLocation]);
     for (const id of ids) await request.delete(`${API_BASE}/spool/${id}`);
     await request.delete(`${API_BASE}/filament/${filamentId}`);
   }
@@ -217,6 +251,7 @@ test("a lost rename response warns and refreshes the board instead of claiming f
     });
     await page.goto("/dashboard?by=location");
     const from = page.locator(".card").filter({ has: page.getByText(oldLocation, { exact: true }) });
+    await from.scrollIntoViewIfNeeded();
     await expect(from.locator(".chip").filter({ hasText: `#${spoolId}` })).toBeVisible();
     await from.locator(".card-name").click();
     const name = page.locator(".card-name-input");
@@ -227,7 +262,11 @@ test("a lost rename response warns and refreshes the board instead of claiming f
     await expect(renamed.locator(".chip").filter({ hasText: `#${spoolId}` })).toBeVisible();
     expect((await (await request.get(`${API_BASE}/spool/${spoolId}`)).json()).location).toBe(newLocation);
   } finally {
-    if (!page.isClosed()) await page.unrouteAll({ behavior: "wait" });
+    if (!page.isClosed()) {
+      await page.unrouteAll({ behavior: "wait" });
+      await page.close();
+    }
+    await removeTestLayoutEntries(request, [oldLocation, newLocation]);
     await request.delete(`${API_BASE}/spool/${spoolId}`);
     await request.delete(`${API_BASE}/filament/${filamentId}`);
   }
@@ -260,7 +299,7 @@ test("a live move during a dashboard refresh is not replaced by an older page", 
   let destinationLoads = 0;
   try {
     await page.route("**/api/v1/spool/group**", async (route) => {
-      if (armed && !groupsHeld) {
+      if (armed) {
         const response = await route.fetch();
         groupsHeld = true;
         await groupsPending;
@@ -282,7 +321,9 @@ test("a live move during a dashboard refresh is not replaced by an older page", 
     await page.goto("/dashboard?by=location");
     const from = page.locator(".card").filter({ has: page.getByText(oldLocation, { exact: true }) });
     const destination = page.locator(".card").filter({ has: page.getByText(otherLocation, { exact: true }) });
+    await from.scrollIntoViewIfNeeded();
     await expect(from.locator(".chip").filter({ hasText: `#${ids[0]}` })).toBeVisible();
+    await destination.scrollIntoViewIfNeeded();
     await expect(destination.locator(".chip").filter({ hasText: `#${ids[1]}` })).toBeVisible();
     await from.locator(".card-name").click();
     const name = page.locator(".card-name-input");
@@ -307,7 +348,11 @@ test("a live move during a dashboard refresh is not replaced by an older page", 
   } finally {
     releaseRefresh();
     releaseGroups();
-    if (!page.isClosed()) await page.unrouteAll({ behavior: "wait" });
+    if (!page.isClosed()) {
+      await page.unrouteAll({ behavior: "wait" });
+      await page.close();
+    }
+    await removeTestLayoutEntries(request, [oldLocation, newLocation, otherLocation]);
     for (const id of ids) await request.delete(`${API_BASE}/spool/${id}`);
     await request.delete(`${API_BASE}/filament/${filamentId}`);
   }
@@ -317,6 +362,8 @@ test("a rename finishing after navigation preserves the latest saved layout", as
   const oldLocation = unique("Navigate from");
   const newLocation = unique("Navigate to");
   const addedGroup = unique("Added while away");
+  const otherField = `extra.test_${Date.now().toString(36)}`;
+  const otherGroup = unique("Keep this group");
   const filament = await request.post(`${API_BASE}/filament`, {
     data: { name: unique("Navigate filament"), density: 1.24, diameter: 1.75 },
   });
@@ -362,12 +409,12 @@ test("a rename finishing after navigation preserves the latest saved layout", as
     await writeSetting(request, "dashboard_groups", {
       ...latest.groups,
       location: [...(latest.groups.location ?? []), addedGroup],
-      "extra.other": ["Keep this group"],
+      [otherField]: [otherGroup],
     });
     await writeSetting(request, "dashboard_spoolorders", {
       ...latest.orders,
       location: { ...latest.orders.location, [oldLocation]: [spoolId, 99999] },
-      "extra.other": { "Keep this group": [12345] },
+      [otherField]: { [otherGroup]: [12345] },
     });
     releaseRename();
 
@@ -378,26 +425,28 @@ test("a rename finishing after navigation preserves the latest saved layout", as
           oldGroup: groups.location?.includes(oldLocation),
           newGroup: groups.location?.includes(newLocation),
           addedGroup: groups.location?.includes(addedGroup),
-          otherGroups: groups["extra.other"],
+          otherGroups: groups[otherField],
           oldOrder: orders.location?.[oldLocation],
           newOrder: orders.location?.[newLocation],
-          otherOrders: orders["extra.other"],
+          otherOrders: orders[otherField],
         };
       })
       .toEqual({
         oldGroup: false,
         newGroup: true,
         addedGroup: true,
-        otherGroups: ["Keep this group"],
+        otherGroups: [otherGroup],
         oldOrder: undefined,
         newOrder: [spoolId, 99999],
-        otherOrders: { "Keep this group": [12345] },
+        otherOrders: { [otherGroup]: [12345] },
       });
   } finally {
     releaseRename();
-    if (!page.isClosed()) await page.unrouteAll({ behavior: "wait" });
-    await writeSetting(request, "dashboard_groups", before.groups);
-    await writeSetting(request, "dashboard_spoolorders", before.orders);
+    if (!page.isClosed()) {
+      await page.unrouteAll({ behavior: "wait" });
+      await page.close();
+    }
+    await removeTestLayoutEntries(request, [oldLocation, newLocation, addedGroup], [otherField]);
     await request.delete(`${API_BASE}/spool/${spoolId}`);
     await request.delete(`${API_BASE}/filament/${filamentId}`);
   }
@@ -446,6 +495,7 @@ test("switching groupings during a rename preserves both layouts", async ({ page
     });
     await page.goto("/dashboard?by=location");
     const from = page.locator(".card").filter({ has: page.getByText(oldLocation, { exact: true }) });
+    await from.scrollIntoViewIfNeeded();
     await expect(from.locator(".chip").filter({ hasText: `#${spoolId}` })).toBeVisible();
     await from.locator(".card-name").click();
     await page.locator(".card-name-input").fill(newLocation);
@@ -462,31 +512,170 @@ test("switching groupings during a rename preserves both layouts", async ({ page
     await page.getByRole("button", { name: "Location", exact: true }).click();
 
     const renamed = page.locator(".card").filter({ has: page.getByText(newLocation, { exact: true }) });
+    await renamed.scrollIntoViewIfNeeded();
     await expect(renamed.locator(".chip").filter({ hasText: `#${spoolId}` })).toBeVisible();
-    await expect.poll(async () => {
-      const { groups, orders } = await readLayout(request);
-      return {
-        old: groups.location?.includes(oldLocation),
-        renamed: groups.location?.includes(newLocation),
-        custom: groups[customField],
-        locationOrder: orders.location?.[newLocation],
-        customOrder: orders[customField]?.[rack],
-      };
-    }).toEqual({
-      old: false,
-      renamed: true,
-      custom: [rack, "New group 1"],
-      locationOrder: [spoolId],
-      customOrder: [spoolId],
-    });
+    await expect
+      .poll(async () => {
+        const { groups, orders } = await readLayout(request);
+        return {
+          old: groups.location?.includes(oldLocation),
+          renamed: groups.location?.includes(newLocation),
+          custom: groups[customField]?.filter((key) => key !== ""),
+          locationOrder: orders.location?.[newLocation],
+          customOrder: orders[customField]?.[rack],
+        };
+      })
+      .toEqual({
+        old: false,
+        renamed: true,
+        custom: [rack, "New group 1"],
+        locationOrder: [spoolId],
+        customOrder: [spoolId],
+      });
   } finally {
     releaseRename();
-    if (!page.isClosed()) await page.unrouteAll({ behavior: "wait" });
-    await writeSetting(request, "dashboard_groups", before.groups);
-    await writeSetting(request, "dashboard_spoolorders", before.orders);
+    if (!page.isClosed()) {
+      await page.unrouteAll({ behavior: "wait" });
+      await page.close();
+    }
+    await removeTestLayoutEntries(request, [oldLocation, newLocation], [customField]);
     await request.delete(`${API_BASE}/spool/${spoolId}`);
     await request.delete(`${API_BASE}/filament/${filamentId}`);
     await request.delete(`${API_BASE}/field/spool/${fieldKey}`);
+  }
+});
+
+test("library groups and filament details refresh when a pending rename finishes", async ({ page, request }) => {
+  page.setDefaultTimeout(5000);
+  const oldLocation = unique("Library rename from");
+  const newLocation = unique("Library rename to");
+  const otherLocation = unique("Library other");
+  const filamentName = unique("Library rename filament");
+  const filament = await request.post(`${API_BASE}/filament`, {
+    data: { name: filamentName, material: "PLA", density: 1.24, diameter: 1.75, weight: 1000 },
+  });
+  expect(filament.ok()).toBeTruthy();
+  const filamentId = (await filament.json()).id as number;
+  const ids: number[] = [];
+  let releaseRename = () => {};
+  const pending = new Promise<void>((resolve) => (releaseRename = resolve));
+  let started = false;
+  try {
+    for (const location of [oldLocation, otherLocation]) {
+      const spool = await request.post(`${API_BASE}/spool`, { data: { filament_id: filamentId, location } });
+      expect(spool.ok()).toBeTruthy();
+      ids.push((await spool.json()).id as number);
+    }
+    await page.route("**/api/v1/spool/field/location", async (route) => {
+      started = true;
+      await pending;
+      return route.fallback();
+    });
+    await page.goto("/dashboard?by=location");
+    const from = page.locator(".card").filter({ has: page.getByText(oldLocation, { exact: true }) });
+    await from.scrollIntoViewIfNeeded();
+    await expect(from.locator(".chip").filter({ hasText: `#${ids[0]}` })).toBeVisible();
+    await from.locator(".card-name").click();
+    await page.locator(".card-name-input").fill(newLocation);
+    await page.locator(".card-name-input").press("Enter");
+    await expect.poll(() => started).toBe(true);
+
+    const other = page.locator(".card").filter({ has: page.getByText(otherLocation, { exact: true }) });
+    await other.scrollIntoViewIfNeeded();
+    await other
+      .locator(".chip")
+      .filter({ hasText: `#${ids[1]}` })
+      .click();
+    await expect(page).toHaveTitle("Library | Spoolman");
+    const filter = await openToolbarMenu(page, "Filter");
+    await filter.getByRole("button", { name: "Filament", exact: true }).click();
+    await filter.getByRole("menuitemcheckbox").filter({ hasText: filamentName }).click();
+    await page.getByRole("button", { name: "Filter", exact: true }).click();
+    const menu = await openToolbarMenu(page, "Group");
+    await menu.getByRole("button", { name: "Location", exact: true }).click();
+    await expect(page.locator(".groups .header").getByText(oldLocation, { exact: true })).toBeVisible();
+    await page.locator(".insp").getByRole("link", { name: filamentName, exact: true }).first().click();
+    const target = page.locator(".insp .spool-row").filter({ hasText: `#${ids[0]}` });
+    await expect(target).toBeVisible();
+    await expect(target).toContainText("Needs refresh");
+
+    releaseRename();
+    await expect(target.locator(".loc")).toHaveText(newLocation);
+    await expect(page.locator(".groups .header").getByText(newLocation, { exact: true })).toBeVisible();
+    await expect(page.locator(".groups .header").getByText(oldLocation, { exact: true })).toHaveCount(0);
+  } finally {
+    releaseRename();
+    if (!page.isClosed()) {
+      await page.unrouteAll({ behavior: "wait" });
+      await page.close();
+    }
+    await removeTestLayoutEntries(request, [oldLocation, newLocation, otherLocation]);
+    for (const id of ids) await request.delete(`${API_BASE}/spool/${id}`);
+    await request.delete(`${API_BASE}/filament/${filamentId}`);
+  }
+});
+
+test("an open inspector refreshes saved empty locations when a rename finishes", async ({ page, request }) => {
+  const oldLocation = unique("Empty location from");
+  const newLocation = unique("Empty location to");
+  const spoolLocation = unique("Existing spool location");
+  const filament = await request.post(`${API_BASE}/filament`, {
+    data: { name: unique("Location choices filament"), density: 1.24, diameter: 1.75 },
+  });
+  expect(filament.ok()).toBeTruthy();
+  const filamentId = (await filament.json()).id as number;
+  let spoolId: number | undefined;
+  let releaseSave = () => {};
+  const pending = new Promise<void>((resolve) => (releaseSave = resolve));
+  let holding = false;
+  let armed = false;
+  try {
+    const spool = await request.post(`${API_BASE}/spool`, {
+      data: { filament_id: filamentId, location: spoolLocation },
+    });
+    expect(spool.ok()).toBeTruthy();
+    spoolId = (await spool.json()).id as number;
+    const before = await readLayout(request);
+    await writeSetting(request, "dashboard_groups", {
+      ...before.groups,
+      location: [...(before.groups.location ?? []), oldLocation],
+    });
+    await page.route("**/api/v1/setting/dashboard_groups", async (route) => {
+      if (armed && route.request().method() === "POST") {
+        holding = true;
+        await pending;
+      }
+      return route.fallback();
+    });
+    await page.goto("/dashboard?by=location");
+    const from = page.locator(".card").filter({ has: page.getByText(oldLocation, { exact: true }) });
+    await from.scrollIntoViewIfNeeded();
+    await from.locator(".card-name").click();
+    await page.locator(".card-name-input").fill(newLocation);
+    armed = true;
+    await page.locator(".card-name-input").press("Enter");
+    await expect.poll(() => holding).toBe(true);
+    const existing = page.locator(".card").filter({ has: page.getByText(spoolLocation, { exact: true }) });
+    await existing.scrollIntoViewIfNeeded();
+    await existing
+      .locator(".chip")
+      .filter({ hasText: `#${spoolId}` })
+      .click();
+    const location = page.locator(".insp").getByRole("combobox", { name: "Location", exact: true });
+    await location.click();
+    await expect(page.getByRole("option", { name: oldLocation, exact: true })).toBeVisible();
+    releaseSave();
+    await expect(page.getByRole("option", { name: newLocation, exact: true })).toBeVisible();
+    await expect(page.getByRole("option", { name: oldLocation, exact: true })).toHaveCount(0);
+  } finally {
+    releaseSave();
+    if (!page.isClosed()) {
+      await page.unrouteAll({ behavior: "wait" });
+      await page.close();
+    }
+    await removeTestLayoutEntries(request, [oldLocation, newLocation, spoolLocation]);
+    if (spoolId !== undefined) await request.delete(`${API_BASE}/spool/${spoolId}`);
+    await request.delete(`${API_BASE}/filament/${filamentId}`);
   }
 });
 
@@ -495,7 +684,6 @@ test("a page loaded during staged recovery survives the retry", async ({ page, r
   const fromLocation = unique("Recovery page from");
   const toLocation = unique("Recovery page to");
   const pagedLocation = unique("Recovery page other");
-  const before = await readLayout(request);
   const filament = await request.post(`${API_BASE}/filament`, {
     data: { name: unique("Recovery page filament"), density: 1.24, diameter: 1.75 },
   });
@@ -528,6 +716,7 @@ test("a page loaded during staged recovery survives the retry", async ({ page, r
     await page.goto("/dashboard?by=location");
     const from = page.locator(".card").filter({ has: page.getByText(fromLocation, { exact: true }) });
     const other = page.locator(".card").filter({ has: page.getByText(pagedLocation, { exact: true }) });
+    await from.scrollIntoViewIfNeeded();
     await expect(from.locator(".chip").filter({ hasText: `#${ids[0]}` })).toBeVisible();
     await other.scrollIntoViewIfNeeded();
     await expect(other.locator(".chip")).toHaveCount(30);
@@ -548,9 +737,11 @@ test("a page loaded during staged recovery survives the retry", async ({ page, r
     await expect(renamed.locator(".chip").filter({ hasText: `#${ids[0]}` })).toBeVisible();
   } finally {
     releasePage();
-    if (!page.isClosed()) await page.unrouteAll({ behavior: "wait" });
-    await writeSetting(request, "dashboard_groups", before.groups);
-    await writeSetting(request, "dashboard_spoolorders", before.orders);
+    if (!page.isClosed()) {
+      await page.unrouteAll({ behavior: "wait" });
+      await page.close();
+    }
+    await removeTestLayoutEntries(request, [fromLocation, toLocation, pagedLocation]);
     for (const id of ids) await request.delete(`${API_BASE}/spool/${id}`);
     await request.delete(`${API_BASE}/filament/${filamentId}`);
   }
@@ -560,7 +751,6 @@ test("a rename retains loaded pages and does not restore the old group during re
   test.setTimeout(60_000);
   const oldLocation = unique("Paged rename from");
   const newLocation = unique("Paged rename to");
-  const before = await readLayout(request);
   const filament = await request.post(`${API_BASE}/filament`, {
     data: { name: unique("Paged rename filament"), density: 1.24, diameter: 1.75 },
   });
@@ -607,9 +797,7 @@ test("a rename retains loaded pages and does not restore the old group during re
     holdGroups = true;
     await name.press("Enter");
     await expect.poll(() => groupsHeld).toBe(true);
-    await expect
-      .poll(async () => (await readLayout(request)).groups.location?.includes(oldLocation))
-      .toBe(false);
+    await expect.poll(async () => (await readLayout(request)).groups.location?.includes(oldLocation)).toBe(false);
     releaseGroups();
 
     await expect.poll(() => stagedLimit).toBeGreaterThanOrEqual(60);
@@ -621,9 +809,11 @@ test("a rename retains loaded pages and does not restore the old group during re
     await expect(renamed.locator(".chip")).toHaveCount(65);
   } finally {
     releaseGroups();
-    if (!page.isClosed()) await page.unrouteAll({ behavior: "wait" });
-    await writeSetting(request, "dashboard_groups", before.groups);
-    await writeSetting(request, "dashboard_spoolorders", before.orders);
+    if (!page.isClosed()) {
+      await page.unrouteAll({ behavior: "wait" });
+      await page.close();
+    }
+    await removeTestLayoutEntries(request, [oldLocation, newLocation]);
     for (const id of ids) await request.delete(`${API_BASE}/spool/${id}`);
     await request.delete(`${API_BASE}/filament/${filamentId}`);
   }
@@ -632,7 +822,6 @@ test("a rename retains loaded pages and does not restore the old group during re
 test("a discarded recovery page cannot resurrect a deleted spool in the inspector", async ({ page, request }) => {
   const oldLocation = unique("Deleted rename from");
   const newLocation = unique("Deleted rename to");
-  const before = await readLayout(request);
   const filament = await request.post(`${API_BASE}/filament`, {
     data: { name: unique("Deleted rename filament"), density: 1.24, diameter: 1.75 },
   });
@@ -653,7 +842,7 @@ test("a discarded recovery page cannot resurrect a deleted spool in the inspecto
   try {
     await page.route("**/api/v1/spool/group**", async (route) => {
       if (holdGroups) groupRequests++;
-      if (holdGroups && !groupsHeld) {
+      if (holdGroups) {
         const response = await route.fetch();
         groupsHeld = true;
         await groupsPending;
@@ -704,9 +893,11 @@ test("a discarded recovery page cannot resurrect a deleted spool in the inspecto
   } finally {
     releaseGroups();
     releasePage();
-    if (!page.isClosed()) await page.unrouteAll({ behavior: "wait" });
-    await writeSetting(request, "dashboard_groups", before.groups);
-    await writeSetting(request, "dashboard_spoolorders", before.orders);
+    if (!page.isClosed()) {
+      await page.unrouteAll({ behavior: "wait" });
+      await page.close();
+    }
+    await removeTestLayoutEntries(request, [oldLocation, newLocation]);
     await request.delete(`${API_BASE}/spool/${spoolId}`);
     await request.delete(`${API_BASE}/filament/${filamentId}`);
   }

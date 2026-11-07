@@ -47,8 +47,9 @@ export function makeExtraSaver<Id>(
 		const extra = { ...getCurrent() };
 		if (json === undefined) delete extra[key];
 		else extra[key] = json;
+		const result = saver.push(id, { [key]: json ?? null });
 		apply(id, extra);
-		return saver.push(id, { [key]: json ?? null });
+		return result;
 	}
 
 	return { change, flush: saver.flush, cancel: saver.cancel };

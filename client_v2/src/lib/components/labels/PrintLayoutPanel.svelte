@@ -7,6 +7,7 @@
 	import LabelCanvas from './LabelCanvas.svelte';
 	import { labelKind, type LabelKind, type LabelDesign } from '$lib/labels/types';
 	import type { LabelBinding } from '$lib/labels/template';
+	import { labelBindingSnapshot } from '$lib/labels/bindingSnapshot';
 	import { PAPER_NAMES, layoutMargin, paperSize, sheetGrid } from '$lib/labels/paper';
 	import { printLabels, exportLabels, LabelDataChangedError, ZIP_THRESHOLD } from '$lib/labels/print';
 	import { EXPORT_FORMATS, resolveExportFormat } from '$lib/labels/export';
@@ -319,6 +320,11 @@
 	const uncertainIds = $derived(
 		kind === 'spool' ? [...selected].filter((id) => inventory.isSpoolUncertain(id)) : []
 	);
+	const missingIds = $derived(
+		kind === 'spool'
+			? [...selected].filter((id) => !inventory.spoolById(id) && !inventory.isSpoolUncertain(id))
+			: []
+	);
 
 	// Preview caption: the id of the first selected subject, labelled by kind.
 	const previewId = $derived(kind === 'filament' ? bindings[0]?.filament?.id : bindings[0]?.spool?.id);
@@ -333,18 +339,21 @@
 	function currentJob(jobBindings: LabelBinding[], jobKind: LabelKind): () => boolean {
 		if (jobKind !== 'spool') return () => true;
 		const ids = new Set(selected);
+		const snapshots = jobBindings.map(labelBindingSnapshot);
 		return () =>
 			kind === jobKind &&
 			selected.size === ids.size &&
+			jobBindings.length === ids.size &&
 			[...ids].every((id) => selected.has(id)) &&
-			jobBindings.every(
-				({ spool }) =>
-					!spool || (!inventory.isSpoolUncertain(spool.id) && inventory.spoolById(spool.id) === spool)
-			);
+			jobBindings.every(({ spool }, index) => {
+				if (!spool || inventory.isSpoolUncertain(spool.id)) return false;
+				const current = inventory.spoolById(spool.id);
+				return !!current && labelBindingSnapshot(bindingFor(current)) === snapshots[index];
+			});
 	}
 
 	async function doPrint() {
-		if (bindings.length === 0 || uncertainIds.length) return;
+		if (bindings.length === 0 || uncertainIds.length || missingIds.length) return;
 		const jobBindings = bindings;
 		printing = true;
 		try {
@@ -368,7 +377,7 @@
 	const exportFormat = $derived(resolveExportFormat(layout.exportFormat));
 
 	async function doExport() {
-		if (bindings.length === 0 || uncertainIds.length) return;
+		if (bindings.length === 0 || uncertainIds.length || missingIds.length) return;
 		const jobBindings = bindings;
 		saving = true;
 		try {
@@ -737,6 +746,8 @@
 		<div class="col-head"><span>{m['labels.preview']()}</span></div>
 		{#if uncertainIds.length}
 			<UncertainSpools ids={uncertainIds} />
+		{:else if missingIds.length}
+			<div class="empty" role="alert">{m['labels.selectedSpoolsMissing']()}</div>
 		{:else if bindings.length > 0}
 			<div class="preview-wrap">
 				<!-- Full-width measuring box, as in the designer: the preview is capped at
@@ -763,13 +774,19 @@
 		{/if}
 		<div class="print-btn">
 			{#if layout.mode === 'image'}
-				<Button onclick={doExport} disabled={bindings.length === 0 || saving || uncertainIds.length > 0}>
+				<Button
+					onclick={doExport}
+					disabled={bindings.length === 0 || saving || uncertainIds.length > 0 || missingIds.length > 0}
+				>
 					{saving
 						? m['labels.preparing']()
 						: m['labels.saveAsFormat']({ format: exportFormat.extension.toUpperCase() })}
 				</Button>
 			{:else}
-				<Button onclick={doPrint} disabled={bindings.length === 0 || printing || uncertainIds.length > 0}>
+				<Button
+					onclick={doPrint}
+					disabled={bindings.length === 0 || printing || uncertainIds.length > 0 || missingIds.length > 0}
+				>
 					{printing
 						? m['labels.preparing']()
 						: m['labels.printN']({ count: bindings.length * Math.max(1, layout.copies) })}

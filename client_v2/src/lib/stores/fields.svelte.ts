@@ -24,6 +24,7 @@ class Fields {
 	// Reactive so views can wait for the definitions rather than render against an
 	// empty list and then rearrange themselves once they arrive.
 	private loaded = $state<EntityType[]>([]);
+	private failed = $state<EntityType[]>([]);
 
 	get(entity: EntityType): FieldDef[] {
 		return this.defs[entity] ?? [];
@@ -32,6 +33,10 @@ class Fields {
 	/** Whether this entity's definitions are in hand — an empty list is a real answer. */
 	isLoaded(entity: EntityType): boolean {
 		return this.loaded.includes(entity);
+	}
+
+	failedEntities(): EntityType[] {
+		return this.failed;
 	}
 
 	/** Load once (idempotent). */
@@ -57,12 +62,23 @@ class Fields {
 					// Even a transport that ignores abort must not publish a late response.
 					if (controller.signal.aborted) return;
 					if (this.revisions[entity] !== revision) continue;
+					this.revisions[entity]++;
 					this.defs = { ...this.defs, [entity]: byOrder(list) };
 					if (!this.loaded.includes(entity)) this.loaded = [...this.loaded, entity];
 					return;
 				}
 			})();
-			pending = Promise.race([load, timeout]).finally(() => clearTimeout(timer));
+			pending = Promise.race([load, timeout])
+				.then(
+					() => {
+						this.failed = this.failed.filter((failed) => failed !== entity);
+					},
+					(error: unknown) => {
+						if (!this.failed.includes(entity)) this.failed = [...this.failed, entity];
+						throw error;
+					}
+				)
+				.finally(() => clearTimeout(timer));
 			this.loading.set(entity, pending);
 		}
 		try {
@@ -84,16 +100,36 @@ class Fields {
 		for (const e of ENTITIES) void this.load(e);
 	}
 
-	async save(entity: EntityType, key: string, params: FieldParams) {
-		const list = await setField(entity, key, params);
+	private async finishMutation(entity: EntityType, revision: number, list: FieldDef[]) {
+		const changed = this.revisions[entity] !== revision;
 		this.revisions[entity]++;
-		this.defs = { ...this.defs, [entity]: byOrder(list) };
+		if (!changed) {
+			this.defs = { ...this.defs, [entity]: byOrder(list) };
+			return;
+		}
+		const pending = this.loading.get(entity);
+		if (pending) {
+			try {
+				await pending;
+			} catch (error) {
+				console.warn('An overlapping %s field load failed before refresh', entity, error);
+			} finally {
+				if (this.loading.get(entity) === pending) this.loading.delete(entity);
+			}
+		}
+		await this.loadRequired(entity);
+	}
+
+	async save(entity: EntityType, key: string, params: FieldParams) {
+		const revision = this.revisions[entity];
+		const list = await setField(entity, key, params);
+		await this.finishMutation(entity, revision, list);
 	}
 
 	async remove(entity: EntityType, key: string) {
+		const revision = this.revisions[entity];
 		const list = await deleteField(entity, key);
-		this.revisions[entity]++;
-		this.defs = { ...this.defs, [entity]: byOrder(list) };
+		await this.finishMutation(entity, revision, list);
 	}
 }
 

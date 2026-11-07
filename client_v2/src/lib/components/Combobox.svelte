@@ -3,6 +3,8 @@
 	import { makeDraftTracker } from '$lib/utils/draftTracker';
 	import type { SaveResult } from '$lib/utils/saver';
 	import { getFieldLabelId } from './fieldLabel';
+	import { getContext } from 'svelte';
+	import { SPOOL_EDIT_UNAVAILABLE } from '$lib/library/spoolEditContext';
 
 	interface Props {
 		value: string | number;
@@ -37,6 +39,8 @@
 		oninput,
 		ariaLabel
 	}: Props = $props();
+	const unavailable = getContext<(() => boolean) | undefined>(SPOOL_EDIT_UNAVAILABLE);
+	const isUnavailable = () => disabled || (unavailable?.() ?? false);
 
 	// Named by the enclosing <Field>'s label cell when there is one; see fieldLabel.ts.
 	const fieldLabelId = getFieldLabelId();
@@ -75,7 +79,7 @@
 	}
 
 	function openList() {
-		if (disabled || options.length === 0 || open) return;
+		if (isUnavailable() || options.length === 0 || open) return;
 		reposition();
 		open = true;
 		typing = false;
@@ -86,6 +90,7 @@
 		highlight = -1;
 	}
 	function change(value: string) {
+		if (isUnavailable()) return;
 		if (protectDraft) draft = value;
 		const result = oninput?.(value);
 		if (protectDraft) tracker.change('value', result);
@@ -148,6 +153,10 @@
 		}
 	}
 
+	$effect(() => {
+		if (isUnavailable()) close();
+	});
+
 	// While open: outside pointer closes it, scroll/resize keeps it anchored.
 	$effect(() => {
 		if (!open) return;
@@ -175,7 +184,7 @@
 	class:invalid
 	value={displayValue}
 	{placeholder}
-	{disabled}
+	disabled={isUnavailable()}
 	role="combobox"
 	aria-expanded={open}
 	aria-controls={listId}
