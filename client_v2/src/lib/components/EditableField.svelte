@@ -37,7 +37,18 @@
 	// Named by the enclosing <Field>'s label cell when there is one; see fieldLabel.ts.
 	const labelId = getFieldLabelId();
 
-	let urls = $derived(linkify ? extractUrls(String(value ?? '')) : []);
+	// What the user typed is kept as a draft until they leave the box; an invalid
+	// draft stays visible so it can be corrected. Autosave responses, live updates
+	// and refetched lists can otherwise overwrite newer typing (#1307). The
+	// inspector is keyed by entity, so a different selection gets a fresh field.
+	let draft = $state<string | null>(null);
+	const external = $derived(String(value ?? ''));
+	function onInput(v: string) {
+		draft = v;
+		oninput?.(v);
+	}
+
+	let urls = $derived(linkify ? extractUrls(draft ?? external) : []);
 </script>
 
 <span class="row">
@@ -45,12 +56,15 @@
 		class="edit"
 		class:mono
 		class:invalid
-		{value}
+		value={draft ?? external}
 		{placeholder}
 		aria-label={ariaLabel}
 		aria-labelledby={ariaLabel ? undefined : labelId}
 		aria-invalid={invalid}
-		oninput={(e) => oninput?.(e.currentTarget.value)}
+		oninput={(e) => onInput(e.currentTarget.value)}
+		onblur={() => {
+			if (!invalid) draft = null;
+		}}
 	/>
 	{#each urls as url (url)}
 		<a

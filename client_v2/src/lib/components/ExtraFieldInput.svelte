@@ -40,18 +40,20 @@
 	}
 	// The numeric fields are text inputs guarded by `numericInput` so a decimal comma
 	// is accepted and letters can't be typed at all; `parseDecimal` reads either
-	// separator. What the user typed is kept in `drafts` and shown back for as long as
-	// it means the same number as the stored value — otherwise emitting "1," (which
-	// stores 1) would immediately rewrite the box to "1" and eat the comma mid-typing.
+	// separator. What the user typed is kept in `drafts` and shown back until they
+	// leave the box: emitting "1," (which stores 1) would otherwise rewrite the box to
+	// "1" and eat the comma mid-typing, and autosave responses and live updates carry
+	// the number as the server had it a moment ago (#1307, as in EditableField).
 	let drafts = $state<Record<string, string>>({});
 	function shown(key: string, stored: unknown): string {
-		const value = stored === undefined || stored === null ? '' : String(stored);
-		const draft = drafts[key];
-		return draft !== undefined && parseDecimal(draft) === parseDecimal(value) ? draft : value;
+		return drafts[key] ?? (stored === undefined || stored === null ? '' : String(stored));
 	}
 	function typed(key: string, raw: string): string {
 		drafts[key] = raw;
 		return raw;
+	}
+	function left(key: string) {
+		delete drafts[key];
 	}
 
 	function onInt(v: string) {
@@ -119,6 +121,7 @@
 			value={shown('int', parsed)}
 			aria-label={field.name}
 			oninput={(e) => onInt(typed('int', e.currentTarget.value))}
+			onblur={() => left('int')}
 		/>
 		{#if field.unit}<span class="unit">{field.unit}</span>{/if}
 	</span>
@@ -132,6 +135,7 @@
 			value={shown('float', parsed)}
 			aria-label={field.name}
 			oninput={(e) => onFloat(typed('float', e.currentTarget.value))}
+			onblur={() => left('float')}
 		/>
 		{#if field.unit}<span class="unit">{field.unit}</span>{/if}
 	</span>
@@ -146,6 +150,7 @@
 			value={shown('lo', lo)}
 			aria-label={`${field.name} ${m['settings.extraFields.min']()}`}
 			oninput={(e) => onRange(0, typed('lo', e.currentTarget.value), isInt)}
+			onblur={() => left('lo')}
 			placeholder={m['settings.extraFields.min']()}
 		/>
 		<span class="dash">–</span>
@@ -157,6 +162,7 @@
 			value={shown('hi', hi)}
 			aria-label={`${field.name} ${m['settings.extraFields.max']()}`}
 			oninput={(e) => onRange(1, typed('hi', e.currentTarget.value), isInt)}
+			onblur={() => left('hi')}
 			placeholder={m['settings.extraFields.max']()}
 		/>
 		{#if field.unit}<span class="unit">{field.unit}</span>{/if}

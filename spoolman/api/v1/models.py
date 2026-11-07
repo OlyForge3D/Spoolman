@@ -492,6 +492,39 @@ class Spool(BaseModel):
         )
 
 
+class SpoolGroupPreviewSpool(BaseModel):
+    """One spool in a filament group's preview: just enough to draw a fill-level pip."""
+
+    id: int = Field(description="Spool ID.", examples=[3])
+    remaining_weight: float | None = Field(
+        None,
+        description="Remaining filament weight in grams, as on the spool. Null when the initial weight is unknown.",
+        examples=[750.0],
+    )
+    initial_weight: float | None = Field(
+        None,
+        description="Initial filament weight in grams, falling back to the filament's weight. Null when unknown.",
+        examples=[1000.0],
+    )
+
+
+class SpoolGroupPreviewFilament(BaseModel):
+    """One filament in a vendor group's preview: just enough to draw a color swatch."""
+
+    id: int = Field(description="Filament ID.", examples=[7])
+    color_hex: str | None = Field(None, description="Hexadecimal color code of the filament.", examples=["FF0000"])
+    multi_color_hexes: str | None = Field(
+        None,
+        description="Comma-separated color codes of a multi-color filament.",
+        examples=["FF0000,00FF00"],
+    )
+    multi_color_direction: MultiColorDirection | None = Field(
+        None,
+        description="Type of multi-color filament. Only set if multi_color_hexes is set.",
+        examples=["coaxial"],
+    )
+
+
 class SpoolGroup(BaseModel):
     """A group of spools with server-computed aggregates.
 
@@ -534,6 +567,30 @@ class SpoolGroup(BaseModel):
     vendor: Vendor | None = Field(
         None,
         description="The vendor, embedded for group_by=vendor.",
+    )
+    filament_count: int | None = Field(
+        None,
+        description=(
+            "Only for group_by=vendor: the number of distinct filaments in the group. With "
+            "include_empty=true that is every matching filament of the manufacturer, including "
+            "those with no spools; otherwise it is the number of distinct filaments among the "
+            "matching spools."
+        ),
+        examples=[4],
+    )
+    spools: list[SpoolGroupPreviewSpool] | None = Field(
+        None,
+        description=(
+            "Only with preview=true and group_by=filament: up to 5 of the group's matching spools, by "
+            "ascending ID. They are exactly the spools counted in spool_count."
+        ),
+    )
+    filaments: list[SpoolGroupPreviewFilament] | None = Field(
+        None,
+        description=(
+            "Only with preview=true and group_by=vendor: up to 4 of the manufacturer's filaments that "
+            "match the filament filters, by name then ID, whether or not they have matching spools."
+        ),
     )
 
 
@@ -642,6 +699,62 @@ class SearchResults(BaseModel):
     )
 
 
+class TagDecodedInfo(BaseModel):
+    """A best-effort read of a scanned tag's own contents, for a format Spoolman can decode.
+
+    Purely informational. Nothing here is applied to any spool automatically -- in particular
+    `used_weight` is shown so a person can act on it, but a tag's self-reported usage is never
+    trusted enough to silently overwrite tracked weight. Confirm it via a `measure` or `use`
+    call on the matched spool if it should.
+
+    Field names follow the rest of the API; they are part of a released endpoint, so renaming
+    them later would be a breaking change.
+    """
+
+    material_class: str | None = Field(None, examples=["FFF"], description="FFF (filament) or SLA (resin).")
+    material: str | None = Field(None, examples=["PLA"])
+    name: str | None = Field(None, examples=["PLA Galaxy Black"])
+    vendor_name: str | None = Field(None, examples=["Prusament"])
+    article_number: str | None = Field(None, examples=["8435008400000"], description="Vendor GTIN, as text.")
+    gtin: str | None = Field(
+        None,
+        examples=["00850078714923"],
+        description="A validated GTIN, zero-padded to 14 digits.",
+    )
+    color_hex: str | None = Field(None, examples=["1122FF"])
+    diameter: float | None = Field(None, examples=[1.75])
+    density: float | None = Field(None, examples=[1.24])
+    weight: float | None = Field(
+        None,
+        description="Nominal full net weight of the filament, in grams.",
+        examples=[1000.0],
+    )
+    initial_weight: float | None = Field(
+        None,
+        description="Measured net weight on this roll, in grams, if the tag carries one.",
+        examples=[998.5],
+    )
+    spool_weight: float | None = Field(
+        None,
+        description="Tare weight of the empty spool, in grams, if the tag carries one.",
+        examples=[140.0],
+    )
+    used_weight: float | None = Field(
+        None,
+        description=(
+            "Weight already used from this spool, per the tag. Informational only -- see the "
+            "class docstring; this is never applied to the spool automatically."
+        ),
+        examples=[123.4],
+    )
+    extruder_temp: int | None = Field(None, description="Print temperature in °C.", examples=[215])
+    bed_temp: int | None = Field(None, description="Bed temperature in °C.", examples=[60])
+    instance_uuid: str | None = Field(
+        None,
+        description="Identifies this specific roll. Not the product, and not stored on the filament.",
+    )
+
+
 class TagScan(BaseModel):
     """One tag read reported by a reader-side agent.
 
@@ -675,7 +788,8 @@ class TagScan(BaseModel):
         None,
         description=(
             "The tag's raw contents, base64-encoded, if the agent read them. Carried through "
-            "untouched: Spoolman does not decode tag contents."
+            "untouched into the broadcast. For a format Spoolman can decode (see `decoded`), it is "
+            "also decoded server-side; that never changes what is broadcast here."
         ),
     )
     matched_spool_id: int | None = Field(
@@ -701,6 +815,23 @@ class TagScan(BaseModel):
     filament: Filament | None = Field(
         None,
         description="The matched filament, so a client needs no follow-up request. Null unless a filament matched.",
+    )
+    decoded: TagDecodedInfo | None = Field(
+        None,
+        description=(
+            "The tag's own contents, decoded server-side, if `format` names a format Spoolman knows "
+            "how to read and `payload_b64` parsed successfully. Null otherwise -- including for a "
+            "recognized but unparseable payload, which is not reported as an error."
+        ),
+    )
+    created: bool = Field(
+        default=False,
+        description=(
+            "Whether this scan just created a new spool from decoded tag contents and linked the tag "
+            "to it. Only possible when the request set `create: true` on an otherwise-unmatched, "
+            "successfully decoded tag."
+        ),
+        examples=[False],
     )
 
 

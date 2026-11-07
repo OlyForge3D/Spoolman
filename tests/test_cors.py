@@ -99,7 +99,11 @@ def test_cors_allow_headers_custom():
 
 def test_cors_expose_headers_default():
     with mock.patch.dict(os.environ, {}, clear=True):
-        assert env.get_cors_expose_headers() == ["X-Total-Count"]
+        assert env.get_cors_expose_headers() == [
+            "X-Total-Count",
+            "X-Total-Spools",
+            "X-Total-Remaining-Weight",
+        ]
 
 
 def test_cors_expose_headers_custom():

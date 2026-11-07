@@ -1,6 +1,6 @@
 [project]
 name = "spoolman"
-version = "0.27.0"
+version = "0.27.1"
 description = "A web service that keeps track of 3D printing spools."
 license = "MIT"
 readme = "README.md"
@@ -18,15 +18,22 @@ dependencies = [
     "sqlalchemy-cockroachdb~=2.0",
     "asyncpg~=0.30",
     "psycopg2-binary~=2.9",
-    "setuptools~=83.0",
+    "setuptools~=84.1",
     "WebSockets~=15.0",
     "prometheus-client~=0.21",
     "httpx~=0.28",
     "hishel~=0.1",
     "aiomysql[rsa]~=0.3",
-    "influxdb-client>=1.50.0",
+    # spoolman.database.tag imports spoolman.tags.decode, which imports the OpenPrintTag
+    # codec unconditionally to decode POST /tag/scan payloads -- that module is on the
+    # import path of every startup, not just tests, so this has to be a real dependency.
+    # Capped below 6: cbor2 6.x moved its accelerated extension to a Rust build
+    # (setuptools-rust) instead of plain setuptools/C. PyPI ships no armv7 wheel for any
+    # cbor2 version, so armv7 always builds from sdist, and the build image (see the
+    # greenlet/armv7 patchelf step in the Dockerfile) has a C toolchain but no Rust one.
+    "cbor2>=5.9,<6",
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.15"
 
 [dependency-groups]
 dev = [

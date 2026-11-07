@@ -4,6 +4,7 @@ import logging
 import os
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -346,7 +347,7 @@ def get_cors_allow_headers() -> list[str]:
 def get_cors_expose_headers() -> list[str]:
     """Get the CORS exposed headers from environment variables.
 
-    Returns ["X-Total-Count"] if no environment variable was set.
+    Returns the pagination and group-total headers if no environment variable was set.
 
     Returns:
         list[str]: The exposed headers.
@@ -354,7 +355,7 @@ def get_cors_expose_headers() -> list[str]:
     """
     headers = os.getenv("SPOOLMAN_CORS_EXPOSE_HEADERS")
     if headers is None:
-        return ["X-Total-Count"]
+        return ["X-Total-Count", "X-Total-Spools", "X-Total-Remaining-Weight"]
     return [h.strip() for h in headers.split(",")]
 
 
@@ -540,9 +541,9 @@ def get_build_date() -> datetime | None:
 def can_write_to_data_dir() -> bool:
     """Check if the data directory is writable."""
     try:
-        test_file = get_data_dir().joinpath("test.txt")
-        test_file.touch()
-        test_file.unlink()
+        # A uniquely named file, so the check can never clobber one of the user's own.
+        with tempfile.NamedTemporaryFile(dir=get_data_dir()):
+            pass
     except:  # noqa: E722
         return False
     return True

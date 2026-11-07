@@ -6,7 +6,7 @@ on:
       # Every branch builds, so a fix can be handed to a bug reporter as a Docker
       # image before it merges (see publish-images). Weblate pushes locale-only
       # commits constantly and dependabot's branches arrive as PRs anyway, so
-      # neither is worth a full multi-arch run.
+      # bot branches skip push runs and are built by the pull_request run instead.
       - "**"
       - "!weblate*"
       - "!dependabot/**"
@@ -37,10 +37,10 @@ jobs:
   #
   style:
     # Same-repo branches already got a full run from the push trigger, so skip the
-    # duplicate pull_request run. Forks still need it: a fork's push fires no event
-    # here. Skipping the three jobs that have no `needs` cascades to every other
-    # job, since a skipped dependency skips its dependents.
-    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository }}
+    # duplicate pull_request run. Bot branches excluded above still need it, as do
+    # forks, whose pushes fire no event here. Skipping the three jobs with no `needs`
+    # cascades to every other job, since a skipped dependency skips its dependents.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || startsWith(github.head_ref, 'dependabot/') || startsWith(github.head_ref, 'weblate') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -84,10 +84,10 @@ jobs:
   #
   build-client:
     # Same-repo branches already got a full run from the push trigger, so skip the
-    # duplicate pull_request run. Forks still need it: a fork's push fires no event
-    # here. Skipping the three jobs that have no `needs` cascades to every other
-    # job, since a skipped dependency skips its dependents.
-    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository }}
+    # duplicate pull_request run. Bot branches excluded above still need it, as do
+    # forks, whose pushes fire no event here. Skipping the three jobs with no `needs`
+    # cascades to every other job, since a skipped dependency skips its dependents.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || startsWith(github.head_ref, 'dependabot/') || startsWith(github.head_ref, 'weblate') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -236,10 +236,10 @@ jobs:
   #
   build-tester:
     # Same-repo branches already got a full run from the push trigger, so skip the
-    # duplicate pull_request run. Forks still need it: a fork's push fires no event
-    # here. Skipping the three jobs that have no `needs` cascades to every other
-    # job, since a skipped dependency skips its dependents.
-    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository }}
+    # duplicate pull_request run. Bot branches excluded above still need it, as do
+    # forks, whose pushes fire no event here. Skipping the three jobs with no `needs`
+    # cascades to every other job, since a skipped dependency skips its dependents.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || startsWith(github.head_ref, 'dependabot/') || startsWith(github.head_ref, 'weblate') }}
     runs-on: ubuntu-latest
     permissions:
       packages: write
@@ -371,6 +371,10 @@ jobs:
   test-frontend-v2:
     needs: [build-amd64]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Argos authenticates via OIDC; fork PRs get no id-token and fall back to tokenless upload.
+      id-token: write
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -398,10 +402,20 @@ jobs:
       - name: Start Spoolman
         run: docker compose -f tests_frontend_v2/docker-compose.yml up -d --wait
 
+      # Screenshots first: they seed a fixed dataset and need the database empty.
+      # Argos uploads are opt-in for this fork and are skipped for tag builds.
+      - name: Take client_v2 screenshots
+        env:
+          ARGOS_UPLOAD: ${{ vars.ARGOS_UPLOAD_ENABLED == 'true' && !startsWith(github.ref, 'refs/tags/') && '1' || '' }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd tests_frontend_v2
+          npx playwright test --project screenshots
+
       - name: Run client_v2 frontend integration tests
         run: |
           cd tests_frontend_v2
-          npx playwright test
+          npx playwright test --project chromium
 
       - name: Dump Spoolman logs on failure
         if: failure()
@@ -635,7 +649,7 @@ jobs:
         if: always()
         run: docker rm -f spoolman-smoke
   #
-  # Release images GHCR and Docker Hub if tests pass
+  # Publish to GHCR and, when configured, the secondary registry if tests pass.
   # Don't run this for pull requests
   #
   publish-images:
@@ -703,7 +717,18 @@ jobs:
             type=semver,pattern={{major}}
             type=ref,event=branch,enable=${{ github.ref_name != 'master' }}
 
+      - name: Configure secondary registry
+        id: remote-registry
+        env:
+          REMOTE_REGISTRY_URL: ${{ vars.REMOTE_REGISTRY_URL }}
+          REMOTE_REGISTRY_NAMESPACE: ${{ vars.REMOTE_REGISTRY_NAMESPACE }}
+          REMOTE_REGISTRY_REPOSITORY: ${{ vars.REMOTE_REGISTRY_REPOSITORY }}
+          REMOTE_REGISTRY_USERNAME: ${{ secrets.REMOTE_REGISTRY_USERNAME }}
+          REMOTE_REGISTRY_PASSWORD: ${{ secrets.REMOTE_REGISTRY_PASSWORD }}
+        run: bash scripts/configure-remote-registry.sh
+
       - name: Extract metadata (tags, labels) for Docker Hub
+        if: ${{ steps.remote-registry.outputs.enabled == 'true' }}
         id: meta-dh
         uses: docker/metadata-action@v5.5.1
         with:
@@ -716,6 +741,7 @@ jobs:
             type=semver,pattern={{major}}
 
       - name: Log in to DockerHub
+        if: ${{ steps.remote-registry.outputs.enabled == 'true' }}
         uses: docker/login-action@v3.3.0
         with:
           registry: ${{ vars.REMOTE_REGISTRY_URL }}

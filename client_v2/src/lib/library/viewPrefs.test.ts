@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest';
-import { parseStoredView } from './viewPrefs';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { parseStoredView, rememberView } from './viewPrefs';
 
 // The stored view is the only piece of Library state that doesn't come from the
 // URL (#1036), so it's also the only piece that can arrive malformed — from an
@@ -13,7 +13,9 @@ describe('parseStoredView', () => {
 			group: 'location',
 			sortKey: 'name',
 			sortAsc: true,
-			showEmpty: false
+			showEmpty: false,
+			showLotNumbers: false,
+			pageSize: 20
 		});
 	});
 
@@ -22,7 +24,9 @@ describe('parseStoredView', () => {
 			group: 'filament',
 			sortKey: 'name',
 			sortAsc: true,
-			showEmpty: true
+			showEmpty: true,
+			showLotNumbers: false,
+			pageSize: 20
 		});
 	});
 
@@ -54,7 +58,48 @@ describe('parseStoredView', () => {
 			group: 'colour',
 			sortKey: 'name',
 			sortAsc: false,
-			showEmpty: false
+			showEmpty: false,
+			showLotNumbers: false,
+			pageSize: 20
 		});
 	});
+});
+
+afterEach(() => vi.unstubAllGlobals());
+
+it('round-trips the lot number preference through storage', () => {
+	let stored: string | null = null;
+	vi.stubGlobal('localStorage', {
+		getItem: () => stored,
+		setItem: (_key: string, value: string) => {
+			stored = value;
+		}
+	});
+	const view = {
+		group: 'filament',
+		sortKey: 'name',
+		sortAsc: true,
+		showEmpty: false,
+		showLotNumbers: true,
+		pageSize: 20
+	};
+	rememberView(view);
+	expect(parseStoredView(stored)).toEqual(view);
+	rememberView({ ...view, showLotNumbers: false });
+	expect(parseStoredView(stored)?.showLotNumbers).toBe(false);
+});
+
+it('defaults lot numbers off for an old stored view with empty enabled', () => {
+	expect(parseStoredView('{"group":"filament","sort":"name","asc":true,"empty":true}')?.showLotNumbers).toBe(
+		false
+	);
+});
+
+it('round-trips the page size and defaults it for old or invalid entries', () => {
+	const old = '{"group":"filament","sort":"name","asc":true';
+	expect(parseStoredView(`${old},"size":100}`)?.pageSize).toBe(100);
+	expect(parseStoredView(`${old}}`)?.pageSize).toBe(20);
+	expect(parseStoredView(`${old},"size":"100"}`)?.pageSize).toBe(20);
+	expect(parseStoredView(`${old},"size":0}`)?.pageSize).toBe(20);
+	expect(parseStoredView(`${old},"size":2.5}`)?.pageSize).toBe(20);
 });
