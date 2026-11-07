@@ -3,17 +3,19 @@
 	import Button from '$components/Button.svelte';
 	import Pagination from '$components/Pagination.svelte';
 	import NumberInput from '../NumberInput.svelte';
+	import UncertainSpools from '../UncertainSpools.svelte';
 	import LabelCanvas from './LabelCanvas.svelte';
 	import { labelKind, type LabelKind, type LabelDesign } from '$lib/labels/types';
 	import type { LabelBinding } from '$lib/labels/template';
 	import { PAPER_NAMES, layoutMargin, paperSize, sheetGrid } from '$lib/labels/paper';
-	import { printLabels, exportLabels, ZIP_THRESHOLD } from '$lib/labels/print';
+	import { printLabels, exportLabels, LabelDataChangedError, ZIP_THRESHOLD } from '$lib/labels/print';
 	import { EXPORT_FORMATS, resolveExportFormat } from '$lib/labels/export';
 	import { spoolSource } from '$lib/api/spoolSource';
 	import { searchAll } from '$lib/api/search';
 	import { isAbortError } from '$lib/api/http';
 	import { inventory } from '$lib/stores/inventory.svelte';
 	import { settings } from '$lib/stores/settings.svelte';
+	import { toasts } from '$lib/stores/toasts.svelte';
 	import type { Spool, Filament } from '$lib/types';
 	import * as m from '$lib/paraglide/messages';
 
@@ -217,7 +219,7 @@
 		const f = inventory.filamentById(s.filamentId);
 		const v = f ? inventory.vendorById(f.vendorId) : undefined;
 		const name = f ? `${v ? v.name + ' ' : ''}${f.name}` : m['labels.unknownFilament']();
-		return `#${s.id} · ${name}${s.location ? ' · ' + s.location : ''}`;
+		return `#${s.id} · ${name}${!inventory.isSpoolUncertain(s.id) && s.location ? ' · ' + s.location : ''}`;
 	}
 
 	// The active id set — search results when searching, otherwise the current page —
@@ -314,6 +316,9 @@
 					.filter((s): s is Spool => !!s)
 					.map(bindingFor)
 	);
+	const uncertainIds = $derived(
+		kind === 'spool' ? [...selected].filter((id) => inventory.isSpoolUncertain(id)) : []
+	);
 
 	// Preview caption: the id of the first selected subject, labelled by kind.
 	const previewId = $derived(kind === 'filament' ? bindings[0]?.filament?.id : bindings[0]?.spool?.id);
@@ -325,13 +330,34 @@
 	let previewW = $state(0);
 	const previewFitW = $derived(previewW > 0 ? Math.min(PREVIEW_W, previewW) : PREVIEW_W);
 
+	function currentJob(jobBindings: LabelBinding[], jobKind: LabelKind): () => boolean {
+		if (jobKind !== 'spool') return () => true;
+		const ids = new Set(selected);
+		return () =>
+			kind === jobKind &&
+			selected.size === ids.size &&
+			[...ids].every((id) => selected.has(id)) &&
+			jobBindings.every(
+				({ spool }) =>
+					!spool || (!inventory.isSpoolUncertain(spool.id) && inventory.spoolById(spool.id) === spool)
+			);
+	}
+
 	async function doPrint() {
-		if (bindings.length === 0) return;
+		if (bindings.length === 0 || uncertainIds.length) return;
+		const jobBindings = bindings;
 		printing = true;
 		try {
-			await printLabels({ design, bindings, layout, baseUrl: settings.baseUrl });
+			await printLabels({
+				design,
+				bindings: jobBindings,
+				layout,
+				baseUrl: settings.baseUrl,
+				isCurrent: currentJob(jobBindings, kind)
+			});
 		} catch (e) {
-			console.error('Print failed', e);
+			if (e instanceof LabelDataChangedError) toasts.error(m['labels.spoolDetailsChanged']());
+			else console.error('Print failed', e);
 		} finally {
 			printing = false;
 		}
@@ -342,12 +368,20 @@
 	const exportFormat = $derived(resolveExportFormat(layout.exportFormat));
 
 	async function doExport() {
-		if (bindings.length === 0) return;
+		if (bindings.length === 0 || uncertainIds.length) return;
+		const jobBindings = bindings;
 		saving = true;
 		try {
-			await exportLabels({ design, bindings, layout, baseUrl: settings.baseUrl });
+			await exportLabels({
+				design,
+				bindings: jobBindings,
+				layout,
+				baseUrl: settings.baseUrl,
+				isCurrent: currentJob(jobBindings, kind)
+			});
 		} catch (e) {
-			console.error('Label export failed', e);
+			if (e instanceof LabelDataChangedError) toasts.error(m['labels.spoolDetailsChanged']());
+			else console.error('Label export failed', e);
 		} finally {
 			saving = false;
 		}
@@ -701,7 +735,9 @@
 
 	<div class="col preview">
 		<div class="col-head"><span>{m['labels.preview']()}</span></div>
-		{#if bindings.length > 0}
+		{#if uncertainIds.length}
+			<UncertainSpools ids={uncertainIds} />
+		{:else if bindings.length > 0}
 			<div class="preview-wrap">
 				<!-- Full-width measuring box, as in the designer: the preview is capped at
 				     PREVIEW_W but shrinks with the column on a narrow screen rather than
@@ -727,13 +763,13 @@
 		{/if}
 		<div class="print-btn">
 			{#if layout.mode === 'image'}
-				<Button onclick={doExport} disabled={bindings.length === 0 || saving}>
+				<Button onclick={doExport} disabled={bindings.length === 0 || saving || uncertainIds.length > 0}>
 					{saving
 						? m['labels.preparing']()
 						: m['labels.saveAsFormat']({ format: exportFormat.extension.toUpperCase() })}
 				</Button>
 			{:else}
-				<Button onclick={doPrint} disabled={bindings.length === 0 || printing}>
+				<Button onclick={doPrint} disabled={bindings.length === 0 || printing || uncertainIds.length > 0}>
 					{printing
 						? m['labels.preparing']()
 						: m['labels.printN']({ count: bindings.length * Math.max(1, layout.copies) })}

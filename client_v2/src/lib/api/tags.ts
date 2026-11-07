@@ -2,6 +2,7 @@ import type { Filament, Spool, Tag } from '$lib/types';
 import { getList, postJson, deleteResource, HttpError } from './http';
 import { mapSpool, mapFilament, mapVendor } from './map';
 import { inventory } from '$lib/stores/inventory.svelte';
+import { readSpoolSnapshot } from './spoolReadFence';
 
 // Linking physical NFC/RFID tags to spools and filaments.
 //
@@ -132,28 +133,34 @@ export async function unlinkTag(target: TagTarget, uid: string): Promise<void> {
  * reported to the user as an unknown tag.
  */
 export async function findTagHolder(uid: string, signal?: AbortSignal): Promise<TagHolder | undefined> {
-	const [spools, filaments] = await Promise.all([
-		getList('/spool', { tag: uid, allow_archived: 'true', limit: 1 }, signal),
-		getList('/filament', { tag: uid, limit: 1 }, signal)
-	]);
-	const rawSpool = spools.items[0] as Json | undefined;
-	if (rawSpool) {
-		// Seed the cache the way every other spool read does, so the inspector this
-		// may be about to open has its filament and manufacturer already.
-		if (rawSpool.filament) {
-			inventory.upsertFilament(mapFilament(rawSpool.filament));
-			if (rawSpool.filament.vendor) inventory.upsertVendor(mapVendor(rawSpool.filament.vendor));
-		}
-		const spool = mapSpool(rawSpool);
-		inventory.upsertSpool(spool);
-		return { kind: 'spool', spool };
-	}
-	const rawFilament = filaments.items[0] as Json | undefined;
-	if (rawFilament) {
-		if (rawFilament.vendor) inventory.upsertVendor(mapVendor(rawFilament.vendor));
-		const filament = mapFilament(rawFilament);
-		inventory.upsertFilament(filament);
-		return { kind: 'filament', filament };
-	}
-	return undefined;
+	return readSpoolSnapshot(
+		() =>
+			Promise.all([
+				getList('/spool', { tag: uid, allow_archived: 'true', limit: 1 }, signal),
+				getList('/filament', { tag: uid, limit: 1 }, signal)
+			]),
+		([spools, filaments]) => {
+			const rawSpool = spools.items[0] as Json | undefined;
+			if (rawSpool) {
+				// Seed the cache the way every other spool read does, so the inspector this
+				// may be about to open has its filament and manufacturer already.
+				if (rawSpool.filament) {
+					inventory.upsertFilament(mapFilament(rawSpool.filament));
+					if (rawSpool.filament.vendor) inventory.upsertVendor(mapVendor(rawSpool.filament.vendor));
+				}
+				const spool = mapSpool(rawSpool);
+				inventory.upsertSpool(spool);
+				return { kind: 'spool' as const, spool };
+			}
+			const rawFilament = filaments.items[0] as Json | undefined;
+			if (rawFilament) {
+				if (rawFilament.vendor) inventory.upsertVendor(mapVendor(rawFilament.vendor));
+				const filament = mapFilament(rawFilament);
+				inventory.upsertFilament(filament);
+				return { kind: 'filament' as const, filament };
+			}
+			return undefined;
+		},
+		signal
+	);
 }

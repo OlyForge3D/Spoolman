@@ -3,8 +3,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('./config', () => ({ API_BASE: 'http://spoolman.test/api/v1' }));
 
 import { inventory } from '$lib/stores/inventory.svelte';
+import { fields } from '$lib/stores/fields.svelte';
+import { FieldType, type FieldDef } from './fields';
 import { mapSpool } from './map';
-import { SpoolBatchError, spoolSource } from './spoolSource';
+import { allPages } from './query';
+import { readSpoolSnapshot } from './spoolReadFence';
+import { SpoolBatchError, SpoolRenameUncertainError, spoolSource } from './spoolSource';
+import { searchAll } from './search';
+import { findTagHolder } from './tags';
 
 // GET /location only knows locations that hold a spool, so an idle toolhead set up
 // as a dashboard card could not be picked for a spool (#1261).
@@ -54,6 +60,12 @@ describe('importExternalFilament', () => {
 		weight: 1000
 	};
 	type ApiVendor = { id: number; name: string; external_id?: string };
+
+	beforeEach(() => {
+		vi.spyOn(fields, 'isLoaded').mockReturnValue(true);
+		vi.spyOn(fields, 'get').mockReturnValue([]);
+	});
+	afterEach(() => vi.restoreAllMocks());
 
 	function serveImport(vendors: ApiVendor[], filamentIds: string[] = []) {
 		const fetch = vi.fn(async (url: string, init?: RequestInit) => {
@@ -117,11 +129,53 @@ describe('importExternalFilament', () => {
 	});
 
 	it('returns an already imported filament without creating anything', async () => {
+		vi.mocked(fields.isLoaded).mockReturnValue(false);
+		const load = vi.spyOn(fields, 'loadRequired');
 		const fetch = serveImport([], [ext.id]);
 		expect((await spoolSource.importExternalFilament(ext)).id).toBe('1');
 		expect(fetch).toHaveBeenCalledTimes(1);
 		expect(new URL(fetch.mock.calls[0][0]).searchParams.get('external_id')).toBe('"Prusa_PLA"');
+		expect(load).not.toHaveBeenCalled();
 	});
+
+	it('applies defaults only to the new filament and manufacturer', async () => {
+		const definitions = (entity: 'filament' | 'vendor'): FieldDef[] => [
+			{
+				key: `${entity}_default`,
+				name: 'Default',
+				order: 0,
+				field_type: FieldType.text,
+				entity_type: entity,
+				default_value: `"${entity} value"`
+			}
+		];
+		vi.mocked(fields.get).mockImplementation((entity) => (entity === 'spool' ? [] : definitions(entity)));
+		const fetch = serveImport([]);
+		await spoolSource.importExternalFilament(ext);
+		const posts = fetch.mock.calls.filter(([, init]) => init?.method === 'POST');
+		expect(JSON.parse(posts[0][1]!.body as string).extra).toEqual({ vendor_default: '"vendor value"' });
+		expect(JSON.parse(posts[1][1]!.body as string).extra).toEqual({ filament_default: '"filament value"' });
+	});
+
+	it('does not load or apply manufacturer defaults when a name already matches', async () => {
+		const get = vi.mocked(fields.get);
+		const fetch = serveImport([{ id: 10, name: 'Prusa' }]);
+		await spoolSource.importExternalFilament(ext);
+		expect(get).toHaveBeenCalledWith('filament');
+		expect(get).not.toHaveBeenCalledWith('vendor');
+		expect(fetch.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(1);
+	});
+
+	it.each(['filament', 'vendor'] as const)(
+		'does not create records when %s definitions cannot be loaded',
+		async (failed) => {
+			vi.mocked(fields.isLoaded).mockImplementation((entity) => entity !== failed);
+			vi.spyOn(fields, 'loadRequired').mockRejectedValue(new Error('definitions unavailable'));
+			const fetch = serveImport([]);
+			await expect(spoolSource.importExternalFilament(ext)).rejects.toThrow('definitions unavailable');
+			expect(fetch.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(0);
+		}
+	);
 });
 
 describe('createFilament', () => {
@@ -148,6 +202,33 @@ describe('createFilament', () => {
 			bedTemp: value
 		});
 		expect(fetch).toHaveBeenCalledOnce();
+	});
+});
+
+describe('staged spool pages', () => {
+	it('does not alter the inventory until the page is committed', async () => {
+		const id = 88001;
+		inventory.removeSpool(id);
+		vi.stubGlobal(
+			'fetch',
+			vi.fn(async () =>
+				Response.json([{ id, location: 'Shelf', filament: { id: 88001, vendor: { id: 88001 } } }])
+			)
+		);
+		const page = await spoolSource.stageSpools({
+			filters: {},
+			sort: [],
+			limit: 30,
+			offset: 0,
+			lowThreshold: 0
+		});
+		expect(page.items[0].id).toBe(id);
+		expect(inventory.spoolById(id)).toBeUndefined();
+		expect(inventory.filamentById('88001')).toBeUndefined();
+		page.commit();
+		expect(inventory.spoolById(id)).toEqual(page.items[0]);
+		expect(inventory.filamentById('88001')).toBeDefined();
+		expect(inventory.vendorById('88001')).toBeDefined();
 	});
 });
 
@@ -208,7 +289,7 @@ describe('vendorNames', () => {
 
 describe('entity write ordering', () => {
 	beforeEach(() => {
-		inventory.spools = [];
+		for (const spool of inventory.spools) inventory.removeSpool(spool.id);
 	});
 
 	function controlledFetch() {
@@ -220,6 +301,304 @@ describe('entity write ordering', () => {
 		vi.stubGlobal('fetch', fetch);
 		return { fetch, requests };
 	}
+
+	it('re-reads a list response that returns after a completed rename', async () => {
+		const { fetch, requests } = controlledFetch();
+		inventory.upsertSpool(mapSpool({ id: 88002, location: 'Shelf' }));
+		const list = spoolSource.listSpools({ filters: {}, sort: [], limit: 30, offset: 0, lowThreshold: 0 });
+		const rename = spoolSource.renameFieldValue('location', 'Shelf', 'Desk');
+		requests[1].respond(Response.json({ spools_updated: 1 }));
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(3));
+		requests[2].respond(Response.json({ id: 88002, location: 'Desk' }));
+		await rename;
+		requests[0].respond(Response.json([{ id: 88002, location: 'Shelf' }]));
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(4));
+		expect(inventory.spoolById(88002)?.location).toBe('Desk');
+		requests[3].respond(Response.json([{ id: 88002, location: 'Desk' }]));
+		expect((await list).items[0].location).toBe('Desk');
+		expect(inventory.spoolById(88002)?.location).toBe('Desk');
+	});
+
+	it('re-reads group aggregates that return after a rename', async () => {
+		const { fetch, requests } = controlledFetch();
+		const groups = spoolSource.listGroups({
+			field: 'location',
+			filters: {},
+			sort: [],
+			limit: 30,
+			offset: 0,
+			lowThreshold: 0
+		});
+		const rename = spoolSource.renameFieldValue('location', 'Group fence old', 'Group fence new');
+		requests[1].respond(Response.json({ spools_updated: 0 }));
+		await rename;
+		requests[0].respond(Response.json([{ group_by: 'location', key: 'Group fence old', spool_count: 1 }]));
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(3));
+		requests[2].respond(Response.json([{ group_by: 'location', key: 'Group fence new', spool_count: 1 }]));
+		expect((await groups).items.map((group) => group.key)).toEqual(['Group fence new']);
+	});
+
+	it('re-reads all group pages when a rename falls between pages', async () => {
+		const { fetch, requests } = controlledFetch();
+		const query = {
+			field: 'location' as const,
+			filters: {},
+			sort: [],
+			limit: 1,
+			lowThreshold: 0
+		};
+		const groups = readSpoolSnapshot(
+			() => allPages(1, (offset) => spoolSource.listGroups({ ...query, offset })),
+			(items) => items
+		);
+		const page = (key: string) =>
+			Response.json([{ group_by: 'location', key, spool_count: 1 }], {
+				headers: { 'x-total-count': '2' }
+			});
+		requests[0].respond(page('First group'));
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+		const rename = spoolSource.renameFieldValue('location', 'Paged old', 'Paged new');
+		requests[2].respond(Response.json({ spools_updated: 0 }));
+		await rename;
+		requests[1].respond(page('Paged old'));
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(4));
+		requests[3].respond(page('Paged new'));
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(5));
+		requests[4].respond(page('First group'));
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(6));
+		requests[5].respond(page('Paged new'));
+		expect((await groups).map((group) => group.key)).toEqual(['First group', 'Paged new']);
+	});
+
+	it('quarantines a newly cached matching spool before an in-flight rename settles', async () => {
+		const { fetch, requests } = controlledFetch();
+		const id = 88006;
+		const rename = spoolSource.renameFieldValue('location', 'Shelf', 'Desk');
+		const list = spoolSource.listSpools({ filters: {}, sort: [], limit: 30, offset: 0, lowThreshold: 0 });
+		requests[1].respond(Response.json([{ id, location: 'Shelf' }]));
+		await list;
+		expect(inventory.spoolById(id)?.location).toBe('Shelf');
+		expect(inventory.isSpoolUncertain(id)).toBe(true);
+
+		requests[0].respond(Response.json({ spools_updated: 1 }));
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(3));
+		requests[2].respond(Response.json({ id, location: 'Desk' }));
+		expect(await rename).toEqual({ updated: 1, cacheRefreshed: true });
+		expect(inventory.spoolById(id)?.location).toBe('Desk');
+		expect(inventory.isSpoolUncertain(id)).toBe(false);
+	});
+
+	it('quarantines a newly seen event while a rename request is in flight', async () => {
+		const id = 88007;
+		let resolvePatch: (response: Response) => void = () => {};
+		const patch = new Promise<Response>((resolve) => (resolvePatch = resolve));
+		const fetch = vi.fn((url: string, init?: RequestInit) =>
+			init?.method === 'PATCH' ? patch : Promise.resolve(Response.json({ id, location: 'Desk' }))
+		);
+		vi.stubGlobal('fetch', fetch);
+		const rename = spoolSource.renameFieldValue('location', 'Shelf', 'Desk');
+		spoolSource.ingestLiveEvent({
+			resource: 'spool',
+			type: 'updated',
+			id,
+			payload: { id, location: 'Shelf' }
+		});
+		expect(inventory.isSpoolUncertain(id)).toBe(true);
+		expect(fetch).toHaveBeenCalledOnce();
+		resolvePatch(Response.json({ spools_updated: 1 }));
+		await rename;
+		await vi.waitFor(() => expect(inventory.isSpoolUncertain(id)).toBe(false));
+		expect(inventory.spoolById(id)?.location).toBe('Desk');
+	});
+
+	it('keeps an ambiguous rename quarantined and fences older reads until retried', async () => {
+		const { fetch, requests } = controlledFetch();
+		const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+		const id = 88008;
+		try {
+			inventory.upsertSpool(mapSpool({ id, location: 'Ambiguous shelf A' }));
+			const list = spoolSource.listSpools({ filters: {}, sort: [], limit: 30, offset: 0, lowThreshold: 0 });
+			const rename = spoolSource.renameFieldValue('location', 'Ambiguous shelf A', 'Ambiguous desk B');
+			const failure = expect(rename).rejects.toBeInstanceOf(SpoolRenameUncertainError);
+			// A gateway error could arrive after the server committed the PATCH.
+			requests[1].respond(new Response('{}', { status: 503 }));
+			await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(3));
+			requests[2].respond(new Response('{}', { status: 503 }));
+			await failure;
+			expect(inventory.isSpoolUncertain(id)).toBe(true);
+
+			requests[0].respond(Response.json([{ id, location: 'Ambiguous shelf A' }]));
+			await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(4));
+			requests[3].respond(Response.json([{ id, location: 'Ambiguous desk B' }]));
+			await list;
+			expect(inventory.isSpoolUncertain(id)).toBe(true);
+			const retry = spoolSource.refreshUncertainSpools([id]);
+			await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(5));
+			requests[4].respond(Response.json({ id, location: 'Ambiguous desk B' }));
+			expect(await retry).toBe(true);
+			expect(inventory.spoolById(id)?.location).toBe('Ambiguous desk B');
+			expect(inventory.isSpoolUncertain(id)).toBe(false);
+		} finally {
+			log.mockRestore();
+		}
+	});
+
+	it('does not trust an old value while an ambiguous rename could still commit', async () => {
+		const { fetch, requests } = controlledFetch();
+		const id = 88009;
+		const lateId = 88010;
+		inventory.upsertSpool(mapSpool({ id, location: 'Unconfirmed A' }));
+		const rename = spoolSource.renameFieldValue('location', 'Unconfirmed A', 'Unconfirmed B');
+		const failure = expect(rename).rejects.toBeInstanceOf(SpoolRenameUncertainError);
+		requests[0].respond(new Response('{}', { status: 503 }));
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+		requests[1].respond(Response.json({ id, location: 'Unconfirmed A' }));
+		await failure;
+		expect(inventory.isSpoolUncertain(id)).toBe(true);
+
+		// A later list can discover a spool that the still-running PATCH may affect.
+		const list = spoolSource.listSpools({ filters: {}, sort: [], limit: 30, offset: 0, lowThreshold: 0 });
+		requests[2].respond(Response.json([{ id: lateId, location: 'Unconfirmed A' }]));
+		await list;
+		expect(inventory.isSpoolUncertain(lateId)).toBe(true);
+
+		const retry = spoolSource.refreshUncertainSpools([id, lateId]);
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(5));
+		requests[3].respond(Response.json({ id, location: 'Unconfirmed B' }));
+		requests[4].respond(Response.json({ id: lateId, location: 'Unconfirmed B' }));
+		expect(await retry).toBe(true);
+		expect(inventory.isSpoolUncertain(id)).toBe(false);
+		expect(inventory.isSpoolUncertain(lateId)).toBe(false);
+	});
+
+	it.each([400, 422])('releases candidates after a definite validation rejection: %s', async (status) => {
+		const { fetch, requests } = controlledFetch();
+		const id = 88011;
+		inventory.upsertSpool(mapSpool({ id, location: 'Invalid rename' }));
+		const rename = spoolSource.renameFieldValue('location', 'Invalid rename', 'Other');
+		const failure = expect(rename).rejects.toMatchObject({ status });
+		expect(inventory.isSpoolUncertain(id)).toBe(true);
+		requests[0].respond(new Response('{}', { status }));
+		await failure;
+		expect(fetch).toHaveBeenCalledOnce();
+		expect(inventory.isSpoolUncertain(id)).toBe(false);
+	});
+
+	it('rejects a staged page that became stale before commit', async () => {
+		const { fetch, requests } = controlledFetch();
+		inventory.upsertSpool(mapSpool({ id: 88003, location: 'Shelf' }));
+		const staging = spoolSource.stageSpools({ filters: {}, sort: [], limit: 30, offset: 0, lowThreshold: 0 });
+		requests[0].respond(Response.json([{ id: 88003, location: 'Shelf' }]));
+		const page = await staging;
+		const rename = spoolSource.renameFieldValue('location', 'Shelf', 'Desk');
+		requests[1].respond(Response.json({ spools_updated: 1 }));
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(3));
+		requests[2].respond(Response.json({ id: 88003, location: 'Desk' }));
+		await rename;
+		expect(page.isCurrent()).toBe(false);
+		expect(page.commit()).toBe(false);
+		expect(inventory.spoolById(88003)?.location).toBe('Desk');
+	});
+
+	it.each(['fetch', 'search', 'tag'] as const)(
+		're-reads a stale %s response instead of overwriting reconciled cache',
+		async (kind) => {
+			const { fetch, requests } = controlledFetch();
+			const id = 88004;
+			inventory.upsertSpool(mapSpool({ id, location: 'Shelf' }));
+			const read =
+				kind === 'fetch'
+					? spoolSource.fetchSpool(id)
+					: kind === 'search'
+						? searchAll('test', 20)
+						: findTagHolder('aabb');
+			const readCount = kind === 'tag' ? 2 : 1;
+			const rename = spoolSource.renameFieldValue('location', 'Shelf', 'Desk');
+			requests[readCount].respond(Response.json({ spools_updated: 1 }));
+			await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(readCount + 2));
+			requests[readCount + 1].respond(Response.json({ id, location: 'Desk' }));
+			await rename;
+			const response = (location: string) =>
+				kind === 'search'
+					? Response.json({ spools: [{ spool: { id, location }, match_field: 'location' }] })
+					: kind === 'tag'
+						? Response.json([{ id, location }])
+						: Response.json({ id, location });
+			requests[0].respond(response('Shelf'));
+			if (kind === 'tag') requests[1].respond(Response.json([]));
+			await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(readCount * 2 + 2));
+			expect(inventory.spoolById(id)?.location).toBe('Desk');
+			requests[readCount + 2].respond(response('Desk'));
+			if (kind === 'tag') requests[readCount + 3].respond(Response.json([]));
+			await read;
+			expect(inventory.spoolById(id)?.location).toBe('Desk');
+		}
+	);
+
+	it.each(['live', 'scan'] as const)(
+		'quarantines and verifies a potentially stale %s event after a rename',
+		async (kind) => {
+			const { fetch, requests } = controlledFetch();
+			const id = 88005;
+			inventory.upsertSpool(mapSpool({ id, location: 'Shelf' }));
+			const rename = spoolSource.renameFieldValue('location', 'Shelf', 'Desk');
+			requests[0].respond(Response.json({ spools_updated: 1 }));
+			await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+			requests[1].respond(Response.json({ id, location: 'Desk' }));
+			await rename;
+			if (kind === 'live')
+				spoolSource.ingestLiveEvent({
+					resource: 'spool',
+					type: 'updated',
+					id,
+					payload: { id, location: 'Earlier location' }
+				});
+			else spoolSource.ingestScannedSpool(mapSpool({ id, location: 'Earlier location' }));
+			expect(inventory.isSpoolUncertain(id)).toBe(true);
+			await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(3));
+			requests[2].respond(Response.json({ id, location: 'Desk' }));
+			await vi.waitFor(() => expect(inventory.isSpoolUncertain(id)).toBe(false));
+			expect(inventory.spoolById(id)?.location).toBe('Desk');
+		}
+	);
+
+	it('bounds authoritative event refreshes during a burst', async () => {
+		const requests: { id: number; respond: () => void }[] = [];
+		let inFlight = 0;
+		let maximum = 0;
+		const fetch = vi.fn((url: string, init?: RequestInit) => {
+			if (init?.method === 'PATCH') return Promise.resolve(Response.json({ spools_updated: 0 }));
+			const id = Number(url.split('/').at(-1));
+			inFlight++;
+			maximum = Math.max(maximum, inFlight);
+			return new Promise<Response>((resolve) =>
+				requests.push({
+					id,
+					respond: () => {
+						inFlight--;
+						resolve(Response.json({ id, location: 'Current burst location' }));
+					}
+				})
+			);
+		});
+		vi.stubGlobal('fetch', fetch);
+		await spoolSource.renameFieldValue('location', 'Burst old', 'Burst new');
+		const ids = Array.from({ length: 10 }, (_, index) => 88100 + index);
+		for (const id of ids)
+			spoolSource.ingestLiveEvent({
+				resource: 'spool',
+				type: 'updated',
+				id,
+				payload: { id, location: 'Earlier burst location' }
+			});
+		await vi.waitFor(() => expect(requests).toHaveLength(4));
+		for (let i = 0; i < ids.length; i++) {
+			await vi.waitFor(() => expect(requests.length).toBeGreaterThan(i));
+			requests[i].respond();
+		}
+		await vi.waitFor(() => expect(ids.every((id) => !inventory.isSpoolUncertain(id))).toBe(true));
+		expect(maximum).toBe(4);
+	});
 
 	it('serializes writes for the same entity while allowing other entities to proceed', async () => {
 		const { fetch, requests } = controlledFetch();
@@ -603,6 +982,32 @@ describe('entity write ordering', () => {
 		expect(inventory.spoolById(9111)?.location).toBe('Race C');
 	});
 
+	it('retains candidates for an overlapping rename when the earlier refresh fails', async () => {
+		const { requests, fetch } = controlledFetch();
+		const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+		try {
+			inventory.upsertSpool(mapSpool({ id: 9112, location: 'Race A' }));
+			const first = spoolSource.renameFieldValue('location', 'Race A', 'Race B');
+			requests[0].respond(Response.json({ spools_updated: 1 }));
+			await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+			const second = spoolSource.renameFieldValue('location', 'Race B', 'Race C');
+			await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(3));
+			requests[1].respond(new Response('{}', { status: 503 }));
+			expect(await first).toEqual({ updated: 1, cacheRefreshed: false });
+			expect(inventory.isSpoolUncertain(9112)).toBe(true);
+
+			requests[2].respond(Response.json({ spools_updated: 1 }));
+			await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(4));
+			expect(requests[3].url).toMatch(/\/spool\/9112$/);
+			requests[3].respond(Response.json({ id: 9112, location: 'Race C' }));
+			expect(await second).toEqual({ updated: 1, cacheRefreshed: true });
+			expect(inventory.spoolById(9112)?.location).toBe('Race C');
+			expect(inventory.isSpoolUncertain(9112)).toBe(false);
+		} finally {
+			log.mockRestore();
+		}
+	});
+
 	it('preserves other cached fields while refreshing a changed extra field', async () => {
 		const { requests, fetch } = controlledFetch();
 		inventory.upsertSpool(mapSpool({ id: 9103, extra: { rack: '"Race X"', note: '"local"' } }));
@@ -627,6 +1032,15 @@ describe('entity write ordering', () => {
 			requests[1].respond(new Response('{}', { status: 503 }));
 			expect(await rename).toEqual({ updated: 1, cacheRefreshed: false });
 			expect(inventory.spoolById(9104)?.location).toBe('Race A');
+			expect(inventory.isSpoolUncertain(9104)).toBe(true);
+			inventory.upsertSpool(mapSpool({ id: 9104, location: 'Race A' }));
+			expect(inventory.isSpoolUncertain(9104)).toBe(true);
+			const retry = spoolSource.refreshUncertainSpools([9104]);
+			await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(3));
+			requests[2].respond(Response.json({ id: 9104, location: 'Race B' }));
+			expect(await retry).toBe(true);
+			expect(inventory.spoolById(9104)?.location).toBe('Race B');
+			expect(inventory.isSpoolUncertain(9104)).toBe(false);
 			expect(log).toHaveBeenCalled();
 		} finally {
 			log.mockRestore();
@@ -667,6 +1081,29 @@ describe('entity write ordering', () => {
 			expect(fetch).toHaveBeenCalledTimes(3);
 		} finally {
 			log.mockRestore();
+			vi.useRealTimers();
+		}
+	});
+
+	it('allows enough time for a large group at ordinary request latency', async () => {
+		vi.useFakeTimers();
+		const fetch = vi.fn((url: string, init?: RequestInit) => {
+			if (init?.method === 'PATCH') return Promise.resolve(Response.json({ spools_updated: 200 }));
+			const id = Number(url.split('/').at(-1));
+			return new Promise<Response>((resolve) =>
+				setTimeout(() => resolve(Response.json({ id, location: 'Race B' })), 250)
+			);
+		});
+		vi.stubGlobal('fetch', fetch);
+		try {
+			for (let id = 10000; id < 10200; id++) inventory.upsertSpool(mapSpool({ id, location: 'Race A' }));
+			const rename = spoolSource.renameFieldValue('location', 'Race A', 'Race B');
+			await vi.advanceTimersByTimeAsync(12_500);
+			expect(await rename).toEqual({ updated: 200, cacheRefreshed: true });
+			expect(fetch).toHaveBeenCalledTimes(201);
+			expect(inventory.uncertainSpoolIds()).toEqual([]);
+			expect(inventory.spoolById(10199)?.location).toBe('Race B');
+		} finally {
 			vi.useRealTimers();
 		}
 	});

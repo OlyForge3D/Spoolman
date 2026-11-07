@@ -22,6 +22,7 @@
 	import { numErr } from '$lib/utils/validate';
 	import { parseDecimal } from '$lib/utils/numeric';
 	import { reportSaveError } from '$lib/utils/autosave';
+	import { setExtraValue, withExtraDefaults } from '$lib/utils/extraDefaults';
 	import {
 		FILAMENT_ADVANCED_KEYS,
 		FILAMENT_FIELD_ORDER,
@@ -220,11 +221,7 @@
 
 	/** `current` with a default filled in for every field it doesn't already carry. */
 	function withDefaults(entity: EntityType, current: Extra): Extra {
-		const out = { ...current };
-		for (const f of fields.get(entity))
-			if (f.default_value != null && !(f.key in out) && !clearedFields[entity].includes(f.key))
-				out[f.key] = f.default_value;
-		return out;
+		return withExtraDefaults(fields.get(entity), current, clearedFields[entity]);
 	}
 	// Definitions are fetched on open, so they can land after the form is already on
 	// screen — opening straight into a preset or a duplicate leaves no time for the
@@ -242,15 +239,7 @@
 	});
 
 	function setExtraOn(entity: EntityType, current: Extra, key: string, json: string | undefined): Extra {
-		const next = { ...current };
-		if (json === undefined) {
-			delete next[key];
-			if (!clearedFields[entity].includes(key)) clearedFields[entity].push(key);
-		} else {
-			next[key] = json;
-			clearedFields[entity] = clearedFields[entity].filter((cleared) => cleared !== key);
-		}
-		return next;
+		return setExtraValue(current, key, json, clearedFields[entity]);
 	}
 	function setExtra(key: string, json: string | undefined) {
 		extraValues = setExtraOn('spool', extraValues, key, json);

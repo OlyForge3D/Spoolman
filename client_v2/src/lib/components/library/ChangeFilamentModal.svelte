@@ -7,7 +7,7 @@
 	// delete and re-add, because that hands them a new id. The v1 client exposed it
 	// as a plain filament dropdown on the spool edit form; here it gets its own
 	// two-step dialog so the weight consequence can be spelled out before applying.
-	import { tick } from 'svelte';
+	import { tick, untrack } from 'svelte';
 	import Swatch from '../Swatch.svelte';
 	import Button from '../Button.svelte';
 	import NewFilamentCards from '../NewFilamentCards.svelte';
@@ -25,6 +25,7 @@
 	import { weightAuto } from '$lib/utils/format';
 	import { parseDecimal } from '$lib/utils/numeric';
 	import { reportSaveError } from '$lib/utils/autosave';
+	import { setExtraValue, withExtraDefaults } from '$lib/utils/extraDefaults';
 	import {
 		FILAMENT_ADVANCED_KEYS,
 		emptyFilamentDraft,
@@ -69,6 +70,7 @@
 	let nfWeights = $state<FilamentWeights>({ weight: '1000', spoolWeight: '', price: '' });
 	let filamentExtra = $state<Extra>({});
 	let vendorExtra = $state<Extra>({});
+	const clearedFields: Record<'filament' | 'vendor', string[]> = { filament: [], vendor: [] };
 	let vendorIsNew = $state(false);
 	let showAdvanced = $state(false);
 	// Same reveal policy as the add-spools flow: a field's error appears once you
@@ -77,22 +79,21 @@
 	let touched = $state<Record<string, boolean>>({});
 	let attempted = $state(false);
 
-	/** `current` with a default filled in for every field it doesn't already carry. */
-	function withDefaults(entity: 'filament' | 'vendor'): Extra {
-		const out: Extra = {};
-		for (const f of fields.get(entity)) if (f.default_value != null) out[f.key] = f.default_value;
-		return out;
+	function withDefaults(entity: 'filament' | 'vendor', current: Extra): Extra {
+		return withExtraDefaults(fields.get(entity), current, clearedFields[entity]);
 	}
 
 	function startCreate() {
+		clearedFields.filament = [];
+		clearedFields.vendor = [];
 		creating = true;
 		chosen = null;
 		clearValidation();
 		showAdvanced = false;
 		nf = emptyFilamentDraft(query.trim());
 		nfWeights = { weight: '1000', spoolWeight: '', price: '' };
-		filamentExtra = withDefaults('filament');
-		vendorExtra = withDefaults('vendor');
+		filamentExtra = withDefaults('filament', {});
+		vendorExtra = withDefaults('vendor', {});
 	}
 	function stopCreate() {
 		creating = false;
@@ -102,18 +103,21 @@
 		touched = {};
 		attempted = false;
 	}
-	function setExtraOn(current: Extra, key: string, json: string | undefined): Extra {
-		const next = { ...current };
-		if (json === undefined) delete next[key];
-		else next[key] = json;
-		return next;
-	}
 	function setFilamentExtra(key: string, json: string | undefined) {
-		filamentExtra = setExtraOn(filamentExtra, key, json);
+		filamentExtra = setExtraValue(filamentExtra, key, json, clearedFields.filament);
 	}
 	function setVendorExtra(key: string, json: string | undefined) {
-		vendorExtra = setExtraOn(vendorExtra, key, json);
+		vendorExtra = setExtraValue(vendorExtra, key, json, clearedFields.vendor);
 	}
+
+	$effect(() => {
+		fields.get('filament');
+		fields.get('vendor');
+		untrack(() => {
+			filamentExtra = withDefaults('filament', filamentExtra);
+			vendorExtra = withDefaults('vendor', vendorExtra);
+		});
+	});
 
 	let errors = $derived(creating ? filamentDraftErrors(nf, nfWeights) : {});
 
@@ -272,6 +276,20 @@
 		busy = true;
 		let createdFilament = false;
 		try {
+			if (creating) {
+				try {
+					const required: ('filament' | 'vendor')[] = ['filament'];
+					if (vendorIsNew) required.push('vendor');
+					await Promise.all(
+						required.filter((entity) => !fields.isLoaded(entity)).map((entity) => fields.loadRequired(entity))
+					);
+					await tick();
+				} catch (error) {
+					reportSaveError(error, 'Failed to load custom fields', m['add.fieldsLoadFailed']());
+					busy = false;
+					return;
+				}
+			}
 			const initial = weightDiffers && adoptWeight ? newWeight : undefined;
 			let filamentId: string;
 			if (creating) {

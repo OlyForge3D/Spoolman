@@ -2,6 +2,7 @@ import { wsUrl } from './config';
 import { getJson } from './http';
 import { mapSpool, mapFilament, mapVendor } from './map';
 import { inventory } from '$lib/stores/inventory.svelte';
+import { spoolSource } from './spoolSource';
 import type { Filament, Spool } from '$lib/types';
 
 // The NFC/RFID scan relay: a reader taps a tag, POSTs it to /api/v1/tag/scan,
@@ -95,7 +96,7 @@ function toScan(payload: Json): TagScan {
 			if (raw.filament.vendor) inventory.upsertVendor(mapVendor(raw.filament.vendor));
 		}
 		spool = mapSpool(raw);
-		inventory.upsertSpool(spool);
+		spoolSource.ingestScannedSpool(spool);
 	}
 	const rawFilament = payload.filament as Json | undefined;
 	let filament: Filament | undefined;

@@ -31,12 +31,22 @@ import {
 	colorFieldsToApi
 } from './map';
 import { inventory } from '$lib/stores/inventory.svelte';
+import { fields } from '$lib/stores/fields.svelte';
 import { isDateFilterProp, parseDateFilter, resolveDateFilter } from '$lib/library/dateFilter';
 import { filamentLabel, type FilterOption } from '$lib/utils/library';
 import type { EntityType } from './fields';
 import { type ExternalFilament } from './external';
 import { searchAll } from './search';
 import { loadLayout } from '$lib/dashboard/layout';
+import { withExtraDefaults } from '$lib/utils/extraDefaults';
+import {
+	isCurrentSpoolRead,
+	noteSpoolRename,
+	possiblyStaleEventFields,
+	readSpoolSnapshot,
+	spoolHasFieldValue
+} from './spoolReadFence';
+import type { LiveEvent } from './live';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 type Json = Record<string, any>;
@@ -82,6 +92,18 @@ export class SpoolBatchError extends Error {
 export interface SpoolRenameResult {
 	updated: number;
 	cacheRefreshed: boolean;
+}
+
+export class SpoolRenameUncertainError extends Error {
+	constructor(cause: unknown) {
+		super('The group rename may have completed; check the dashboard before retrying.', { cause });
+		this.name = 'SpoolRenameUncertainError';
+	}
+}
+
+export interface StagedSpoolPage extends Page<Spool> {
+	isCurrent(): boolean;
+	commit(): boolean;
 }
 
 // Map a filter chip prop → API query param. Values are quoted for exact match.
@@ -179,30 +201,20 @@ function swallow404(e: unknown): null {
 	throw e;
 }
 
-function cacheSpools(raw: unknown[]): Spool[] {
-	const spools = (raw as Json[]).map((s) => {
+function cacheMappedSpools(raw: unknown[], spools: Spool[]): void {
+	for (const s of raw as Json[]) {
 		if (s.filament) {
 			inventory.upsertFilament(mapFilament(s.filament));
 			if (s.filament.vendor) inventory.upsertVendor(mapVendor(s.filament.vendor));
 		}
-		return mapSpool(s);
-	});
+	}
 	inventory.upsertSpools(spools);
-	return spools;
 }
 
-function spoolHasFieldValue(spool: Spool, field: GroupField, value: string): boolean {
-	if (field === 'location') return spool.location === value;
-	if (!field.startsWith('extra.')) return false;
-	const key = field.slice('extra.'.length);
-	const raw = spool.extra[key];
-	if (raw === undefined) return false;
-	try {
-		return JSON.parse(raw) === value;
-	} catch (error) {
-		console.warn(`Invalid cached spool extra field ${key}`, error);
-		return false;
-	}
+function cacheSpools(raw: unknown[]): Spool[] {
+	const spools = (raw as Json[]).map(mapSpool);
+	cacheMappedSpools(raw, spools);
+	return spools;
 }
 
 function withServerSpoolField(spool: Spool, server: Spool, field: GroupField): Spool {
@@ -216,14 +228,101 @@ function withServerSpoolField(spool: Spool, server: Spool, field: GroupField): S
 
 const WRITE_WAIT_TIMEOUT_MS = 30_000;
 const RENAME_REFRESH_TIMEOUT_MS = 10_000;
+const RENAME_REFRESH_MAX_TIMEOUT_MS = 120_000;
+const RENAME_REFRESH_WAVE_BUDGET_MS = 1_000;
 const RENAME_REFRESH_CONCURRENCY = 4;
+
+interface ActiveRename {
+	field: GroupField;
+	value: string;
+	candidates: Map<number, number>;
+	accepting: boolean;
+}
 
 class HttpSpoolSource {
 	private readonly pendingWrites = new Map<string, Promise<unknown>>();
 	private pendingSpoolBulk: Promise<unknown> | undefined;
 	private spoolBulkRevision = 0;
-	private readonly reconcilingSpools = new Map<number, number>();
+	private readonly activeRenames = new Set<ActiveRename>();
+	private readonly ambiguousRenames: { field: GroupField; value: string }[] = [];
+	private readonly eventRefreshes = new Set<number>();
+	private readonly eventRefreshQueue: number[] = [];
+	private eventRefreshesInFlight = 0;
 	private nextSpoolCreation = 0;
+
+	constructor() {
+		inventory.observeSpoolUpserts((spool) => {
+			if (
+				[...this.activeRenames].some(
+					(active) => active.accepting && spoolHasFieldValue(spool, active.field, active.value)
+				)
+			)
+				this.addRenameCandidates([spool.id]);
+			for (const { field, value } of this.ambiguousRenames) {
+				if (
+					!spoolHasFieldValue(spool, field, value) ||
+					inventory.hasPendingSpoolRename(spool.id, field, value)
+				)
+					continue;
+				const revision = inventory.markSpoolUncertain(spool.id, field);
+				inventory.holdSpoolUncertainty(spool.id, field, revision, value);
+			}
+		});
+	}
+
+	private quarantineEventSpool(spool: Spool): boolean {
+		const possiblyStale = new Set([
+			...possiblyStaleEventFields(spool, inventory.spoolById(spool.id)),
+			...inventory.uncertainSpoolFields(spool.id)
+		]);
+		for (const field of possiblyStale) {
+			if (inventory.spoolUncertainty(spool.id, field) === undefined)
+				inventory.markSpoolUncertain(spool.id, field);
+		}
+		return possiblyStale.size > 0;
+	}
+
+	private refreshEventSpool(id: number) {
+		if (this.eventRefreshes.has(id)) return;
+		this.eventRefreshes.add(id);
+		this.eventRefreshQueue.push(id);
+		this.drainEventRefreshes();
+	}
+
+	private drainEventRefreshes() {
+		while (this.eventRefreshesInFlight < RENAME_REFRESH_CONCURRENCY && this.eventRefreshQueue.length) {
+			const id = this.eventRefreshQueue.shift()!;
+			this.eventRefreshesInFlight++;
+			void this.refreshUncertainSpools([id])
+				.then((refreshed) => {
+					if (!refreshed) console.error(`Failed to verify spool ${id} after a potentially stale event`);
+				})
+				.catch((error) =>
+					console.error(`Failed to verify spool ${id} after a potentially stale event`, error)
+				)
+				.finally(() => {
+					this.eventRefreshes.delete(id);
+					this.eventRefreshesInFlight--;
+					this.drainEventRefreshes();
+				});
+		}
+	}
+
+	ingestLiveEvent(event: LiveEvent): void {
+		const spool =
+			event.resource === 'spool' && event.type !== 'deleted' && event.payload
+				? mapSpool(event.payload)
+				: undefined;
+		const uncertain = spool ? this.quarantineEventSpool(spool) : false;
+		inventory.ingest(event);
+		if (spool && uncertain) this.refreshEventSpool(spool.id);
+	}
+
+	ingestScannedSpool(spool: Spool): void {
+		const uncertain = this.quarantineEventSpool(spool);
+		inventory.upsertSpool(spool);
+		if (uncertain) this.refreshEventSpool(spool.id);
+	}
 
 	// Full write responses replace the cached entity, so writes to the same
 	// entity must land in order, even when they come from different controls.
@@ -305,18 +404,23 @@ class HttpSpoolSource {
 		};
 		applyFilters(params, query.filters);
 
-		const { items, total, totalSpools, totalRemaining } = await getList('/spool/group', params, query.signal);
-		for (const g of items as Json[]) {
-			if (g.filament) {
-				inventory.upsertFilament(mapFilament(g.filament));
-				if (g.filament.vendor) inventory.upsertVendor(mapVendor(g.filament.vendor));
-			}
-			if (g.vendor) inventory.upsertVendor(mapVendor(g.vendor));
-		}
-		return { items: (items as Json[]).map(mapGroup), total, totalSpools, totalRemaining };
+		return readSpoolSnapshot(
+			() => getList('/spool/group', params, query.signal),
+			({ items, total, totalSpools, totalRemaining }) => {
+				for (const g of items as Json[]) {
+					if (g.filament) {
+						inventory.upsertFilament(mapFilament(g.filament));
+						if (g.filament.vendor) inventory.upsertVendor(mapVendor(g.filament.vendor));
+					}
+					if (g.vendor) inventory.upsertVendor(mapVendor(g.vendor));
+				}
+				return { items: (items as Json[]).map(mapGroup), total, totalSpools, totalRemaining };
+			},
+			query.signal
+		);
 	}
 
-	async listSpools(query: SpoolQuery): Promise<Page<Spool>> {
+	async stageSpools(query: SpoolQuery): Promise<StagedSpoolPage> {
 		const params: QueryParams = {
 			sort: sortParam(query.sort),
 			limit: query.limit,
@@ -326,8 +430,32 @@ class HttpSpoolSource {
 		applyFilters(params, query.filters);
 		scopeParams(params, query.groupScope);
 
-		const { items, total } = await getList('/spool', params, query.signal);
-		return { items: cacheSpools(items), total };
+		return readSpoolSnapshot(
+			() => getList('/spool', params, query.signal),
+			({ items, total }, revision) => {
+				const spools = (items as Json[]).map(mapSpool);
+				const isCurrent = () => isCurrentSpoolRead(revision);
+				return {
+					items: spools,
+					total,
+					isCurrent,
+					commit: () => {
+						if (!isCurrent()) return false;
+						cacheMappedSpools(items, spools);
+						return true;
+					}
+				};
+			},
+			query.signal
+		);
+	}
+
+	async listSpools(query: SpoolQuery): Promise<Page<Spool>> {
+		for (let attempt = 0; attempt < 4; attempt++) {
+			const page = await this.stageSpools(query);
+			if (page.commit()) return { items: page.items, total: page.total };
+		}
+		throw new Error('Spool data kept changing while it was being loaded');
 	}
 
 	/** Load and cache one page of filaments, including the catalog total. */
@@ -408,6 +536,12 @@ class HttpSpoolSource {
 			return f;
 		}
 
+		const defaults = async (entity: 'filament' | 'vendor'): Promise<Extra> => {
+			if (!fields.isLoaded(entity)) await fields.loadRequired(entity);
+			return withExtraDefaults(fields.get(entity), {});
+		};
+		const filamentExtra = await defaults('filament');
+
 		// Match the vendor by external_id first, then by name.
 		let vendorId: number | undefined;
 		const vendors = await getJson<Json[]>('/vendor', { external_id: quote(ext.manufacturer) });
@@ -415,7 +549,7 @@ class HttpSpoolSource {
 			inventory.upsertVendor(mapVendor(vendors[0]));
 			vendorId = vendors[0].id;
 		} else {
-			vendorId = await this.getOrCreateVendor(ext.manufacturer, undefined, ext.manufacturer);
+			vendorId = await this.getOrCreateVendor(ext.manufacturer, () => defaults('vendor'), ext.manufacturer);
 		}
 
 		const body: Json = {
@@ -428,7 +562,8 @@ class HttpSpoolSource {
 			spool_weight: ext.spool_weight ?? undefined,
 			settings_extruder_temp: ext.extruder_temp ?? undefined,
 			settings_bed_temp: ext.bed_temp ?? undefined,
-			external_id: ext.id
+			external_id: ext.id,
+			extra: Object.keys(filamentExtra).length ? filamentExtra : undefined
 		};
 		if (ext.color_hexes && ext.color_hexes.length) {
 			body.multi_color_hexes = ext.color_hexes.map((h) => h.replace(/^#/, '')).join(',');
@@ -449,7 +584,11 @@ class HttpSpoolSource {
 	 * `extra` and `externalId` only apply to a vendor this call creates — matching an existing
 	 * name links that record, it never edits it.
 	 */
-	async getOrCreateVendor(name: string, extra?: Extra, externalId?: string): Promise<number | undefined> {
+	async getOrCreateVendor(
+		name: string,
+		extra?: Extra | (() => Promise<Extra>),
+		externalId?: string
+	): Promise<number | undefined> {
 		const trimmed = name.trim();
 		if (!trimmed) return undefined;
 		const all = await getJson<Json[]>('/vendor');
@@ -458,10 +597,11 @@ class HttpSpoolSource {
 			inventory.upsertVendor(mapVendor(match));
 			return match.id;
 		}
+		const newExtra = typeof extra === 'function' ? await extra() : extra;
 		const created = await postJson<Json>('/vendor', {
 			name: trimmed,
 			external_id: externalId,
-			extra: extra && Object.keys(extra).length ? extra : undefined
+			extra: newExtra && Object.keys(newExtra).length ? newExtra : undefined
 		});
 		inventory.upsertVendor(mapVendor(created));
 		return created.id;
@@ -526,8 +666,11 @@ class HttpSpoolSource {
 	// entity) resolves to undefined rather than throwing.
 
 	async fetchSpool(id: number, signal?: AbortSignal): Promise<Spool | undefined> {
-		const s = await getJson<Json | null>(`/spool/${id}`, {}, signal).catch(swallow404);
-		return s ? cacheSpools([s])[0] : undefined;
+		return readSpoolSnapshot(
+			() => getJson<Json | null>(`/spool/${id}`, {}, signal).catch(swallow404),
+			(s) => (s ? cacheSpools([s])[0] : undefined),
+			signal
+		);
 	}
 	async fetchFilament(id: string, signal?: AbortSignal): Promise<Filament | undefined> {
 		const f = await getJson<Json | null>(`/filament/${id}`, {}, signal).catch(swallow404);
@@ -720,9 +863,11 @@ class HttpSpoolSource {
 	}
 
 	private async refreshRenamedSpool(id: number, field: GroupField, signal: AbortSignal): Promise<boolean> {
-		for (let attempt = 0; attempt < 3; attempt++) {
-			const pending = this.pendingWrites.get(`spool:${id}`);
-			if (pending) {
+		for (let attempt = 0; attempt < 3;) {
+			const pending = [this.pendingWrites.get(`spool:${id}`), this.pendingSpoolBulk].filter(
+				(promise): promise is Promise<unknown> => promise !== undefined
+			);
+			if (pending.length) {
 				const settled = await new Promise<boolean>((resolve) => {
 					if (signal.aborted) {
 						resolve(false);
@@ -734,24 +879,38 @@ class HttpSpoolSource {
 						signal.removeEventListener('abort', abort);
 						resolve(true);
 					};
-					void pending.then(finish, finish);
+					void Promise.allSettled(pending).then(finish);
 				});
 				if (!settled) return false;
 				continue;
 			}
 			const current = inventory.spoolById(id);
-			if (!current) return true;
+			const uncertainty = inventory.spoolUncertainty(id, field);
+			if (!current) {
+				if (uncertainty !== undefined) inventory.resolveSpoolUncertainty(id, field, uncertainty);
+				if (inventory.spoolUncertainty(id, field) === undefined) return true;
+				continue;
+			}
 			const revision = this.spoolBulkRevision;
+			attempt++;
 			const raw = await getJson<Json | null>(`/spool/${id}`, {}, signal).catch(swallow404);
 			if (
 				this.spoolBulkRevision !== revision ||
 				this.pendingWrites.has(`spool:${id}`) ||
+				this.pendingSpoolBulk !== undefined ||
 				inventory.spoolById(id) !== current
 			)
 				continue;
-			if (raw) inventory.upsertSpool(withServerSpoolField(current, mapSpool(raw), field));
-			else inventory.removeSpool(id);
-			return true;
+			if (raw) {
+				const server = mapSpool(raw);
+				inventory.upsertSpool(withServerSpoolField(current, server, field));
+				if (uncertainty !== undefined) {
+					const pendingValues = inventory.pendingSpoolRenameValues(id, field, uncertainty);
+					if (pendingValues.some((value) => spoolHasFieldValue(server, field, value))) return false;
+					inventory.resolveSpoolUncertainty(id, field, uncertainty);
+				}
+			} else inventory.removeSpool(id);
+			if (inventory.spoolUncertainty(id, field) === undefined) return true;
 		}
 		console.warn(`Spool ${id} kept changing during rename reconciliation`);
 		return false;
@@ -760,7 +919,14 @@ class HttpSpoolSource {
 	private async refreshRenamedSpools(ids: number[], field: GroupField): Promise<boolean> {
 		if (!ids.length) return true;
 		const controller = new AbortController();
-		const timer = setTimeout(() => controller.abort(), RENAME_REFRESH_TIMEOUT_MS);
+		const timeout = Math.min(
+			RENAME_REFRESH_MAX_TIMEOUT_MS,
+			Math.max(
+				RENAME_REFRESH_TIMEOUT_MS,
+				Math.ceil(ids.length / RENAME_REFRESH_CONCURRENCY) * RENAME_REFRESH_WAVE_BUDGET_MS
+			)
+		);
+		const timer = setTimeout(() => controller.abort(), timeout);
 		let next = 0;
 		let refreshed = true;
 		try {
@@ -788,43 +954,100 @@ class HttpSpoolSource {
 		return refreshed;
 	}
 
+	async refreshUncertainSpools(ids: number[]): Promise<boolean> {
+		const fields = new Set(ids.flatMap((id) => inventory.uncertainSpoolFields(id)));
+		let refreshed = true;
+		for (const field of fields) {
+			const affected = ids.filter((id) => inventory.uncertainSpoolFields(id).includes(field));
+			if (!(await this.refreshRenamedSpools(affected, field))) refreshed = false;
+		}
+		return refreshed;
+	}
+
+	private addRenameCandidates(ids: Iterable<number>) {
+		for (const id of ids) {
+			for (const active of this.activeRenames) {
+				if (active.accepting && !active.candidates.has(id))
+					active.candidates.set(id, inventory.markSpoolUncertain(id, active.field));
+			}
+		}
+	}
+
 	/**
 	 * Replace one value of one spool field wherever it occurs, in a single request. Works for
 	 * any field the spool owns, so the dashboard can rename a whole group without paging in its
 	 * members — and without leaving out the ones it never loaded.
 	 */
 	async renameFieldValue(field: GroupField, value: string, newValue: string): Promise<SpoolRenameResult> {
-		// Release the write barrier after the PATCH, so later writes can settle
-		// before reconciliation without waiting on the reconciliation itself.
-		const { updated, uncertain } = await this.writeSpools(async () => {
-			const uncertain = new Set(
-				inventory.spools.filter((spool) => spoolHasFieldValue(spool, field, value)).map((spool) => spool.id)
-			);
-			const result = await patchJson<{ spools_updated: number }>(
-				`/spool/field/${encodeURIComponent(field)}`,
-				{
-					value,
-					new_value: newValue
-				}
-			);
-			this.spoolBulkRevision++;
-			// A cached old value may have arrived before or after the bulk statement,
-			// or may already have been stale. Only the server can distinguish those.
-			for (const spool of inventory.spools)
-				if (spoolHasFieldValue(spool, field, value)) uncertain.add(spool.id);
-			// Earlier renames may still be reconciling a value that this rename
-			// just changed again, even if the cache has not caught up yet.
-			for (const id of this.reconcilingSpools.keys()) uncertain.add(id);
-			for (const id of uncertain) this.reconcilingSpools.set(id, (this.reconcilingSpools.get(id) ?? 0) + 1);
-			return { updated: result.spools_updated, uncertain: [...uncertain] };
-		});
+		const inherited = new Set(inventory.uncertainSpoolIds());
+		for (const active of this.activeRenames) for (const id of active.candidates.keys()) inherited.add(id);
+		const active: ActiveRename = { field, value, candidates: new Map(), accepting: true };
+		this.activeRenames.add(active);
+		this.addRenameCandidates(inherited);
+		const matching = () =>
+			inventory.spools.filter((spool) => spoolHasFieldValue(spool, field, value)).map((spool) => spool.id);
+		this.addRenameCandidates(matching());
+		let sent = false;
+		let rejected = false;
 		try {
-			return { updated, cacheRefreshed: await this.refreshRenamedSpools(uncertain, field) };
+			// Release the write barrier after the PATCH, so later writes can settle
+			// before reconciliation without waiting on the reconciliation itself.
+			let updated: number;
+			try {
+				updated = await this.writeSpools(async () => {
+					this.addRenameCandidates(matching());
+					sent = true;
+					this.spoolBulkRevision++;
+					noteSpoolRename(field);
+					inventory.spoolRenameRevision++;
+					inventory.spoolRenamesInFlight++;
+					let succeeded = false;
+					try {
+						const result = await patchJson<{ spools_updated: number }>(
+							`/spool/field/${encodeURIComponent(field)}`,
+							{
+								value,
+								new_value: newValue
+							}
+						);
+						succeeded = true;
+						return result.spools_updated;
+					} catch (error) {
+						// This endpoint validates these responses before executing the update.
+						rejected = error instanceof HttpError && (error.status === 400 || error.status === 422);
+						throw error;
+					} finally {
+						// Even a lost response may follow a committed PATCH. Fence every read
+						// that overlapped the request and verify its candidates in either case.
+						this.spoolBulkRevision++;
+						noteSpoolRename(field);
+						inventory.spoolRenameRevision++;
+						inventory.spoolRenamesInFlight--;
+						this.addRenameCandidates(matching());
+						if (!succeeded && !rejected) {
+							if (!this.ambiguousRenames.some((entry) => entry.field === field && entry.value === value))
+								this.ambiguousRenames.push({ field, value });
+							for (const [id, revision] of active.candidates)
+								inventory.holdSpoolUncertainty(id, field, revision, value);
+						}
+						active.accepting = false;
+					}
+				});
+			} catch (error) {
+				if (sent && !rejected) {
+					await this.refreshRenamedSpools([...active.candidates.keys()], field);
+					throw new SpoolRenameUncertainError(error);
+				}
+				throw error;
+			}
+			return {
+				updated,
+				cacheRefreshed: await this.refreshRenamedSpools([...active.candidates.keys()], field)
+			};
 		} finally {
-			for (const id of uncertain) {
-				const remaining = (this.reconcilingSpools.get(id) ?? 1) - 1;
-				if (remaining) this.reconcilingSpools.set(id, remaining);
-				else this.reconcilingSpools.delete(id);
+			this.activeRenames.delete(active);
+			if (!sent || rejected) {
+				for (const [id, revision] of active.candidates) inventory.cancelSpoolUncertainty(id, field, revision);
 			}
 		}
 	}

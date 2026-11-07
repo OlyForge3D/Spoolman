@@ -2,6 +2,7 @@
 	import { untrack } from 'svelte';
 	import { asset } from '$app/paths';
 	import SpoolInspector from './SpoolInspector.svelte';
+	import UncertainSpools from '../UncertainSpools.svelte';
 	import FilamentInspector from './FilamentInspector.svelte';
 	import VendorInspector from './VendorInspector.svelte';
 	import type { Selection } from '$lib/types';
@@ -70,7 +71,14 @@
 
 <!-- Keyed by entity so a new selection never inherits an unsaved field draft. -->
 {#if spool}
-	{#key spool.id}<SpoolInspector {spool} />{/key}
+	{#key spool.id}
+		<div class="inspector-content" class:unavailable={inventory.isSpoolUncertain(spool.id)}>
+			<SpoolInspector {spool} />
+		</div>
+		{#if inventory.isSpoolUncertain(spool.id)}
+			<div class="empty"><UncertainSpools ids={[spool.id]} /></div>
+		{/if}
+	{/key}
 {:else if filament}
 	{#key filament.id}<FilamentInspector {filament} />{/key}
 {:else if vendor}
@@ -92,6 +100,12 @@
 {/if}
 
 <style>
+	.inspector-content {
+		display: contents;
+	}
+	.inspector-content.unavailable {
+		display: none;
+	}
 	.empty {
 		display: flex;
 		flex-direction: column;

@@ -8,6 +8,7 @@
 	import * as params from '$lib/library/params';
 	import { truncTitle } from '$lib/actions/truncated';
 	import { page } from '$app/state';
+	import { inventory } from '$lib/stores/inventory.svelte';
 	import * as m from '$lib/paraglide/messages';
 
 	interface Props {
@@ -48,7 +49,11 @@
 	{/if}
 	<ProgressBar value={vm.pctValue} danger={vm.low} width="56px" />
 	<span class="rem mono" class:low={vm.low}>{vm.remLabel}</span>
-	<span class="right" use:truncTitle>{vm.location}</span>
+	<span class="right" use:truncTitle>
+		{inventory.isSpoolUncertain(vm.spool.id)
+			? ''
+			: (inventory.spoolById(vm.spool.id)?.location ?? vm.location)}
+	</span>
 </a>
 
 <style>

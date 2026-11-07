@@ -34,8 +34,8 @@ export interface FieldDef extends FieldParams {
 	entity_type: EntityType;
 }
 
-export function getFields(entity: EntityType): Promise<FieldDef[]> {
-	return getJson<FieldDef[]>(`/field/${entity}`);
+export function getFields(entity: EntityType, signal?: AbortSignal): Promise<FieldDef[]> {
+	return getJson<FieldDef[]>(`/field/${entity}`, {}, signal);
 }
 
 /** Create or update a field; returns the full updated list. */

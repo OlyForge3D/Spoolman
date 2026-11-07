@@ -1,5 +1,6 @@
 import type { Filament, Spool, Vendor } from '$lib/types';
 import type { LiveEvent } from '$lib/api/live';
+import type { GroupField } from '$lib/api/types';
 import { mapFilament, mapSpool, mapVendor } from '$lib/api/map';
 
 // Reactive, normalized client cache. Populated by HTTP responses (the data
@@ -12,6 +13,13 @@ class Inventory {
 	vendors = $state<Vendor[]>([]);
 	filaments = $state<Filament[]>([]);
 	spools = $state<Spool[]>([]);
+	spoolRenameRevision = $state(0);
+	spoolRenamesInFlight = $state(0);
+	private uncertainSpools = $state<
+		Record<number, { field: GroupField; revision: number; pendingValue?: string }[]>
+	>({});
+	private nextUncertainty = 0;
+	private readonly spoolUpsertObservers = new Set<(spool: Spool) => void>();
 
 	filamentById(id: string): Filament | undefined {
 		return this.filaments.find((f) => f.id === id);
@@ -21,6 +29,64 @@ class Inventory {
 	}
 	spoolById(id: number): Spool | undefined {
 		return this.spools.find((s) => s.id === id);
+	}
+	isSpoolUncertain(id: number): boolean {
+		return (this.uncertainSpools[id]?.length ?? 0) > 0;
+	}
+	uncertainSpoolIds(): number[] {
+		return Object.keys(this.uncertainSpools).map(Number);
+	}
+	uncertainSpoolFields(id: number): GroupField[] {
+		return [...new Set((this.uncertainSpools[id] ?? []).map(({ field }) => field))];
+	}
+	spoolUncertainty(id: number, field: GroupField): number | undefined {
+		return this.uncertainSpools[id]?.filter((entry) => entry.field === field).at(-1)?.revision;
+	}
+	markSpoolUncertain(id: number, field: GroupField): number {
+		const revision = ++this.nextUncertainty;
+		const entries = this.uncertainSpools[id] ?? [];
+		this.uncertainSpools = {
+			...this.uncertainSpools,
+			[id]: [...entries, { field, revision }]
+		};
+		return revision;
+	}
+	holdSpoolUncertainty(id: number, field: GroupField, revision: number, pendingValue: string) {
+		const entries = this.uncertainSpools[id];
+		if (!entries?.some((entry) => entry.field === field && entry.revision === revision)) return;
+		this.uncertainSpools = {
+			...this.uncertainSpools,
+			[id]: entries.map((entry) =>
+				entry.field === field && entry.revision === revision ? { ...entry, pendingValue } : entry
+			)
+		};
+	}
+	hasPendingSpoolRename(id: number, field: GroupField, value: string): boolean {
+		return (this.uncertainSpools[id] ?? []).some(
+			(entry) => entry.field === field && entry.pendingValue === value
+		);
+	}
+	pendingSpoolRenameValues(id: number, field: GroupField, revision: number): string[] {
+		return (this.uncertainSpools[id] ?? [])
+			.filter((entry) => entry.field === field && entry.revision <= revision)
+			.flatMap((entry) => (entry.pendingValue === undefined ? [] : [entry.pendingValue]));
+	}
+	resolveSpoolUncertainty(id: number, field: GroupField, revision: number) {
+		if (this.spoolUncertainty(id, field) !== revision) return;
+		this.removeSpoolUncertainties(id, (entry) => entry.field === field && entry.revision <= revision);
+	}
+	cancelSpoolUncertainty(id: number, field: GroupField, revision: number) {
+		this.removeSpoolUncertainties(id, (entry) => entry.field === field && entry.revision === revision);
+	}
+	private removeSpoolUncertainties(
+		id: number,
+		remove: (entry: { field: GroupField; revision: number; pendingValue?: string }) => boolean
+	) {
+		const entries = (this.uncertainSpools[id] ?? []).filter((entry) => !remove(entry));
+		const next = { ...this.uncertainSpools };
+		if (entries.length) next[id] = entries;
+		else delete next[id];
+		this.uncertainSpools = next;
 	}
 	vendorOf(f: Filament): Vendor {
 		return (
@@ -43,7 +109,13 @@ class Inventory {
 
 	// --- upserts (new array refs so $state/$derived recompute) --------------
 
+	observeSpoolUpserts(observer: (spool: Spool) => void): () => void {
+		this.spoolUpsertObservers.add(observer);
+		return () => this.spoolUpsertObservers.delete(observer);
+	}
+
 	upsertSpool(s: Spool) {
+		for (const observer of this.spoolUpsertObservers) observer(s);
 		this.spools = this.spools.some((x) => x.id === s.id)
 			? this.spools.map((x) => (x.id === s.id ? s : x))
 			: [...this.spools, s];
@@ -76,6 +148,11 @@ class Inventory {
 
 	removeSpool(id: number) {
 		this.spools = this.spools.filter((s) => s.id !== id);
+		if (this.uncertainSpools[id]) {
+			const next = { ...this.uncertainSpools };
+			delete next[id];
+			this.uncertainSpools = next;
+		}
 	}
 	removeFilament(id: string) {
 		this.filaments = this.filaments.filter((f) => f.id !== id);

@@ -8,7 +8,8 @@
 	import { settings } from '$lib/stores/settings.svelte';
 	import { fields } from '$lib/stores/fields.svelte';
 	import { toasts } from '$lib/stores/toasts.svelte';
-	import { spoolSource } from '$lib/api/spoolSource';
+	import { SpoolRenameUncertainError, spoolSource } from '$lib/api/spoolSource';
+	import { isCurrentSpoolRead, readSpoolSnapshot } from '$lib/api/spoolReadFence';
 	import { allPages } from '$lib/api/query';
 	import { live, type LiveEvent } from '$lib/api/live';
 	import { isAbortError } from '$lib/api/http';
@@ -20,7 +21,15 @@
 	import { reportSaveError } from '$lib/utils/autosave';
 	import * as m from '$lib/paraglide/messages';
 	import { dashboardFields, DEFAULT_FIELD_KEY, type DashboardField } from '$lib/dashboard/fields';
-	import { loadLayout, saveGroups, saveSpoolOrders, type DashboardLayout } from '$lib/dashboard/layout';
+	import {
+		loadCurrentLayout,
+		observeLayoutRenames,
+		renameLayoutGroup,
+		renameSavedGroup,
+		saveGroups,
+		saveSpoolOrders,
+		type DashboardLayout
+	} from '$lib/dashboard/layout';
 	import { fieldKeyFromUrl, gotoField, rememberFieldKey, rememberedFieldKey } from '$lib/dashboard/params';
 	import { page } from '$app/state';
 	import { dndzone, type DndEvent } from 'svelte-dnd-action';
@@ -122,7 +131,7 @@
 
 	function saveOrder(order: string[]) {
 		layout.groups = { ...layout.groups, [field.key]: order };
-		saveGroups(layout.groups);
+		saveGroups(field.key, order);
 	}
 
 	// --- loaded data --------------------------------------------------------
@@ -156,7 +165,8 @@
 	let reloadAfterMoveFailure = $state(false);
 	let pendingMoves = $state(0);
 	let recoveryError = $state(false);
-	let recoveryExtraKeys: string[] = [];
+	let recovering = $state(false);
+	let recoveryLoads: Record<string, number> = {};
 	let spoolStateVersion = 0;
 	let displayKeys = $derived(cards.map((c) => c.key));
 	// Nothing at all to show: no saved cards and no spools. Only decided once both loads have
@@ -183,16 +193,21 @@
 		try {
 			// Every group gets a card, so page through all of them rather than stopping at
 			// the first page; a group past it would never show up at all.
-			const groups = await allPages(GROUP_PAGE, (offset) =>
-				spoolSource.listGroups({
-					field: fieldKey,
-					filters: {},
-					sort: [{ field: 'group.title', dir: 'asc' }],
-					limit: GROUP_PAGE,
-					offset,
-					lowThreshold: settings.lowThreshold,
-					signal
-				})
+			const { groups, revision } = await readSpoolSnapshot(
+				() =>
+					allPages(GROUP_PAGE, (offset) =>
+						spoolSource.listGroups({
+							field: fieldKey,
+							filters: {},
+							sort: [{ field: 'group.title', dir: 'asc' }],
+							limit: GROUP_PAGE,
+							offset,
+							lowThreshold: settings.lowThreshold,
+							signal
+						})
+					),
+				(groups, revision) => ({ groups, revision }),
+				signal
 			);
 			if (signal.aborted) return;
 			if (replace && (dragging || pendingMoves || spoolStateVersion !== version)) {
@@ -205,24 +220,14 @@
 			const totals = new Map<string, number>();
 			for (const g of groups) totals.set(g.key, (totals.get(g.key) ?? 0) + g.spoolCount);
 
-			const previouslyLoaded = replace
-				? [
-						...new Set([
-							...Object.entries(buckets)
-								.filter(([, b]) => b.started || b.spools.length > 0)
-								.map(([key]) => key),
-							...recoveryExtraKeys
-						])
-					]
-				: [];
 			const refreshedPages = replace
 				? await Promise.all(
-						previouslyLoaded
-							.filter((key) => totals.has(key))
-							.map(async (key) => {
+						Object.entries(recoveryLoads)
+							.filter(([key]) => totals.has(key))
+							.map(async ([key, limit]) => {
 								if (!(await acquire(signal))) return null;
 								try {
-									return { key, page: await fetchPage(fieldKey, key, 0, signal) };
+									return { key, page: await stagePage(fieldKey, key, limit, signal) };
 								} finally {
 									release();
 								}
@@ -231,6 +236,13 @@
 				: [];
 			if (signal.aborted) return;
 			if (replace && (dragging || pendingMoves || spoolStateVersion !== version)) {
+				reloadAfterMoveFailure = true;
+				return;
+			}
+			if (
+				!isCurrentSpoolRead(revision) ||
+				(replace && refreshedPages.some((result) => result && !result.page.isCurrent()))
+			) {
 				reloadAfterMoveFailure = true;
 				return;
 			}
@@ -252,6 +264,7 @@
 			if (replace) {
 				for (const result of refreshedPages) {
 					if (!result) continue;
+					result.page.commit();
 					const b = bucket(result.key);
 					b.spools = result.page.items;
 					b.total = result.page.total;
@@ -259,7 +272,8 @@
 					b.done = result.page.items.length === 0 || result.page.items.length >= result.page.total;
 				}
 				recoveryError = false;
-				recoveryExtraKeys = [];
+				recovering = false;
+				recoveryLoads = {};
 			}
 		} catch (e) {
 			if (isAbortError(e, signal)) return;
@@ -270,11 +284,15 @@
 		}
 	}
 
-	function refreshBoard(extraKey?: string) {
+	function refreshBoard(extraKey?: string, extraLoaded = 0) {
 		for (const [key, b] of Object.entries(buckets)) {
-			if ((b.started || b.spools.length > 0) && !recoveryExtraKeys.includes(key)) recoveryExtraKeys.push(key);
+			if (b.started || b.spools.length > 0) {
+				const extent = Math.max(PAGE, b.spools.length + (b.loading ? PAGE : 0));
+				recoveryLoads[key] = Math.max(recoveryLoads[key] ?? 0, extent);
+			}
 		}
-		if (extraKey && !recoveryExtraKeys.includes(extraKey)) recoveryExtraKeys.push(extraKey);
+		if (extraKey) recoveryLoads[extraKey] = Math.max(recoveryLoads[extraKey] ?? 0, PAGE, extraLoaded);
+		recovering = true;
 		pageAbort.abort();
 		pageAbort = new AbortController();
 		void loadGroups(field.key, true);
@@ -327,6 +345,18 @@
 		});
 	}
 
+	function stagePage(fieldKey: DashboardField['key'], key: string, limit: number, signal: AbortSignal) {
+		return spoolSource.stageSpools({
+			filters: {},
+			sort: [{ field: 'id', dir: 'asc' }],
+			groupScope: { field: fieldKey, key },
+			limit,
+			offset: 0,
+			lowThreshold: settings.lowThreshold,
+			signal
+		});
+	}
+
 	// Fetch one more page of a group's spools. Ordering is by id so paging is stable; the
 	// card's custom order is applied to what has been loaded (see `orderSpools`). Callers may
 	// fire this freely — it is a no-op while a request is in flight or once everything is
@@ -336,6 +366,7 @@
 		if (b.loading || b.done) return;
 		const signal = pageAbort.signal;
 		const fieldKey = field.key;
+		spoolStateVersion++;
 		b.started = true;
 		b.loading = true;
 		if (!(await acquire(signal))) {
@@ -345,12 +376,14 @@
 		}
 		try {
 			const page = await fetchPage(fieldKey, key, b.spools.length, signal);
+			if (signal.aborted) return;
 			// A spool moved in by a drag or a live event may already be held here.
 			const seen = new Set(page.items.map((s) => s.id));
 			const kept = b.spools.filter((s) => !seen.has(s.id));
 			b.spools = [...kept, ...page.items];
 			b.total = page.total;
 			b.done = page.items.length === 0 || b.spools.length >= page.total;
+			spoolStateVersion++;
 		} catch (e) {
 			// Leave the card unstarted so scrolling it back into view retries, rather than
 			// stranding it empty for the rest of the session. A cancelled request is the same
@@ -396,7 +429,7 @@
 		const abort = new AbortController();
 		(async () => {
 			try {
-				layout = await loadLayout(abort.signal);
+				layout = await loadCurrentLayout(abort.signal);
 			} catch (e) {
 				if (isAbortError(e, abort.signal)) return;
 				console.error('Failed to load dashboard layout', e);
@@ -406,6 +439,16 @@
 		})();
 		return () => abort.abort();
 	});
+
+	$effect(() =>
+		observeLayoutRenames((renamedField, oldKey, newKey) => {
+			const renamed = renameLayoutGroup(layout, renamedField, oldKey, newKey);
+			const changed = renamed.groups !== layout.groups || renamed.spoolOrders !== layout.spoolOrders;
+			layout = renamed;
+			if (changed && field.key === renamedField && !pageAbort.signal.aborted)
+				refreshBoard(newKey, buckets[oldKey]?.spools.length ?? 0);
+		})
+	);
 
 	// A remote spool change is applied to the loaded cards directly — reloading them all would
 	// undo the point of paging. Counts (and any group that just came into or out of existence)
@@ -423,9 +466,13 @@
 	function applySpoolEvent(event: LiveEvent) {
 		spoolStateVersion++;
 		// Keep the shared cache fresh first: the chips read their filament from it.
-		inventory.ingest(event);
+		spoolSource.ingestLiveEvent(event);
 
 		const id = Number(event.id);
+		if (inventory.isSpoolUncertain(id)) {
+			reloadAfterMoveFailure = true;
+			return;
+		}
 		const spool = event.type !== 'deleted' && event.payload ? mapSpool(event.payload) : null;
 		// Archived spools are not shown here, so they leave their card like a deletion.
 		const newKey = spool && !spool.archived ? field.valueOf(spool) : null;
@@ -465,7 +512,8 @@
 		cards = [];
 		editingKey = null;
 		recoveryError = false;
-		recoveryExtraKeys = [];
+		recovering = false;
+		recoveryLoads = {};
 		pageAbort = new AbortController();
 
 		loadGroups(fieldKey);
@@ -535,7 +583,7 @@
 		const desired = buildCards();
 		cards = desired;
 		const keys = desired.map((c) => c.key);
-		if (JSON.stringify(keys) !== JSON.stringify(groupOrder)) saveOrder(keys);
+		if (!recovering && JSON.stringify(keys) !== JSON.stringify(groupOrder)) saveOrder(keys);
 	});
 
 	// Arming the grid's drag zone from the grip has to happen BEFORE the press reaches the
@@ -634,7 +682,7 @@
 		}
 		if (JSON.stringify(next) !== JSON.stringify(spoolOrders)) {
 			layout.spoolOrders = { ...layout.spoolOrders, [field.key]: next };
-			saveSpoolOrders(layout.spoolOrders);
+			saveSpoolOrders(field.key, next);
 		}
 	}
 
@@ -698,26 +746,29 @@
 
 		const old = buckets[oldKey];
 		const renamedField = field;
+		let renamedServer = false;
 		try {
 			if (old && old.total > 0) {
 				// One request moves the whole group, including the pages this card never loaded.
 				const result = await renamedField.rename(oldKey, newKey);
+				renamedServer = true;
 				if (!result.cacheRefreshed) toasts.error(m['dashboard.renameRefreshFailed']());
-				if (field.key !== renamedField.key || pageAbort.signal.aborted) return;
 			}
-			// Carry the card's custom spool order over to the new key.
-			if (spoolOrders[oldKey]) {
-				const { [oldKey]: carried, ...rest } = spoolOrders;
-				layout.spoolOrders = { ...layout.spoolOrders, [field.key]: { ...rest, [newKey]: carried } };
-				saveSpoolOrders(layout.spoolOrders);
-			}
-			// Rename in place in the saved order so the card keeps its position.
-			saveOrder(groupOrder.map((k) => (k === oldKey ? newKey : k)));
+			await renameSavedGroup(renamedField.key, oldKey, newKey);
+			if (pageAbort.signal.aborted || field.key !== renamedField.key) return;
 			editingKey = null;
 			renameError = '';
-			if (old && old.total > 0) refreshBoard(newKey);
 		} catch (e) {
-			renameError = e instanceof Error ? e.message : m['dashboard.errorRename']();
+			if (renamedServer) {
+				reportSaveError(e, 'Failed to save renamed dashboard layout', m['dashboard.renameLayoutFailed']());
+				if (!pageAbort.signal.aborted && field.key === renamedField.key)
+					refreshBoard(newKey, old?.spools.length ?? 0);
+			} else if (e instanceof SpoolRenameUncertainError) {
+				console.error('The dashboard group rename outcome is unknown', e);
+				renameError = m['dashboard.renameOutcomeUnknown']();
+				if (!pageAbort.signal.aborted && field.key === renamedField.key) refreshBoard();
+				else toasts.error(m['dashboard.renameOutcomeUnknown']());
+			} else renameError = e instanceof Error ? e.message : m['dashboard.errorRename']();
 		}
 	}
 </script>

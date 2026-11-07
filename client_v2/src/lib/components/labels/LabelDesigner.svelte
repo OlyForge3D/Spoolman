@@ -7,6 +7,7 @@
 	import { fields } from '$lib/stores/fields.svelte';
 	import { settings } from '$lib/stores/settings.svelte';
 	import { spoolSource } from '$lib/api/spoolSource';
+	import UncertainSpools from '../UncertainSpools.svelte';
 	import { inventory } from '$lib/stores/inventory.svelte';
 	import type { Spool, Filament } from '$lib/types';
 	import * as m from '$lib/paraglide/messages';
@@ -76,6 +77,9 @@
 		const vendor = filament ? inventory.vendorById(filament.vendorId) : undefined;
 		return { spool: s, filament, vendor };
 	});
+	const previewUncertain = $derived(
+		kind === 'spool' && previewId !== '' && inventory.isSpoolUncertain(Number(previewId))
+	);
 
 	// Fit the label into the canvas viewport (with sensible min/max zoom). The viewport is
 	// at most VIEW_W wide, but on a narrow screen it is only as wide as the stage actually
@@ -227,20 +231,26 @@
 		<!-- Full-width measuring box: its width comes from the layout (never from the canvas
 		     inside it), so feeding it back into `pxPerMm` can't loop. -->
 		<div class="stage" bind:clientWidth={stageW}>
-			<LabelCanvas
-				{design}
-				binding={previewBinding}
-				baseUrl={settings.baseUrl}
-				{pxPerMm}
-				interactive
-				bind:selectedId
-				onchange={updateElement}
-			/>
+			{#if previewUncertain}
+				<UncertainSpools ids={[Number(previewId)]} />
+			{:else}
+				<LabelCanvas
+					{design}
+					binding={previewBinding}
+					baseUrl={settings.baseUrl}
+					{pxPerMm}
+					interactive
+					bind:selectedId
+					onchange={updateElement}
+				/>
+			{/if}
 		</div>
-		<div class="hint">
-			{m['labels.canvasHint']()}
-			{previewBinding ? m['labels.showingReal']() : m['labels.showingTags']()}
-		</div>
+		{#if !previewUncertain}
+			<div class="hint">
+				{m['labels.canvasHint']()}
+				{previewBinding ? m['labels.showingReal']() : m['labels.showingTags']()}
+			</div>
+		{/if}
 	</div>
 
 	<div class="inspector-area">

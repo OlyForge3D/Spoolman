@@ -117,6 +117,18 @@ interface PrintJob {
 	bindings: LabelBinding[];
 	layout: PrintLayout;
 	baseUrl: string;
+	isCurrent?: () => boolean;
+}
+
+export class LabelDataChangedError extends Error {
+	constructor() {
+		super('Label data changed while preparing output');
+		this.name = 'LabelDataChangedError';
+	}
+}
+
+function assertCurrent(isCurrent?: () => boolean): void {
+	if (isCurrent && !isCurrent()) throw new LabelDataChangedError();
 }
 
 /**
@@ -124,8 +136,9 @@ interface PrintJob {
  * many labels per page (honoring margins/spacing/skip); label mode emits one
  * exact-size page per label.
  */
-export async function printLabels({ design, bindings, layout, baseUrl }: PrintJob): Promise<void> {
+export async function printLabels({ design, bindings, layout, baseUrl, isCurrent }: PrintJob): Promise<void> {
 	const logoImage = await getLogoImage().catch(() => null);
+	assertCurrent(isCurrent);
 	// One raster per spool, reused across copies.
 	const dpi = resolveDpi(layout);
 	const urls = bindings.map((b) => renderLabelDataUrl(design, b, baseUrl, logoImage, dpi));
@@ -156,6 +169,10 @@ export async function printLabels({ design, bindings, layout, baseUrl }: PrintJo
 		style.remove();
 		window.removeEventListener('afterprint', cleanup);
 	};
+	if (isCurrent && !isCurrent()) {
+		cleanup();
+		throw new LabelDataChangedError();
+	}
 	window.addEventListener('afterprint', cleanup);
 	window.print();
 	// Fallback cleanup for browsers that don't fire afterprint.
@@ -199,9 +216,16 @@ function downloadBytes(bytes: Uint8Array, name: string, mimeType: string) {
  * Small exports download as individual files; anything past `ZIP_THRESHOLD`
  * arrives as one zip.
  */
-export async function exportLabels({ design, bindings, layout, baseUrl }: PrintJob): Promise<void> {
+export async function exportLabels({
+	design,
+	bindings,
+	layout,
+	baseUrl,
+	isCurrent
+}: PrintJob): Promise<void> {
 	if (bindings.length === 0) return;
 	const logoImage = await getLogoImage().catch(() => null);
+	assertCurrent(isCurrent);
 	const dpi = resolveDpi(layout);
 	const kind = labelKind(design);
 	const format = resolveExportFormat(layout.exportFormat);
@@ -228,6 +252,7 @@ export async function exportLabels({ design, bindings, layout, baseUrl }: PrintJ
 
 	if (files.length <= ZIP_THRESHOLD) {
 		for (const f of files) {
+			assertCurrent(isCurrent);
 			downloadBytes(f.bytes, f.name, f.mimeType);
 			// Space the clicks out so the browser actually delivers every file.
 			if (files.length > 1) await new Promise((r) => setTimeout(r, 150));
@@ -241,6 +266,7 @@ export async function exportLabels({ design, bindings, layout, baseUrl }: PrintJ
 	const entries: Record<string, Uint8Array> = {};
 	for (const f of files) entries[f.name] = f.bytes;
 	const zipped = zipSync(entries, { level: format.zipLevel });
+	assertCurrent(isCurrent);
 	downloadBytes(zipped, 'spoolman-labels.zip', 'application/zip');
 }
 

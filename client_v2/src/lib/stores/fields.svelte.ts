@@ -11,6 +11,7 @@ import {
 // (inspectors) and by the settings manager; refetched after mutations.
 
 const ENTITIES: EntityType[] = ['spool', 'filament', 'vendor'];
+const LOAD_TIMEOUT_MS = 10_000;
 
 function byOrder(list: FieldDef[]): FieldDef[] {
 	return [...list].sort((a, b) => a.order - b.order || a.key.localeCompare(b.key));
@@ -41,11 +42,27 @@ class Fields {
 	async loadRequired(entity: EntityType) {
 		let pending = this.loading.get(entity);
 		if (!pending) {
-			const revision = this.revisions[entity];
-			pending = getFields(entity).then((list) => {
-				if (this.revisions[entity] === revision) this.defs = { ...this.defs, [entity]: byOrder(list) };
-				if (!this.loaded.includes(entity)) this.loaded = [...this.loaded, entity];
+			const controller = new AbortController();
+			let timer: ReturnType<typeof setTimeout>;
+			const timeout = new Promise<never>((_, reject) => {
+				timer = setTimeout(() => {
+					reject(new Error(`Loading ${entity} field definitions timed out`));
+					controller.abort();
+				}, LOAD_TIMEOUT_MS);
 			});
+			const load = (async () => {
+				while (!controller.signal.aborted) {
+					const revision = this.revisions[entity];
+					const list = await getFields(entity, controller.signal);
+					// Even a transport that ignores abort must not publish a late response.
+					if (controller.signal.aborted) return;
+					if (this.revisions[entity] !== revision) continue;
+					this.defs = { ...this.defs, [entity]: byOrder(list) };
+					if (!this.loaded.includes(entity)) this.loaded = [...this.loaded, entity];
+					return;
+				}
+			})();
+			pending = Promise.race([load, timeout]).finally(() => clearTimeout(timer));
 			this.loading.set(entity, pending);
 		}
 		try {

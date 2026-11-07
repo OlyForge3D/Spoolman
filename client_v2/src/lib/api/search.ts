@@ -3,6 +3,7 @@ import type { Spool, Vendor } from '$lib/types';
 import { getJson } from './http';
 import { mapFilament, mapSpool, mapVendor } from './map';
 import { inventory } from '$lib/stores/inventory.svelte';
+import { readSpoolSnapshot } from './spoolReadFence';
 
 // Cross-entity search against GET /api/v1/search. Like the spool source, every
 // entity it fetches is upserted into the reactive cache so that clicking a result
@@ -72,20 +73,23 @@ export async function searchAll(
 	const q = query.trim();
 	if (!q) return EMPTY;
 
-	const data = await getJson<Json>(
-		'/search',
-		{
-			q,
-			color_similarity_threshold: threshold,
-			spools_per_filament: SPOOLS_PER_FILAMENT
-		},
+	return readSpoolSnapshot(
+		() =>
+			getJson<Json>(
+				'/search',
+				{
+					q,
+					color_similarity_threshold: threshold,
+					spools_per_filament: SPOOLS_PER_FILAMENT
+				},
+				signal
+			),
+		(data) => ({
+			spools: (data.spools ?? []).map(mapSpoolHit),
+			filaments: (data.filaments ?? []).map(mapFilamentHit),
+			vendors: (data.vendors ?? []).map(mapVendorHit),
+			isColorQuery: !!data.is_color_query
+		}),
 		signal
 	);
-
-	return {
-		spools: (data.spools ?? []).map(mapSpoolHit),
-		filaments: (data.filaments ?? []).map(mapFilamentHit),
-		vendors: (data.vendors ?? []).map(mapVendorHit),
-		isColorQuery: !!data.is_color_query
-	};
 }
