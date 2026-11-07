@@ -23,8 +23,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Install UV from official image (pinned version for reproducibility)
-COPY --from=ghcr.io/astral-sh/uv:0.6 /uv /uvx /bin/
+# Pin uv to the CI version. Its PyPI wheel supports armv7, unlike the uv:0.6 image.
+RUN pip install --no-cache-dir uv==0.9.26
 
 # Install dependencies
 WORKDIR /home/app/spoolman
