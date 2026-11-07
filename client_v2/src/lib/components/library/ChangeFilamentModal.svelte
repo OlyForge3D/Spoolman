@@ -330,10 +330,12 @@
 		>
 			<div class="modal-head">
 				<span class="title" id="change-filament-title">{m['changeFilament.title']()}</span>
-				<button class="x" onclick={close} aria-label={m['buttons.close']()}><X size={16} /></button>
+				<button class="x" onclick={close} disabled={busy} aria-label={m['buttons.close']()}
+					><X size={16} /></button
+				>
 			</div>
 
-			<div class="body">
+			<fieldset class="body" disabled={busy}>
 				<p class="intro">{m['changeFilament.intro']({ id: spool.id })}</p>
 
 				<div class="swap">
@@ -513,7 +515,7 @@
 						<span class="cn-sub">{m['add.createNewSub']({ name: serverInfo.externalDbName })}</span>
 					</button>
 				{/if}
-			</div>
+			</fieldset>
 
 			<div class="foot">
 				<Button variant="outline" disabled={busy} onclick={close}>{m['buttons.cancel']()}</Button>
@@ -587,6 +589,9 @@
 	.body {
 		padding: 12px 20px 16px;
 		overflow-y: auto;
+		min-width: 0;
+		margin: 0;
+		border: 0;
 	}
 	.intro {
 		margin: 0 0 12px;

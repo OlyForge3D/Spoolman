@@ -62,15 +62,6 @@ class Inventory {
 	upsertSpools(list: Spool[]) {
 		for (const s of list) this.upsertSpool(s);
 	}
-	mapSpools(update: (spool: Spool) => Spool) {
-		let changed = false;
-		const next = this.spools.map((spool) => {
-			const updated = update(spool);
-			if (updated !== spool) changed = true;
-			return updated;
-		});
-		if (changed) this.spools = next;
-	}
 	upsertFilaments(list: Filament[]) {
 		for (const f of list) this.upsertFilament(f);
 	}

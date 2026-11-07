@@ -7,6 +7,7 @@
 	import { inventory } from '$lib/stores/inventory.svelte';
 	import { settings } from '$lib/stores/settings.svelte';
 	import { fields } from '$lib/stores/fields.svelte';
+	import { toasts } from '$lib/stores/toasts.svelte';
 	import { spoolSource } from '$lib/api/spoolSource';
 	import { allPages } from '$lib/api/query';
 	import { live, type LiveEvent } from '$lib/api/live';
@@ -153,6 +154,10 @@
 	let dragging = $state(false);
 	let cardsDragDisabled = $state(true);
 	let reloadAfterMoveFailure = $state(false);
+	let pendingMoves = $state(0);
+	let recoveryError = $state(false);
+	let recoveryExtraKeys: string[] = [];
+	let spoolStateVersion = 0;
 	let displayKeys = $derived(cards.map((c) => c.key));
 	// Nothing at all to show: no saved cards and no spools. Only decided once both loads have
 	// settled, so the help text doesn't flash on the way in.
@@ -170,10 +175,11 @@
 	// the page stacks a fresh set on top of each abandoned one.
 	let pageAbort = new AbortController();
 
-	async function loadGroups(fieldKey: DashboardField['key']) {
+	async function loadGroups(fieldKey: DashboardField['key'], replace = false) {
 		// Captured up front: by the time this settles, `pageAbort` may already be a fresh
 		// controller for a later view.
 		const signal = pageAbort.signal;
+		const version = spoolStateVersion;
 		try {
 			// Every group gets a card, so page through all of them rather than stopping at
 			// the first page; a group past it would never show up at all.
@@ -189,12 +195,46 @@
 				})
 			);
 			if (signal.aborted) return;
+			if (replace && (dragging || pendingMoves || spoolStateVersion !== version)) {
+				reloadAfterMoveFailure = true;
+				return;
+			}
 			// A NULL value and an empty-string one are distinct rows to the database but the
 			// same "unassigned" card here, so counts are summed by key.
 			// eslint-disable-next-line svelte/prefer-svelte-reactivity -- transient local, not reactive state
 			const totals = new Map<string, number>();
 			for (const g of groups) totals.set(g.key, (totals.get(g.key) ?? 0) + g.spoolCount);
 
+			const previouslyLoaded = replace
+				? [
+						...new Set([
+							...Object.entries(buckets)
+								.filter(([, b]) => b.started || b.spools.length > 0)
+								.map(([key]) => key),
+							...recoveryExtraKeys
+						])
+					]
+				: [];
+			const refreshedPages = replace
+				? await Promise.all(
+						previouslyLoaded
+							.filter((key) => totals.has(key))
+							.map(async (key) => {
+								if (!(await acquire(signal))) return null;
+								try {
+									return { key, page: await fetchPage(fieldKey, key, 0, signal) };
+								} finally {
+									release();
+								}
+							})
+					)
+				: [];
+			if (signal.aborted) return;
+			if (replace && (dragging || pendingMoves || spoolStateVersion !== version)) {
+				reloadAfterMoveFailure = true;
+				return;
+			}
+			if (replace) buckets = {};
 			for (const [key, total] of totals) {
 				const b = bucket(key);
 				b.total = total;
@@ -209,24 +249,42 @@
 				b.spools = [];
 				b.done = true;
 			}
+			if (replace) {
+				for (const result of refreshedPages) {
+					if (!result) continue;
+					const b = bucket(result.key);
+					b.spools = result.page.items;
+					b.total = result.page.total;
+					b.started = true;
+					b.done = result.page.items.length === 0 || result.page.items.length >= result.page.total;
+				}
+				recoveryError = false;
+				recoveryExtraKeys = [];
+			}
 		} catch (e) {
 			if (isAbortError(e, signal)) return;
 			console.error('Failed to load dashboard groups', e);
+			if (replace) recoveryError = true;
 		} finally {
 			if (!signal.aborted) groupsLoaded = true;
 		}
 	}
 
-	$effect(() => {
-		if (!reloadAfterMoveFailure || dragging) return;
-		reloadAfterMoveFailure = false;
-		if (pageAbort.signal.aborted) return;
+	function refreshBoard(extraKey?: string) {
+		for (const [key, b] of Object.entries(buckets)) {
+			if ((b.started || b.spools.length > 0) && !recoveryExtraKeys.includes(key)) recoveryExtraKeys.push(key);
+		}
+		if (extraKey && !recoveryExtraKeys.includes(extraKey)) recoveryExtraKeys.push(extraKey);
 		pageAbort.abort();
 		pageAbort = new AbortController();
-		buckets = {};
-		cards = [];
-		groupsLoaded = false;
-		void loadGroups(field.key);
+		void loadGroups(field.key, true);
+	}
+
+	$effect(() => {
+		if (!reloadAfterMoveFailure || dragging || pendingMoves) return;
+		reloadAfterMoveFailure = false;
+		if (pageAbort.signal.aborted) return;
+		refreshBoard();
 	});
 
 	// A screenful can be a dozen cards, and firing that many requests at once both queues
@@ -257,6 +315,18 @@
 		waiting.shift()?.();
 	}
 
+	function fetchPage(fieldKey: DashboardField['key'], key: string, offset: number, signal: AbortSignal) {
+		return spoolSource.listSpools({
+			filters: {},
+			sort: [{ field: 'id', dir: 'asc' }],
+			groupScope: { field: fieldKey, key },
+			limit: PAGE,
+			offset,
+			lowThreshold: settings.lowThreshold,
+			signal
+		});
+	}
+
 	// Fetch one more page of a group's spools. Ordering is by id so paging is stable; the
 	// card's custom order is applied to what has been loaded (see `orderSpools`). Callers may
 	// fire this freely — it is a no-op while a request is in flight or once everything is
@@ -265,7 +335,7 @@
 		const b = bucket(key);
 		if (b.loading || b.done) return;
 		const signal = pageAbort.signal;
-		const scope = { field: field.key, key };
+		const fieldKey = field.key;
 		b.started = true;
 		b.loading = true;
 		if (!(await acquire(signal))) {
@@ -274,15 +344,7 @@
 			return;
 		}
 		try {
-			const page = await spoolSource.listSpools({
-				filters: {},
-				sort: [{ field: 'id', dir: 'asc' }],
-				groupScope: scope,
-				limit: PAGE,
-				offset: b.spools.length,
-				lowThreshold: settings.lowThreshold,
-				signal
-			});
+			const page = await fetchPage(fieldKey, key, b.spools.length, signal);
 			// A spool moved in by a drag or a live event may already be held here.
 			const seen = new Set(page.items.map((s) => s.id));
 			const kept = b.spools.filter((s) => !seen.has(s.id));
@@ -359,6 +421,7 @@
 	}
 
 	function applySpoolEvent(event: LiveEvent) {
+		spoolStateVersion++;
 		// Keep the shared cache fresh first: the chips read their filament from it.
 		inventory.ingest(event);
 
@@ -401,6 +464,8 @@
 		groupsLoaded = false;
 		cards = [];
 		editingKey = null;
+		recoveryError = false;
+		recoveryExtraKeys = [];
 		pageAbort = new AbortController();
 
 		loadGroups(fieldKey);
@@ -526,15 +591,33 @@
 			b.total += b.spools.length - before;
 		}
 		const changedField = field;
+		if (changed.length) spoolStateVersion++;
 		for (const { spool, key } of changed) {
-			changedField.assign(spool, key).catch((e) => {
-				const cached = inventory.spoolById(spool.id);
-				if (cached && changedField.valueOf(cached) === key) {
-					inventory.upsertSpool(changedField.withValue(cached, changedField.valueOf(spool)));
-				}
-				reportSaveError(e, 'Move failed', m['dashboard.moveFailed']());
-				if (field.key === changedField.key && !pageAbort.signal.aborted) reloadAfterMoveFailure = true;
-			});
+			pendingMoves++;
+			changedField
+				.assign(spool, key)
+				.catch((e) => {
+					const cached = inventory.spoolById(spool.id);
+					if (cached && changedField.valueOf(cached) === key) {
+						const restored = changedField.withValue(cached, changedField.valueOf(spool));
+						inventory.upsertSpool(restored);
+						if (field.key === changedField.key) {
+							const destination = buckets[key];
+							if (destination?.spools.some((item) => item.id === spool.id)) {
+								destination.spools = destination.spools.filter((item) => item.id !== spool.id);
+								destination.total = Math.max(0, destination.total - 1);
+								const original = bucket(changedField.valueOf(spool));
+								if (!original.spools.some((item) => item.id === spool.id)) {
+									original.spools = [...original.spools, restored];
+									original.total++;
+								}
+							}
+						}
+					}
+					reportSaveError(e, 'Move failed', m['dashboard.moveFailed']());
+					if (field.key === changedField.key && !pageAbort.signal.aborted) reloadAfterMoveFailure = true;
+				})
+				.finally(() => pendingMoves--);
 		}
 
 		// A card's saved order can only speak for the spools it has loaded. Ids from the
@@ -614,14 +697,13 @@
 		}
 
 		const old = buckets[oldKey];
+		const renamedField = field;
 		try {
 			if (old && old.total > 0) {
 				// One request moves the whole group, including the pages this card never loaded.
-				await field.rename(oldKey, newKey);
-				// Carry the loaded page over without overwriting newer cached fields.
-				const moved = old.spools.map((s) => field.withValue(inventory.spoolById(s.id) ?? s, newKey));
-				buckets[newKey] = { ...old, spools: moved };
-				delete buckets[oldKey];
+				const result = await renamedField.rename(oldKey, newKey);
+				if (!result.cacheRefreshed) toasts.error(m['dashboard.renameRefreshFailed']());
+				if (field.key !== renamedField.key || pageAbort.signal.aborted) return;
 			}
 			// Carry the card's custom spool order over to the new key.
 			if (spoolOrders[oldKey]) {
@@ -633,6 +715,7 @@
 			saveOrder(groupOrder.map((k) => (k === oldKey ? newKey : k)));
 			editingKey = null;
 			renameError = '';
+			if (old && old.total > 0) refreshBoard(newKey);
 		} catch (e) {
 			renameError = e instanceof Error ? e.message : m['dashboard.errorRename']();
 		}
@@ -692,6 +775,13 @@
 			<button class="add" onclick={addGroup}><Plus size={14} /> {m['dashboard.newGroup']()}</button>
 		{/if}
 	</div>
+
+	{#if recoveryError}
+		<div class="recovery-error" role="alert">
+			<span>{m['dashboard.refreshFailed']()}</span>
+			<button onclick={() => refreshBoard()}>{m['buttons.retry']()}</button>
+		</div>
+	{/if}
 
 	<div
 		class="grid"
@@ -838,6 +928,22 @@
 		flex-wrap: wrap;
 		gap: 8px 12px;
 		margin-bottom: 16px;
+	}
+	.recovery-error {
+		display: flex;
+		align-items: center;
+		gap: 12px;
+		margin-bottom: 16px;
+		color: var(--danger-soft);
+		font-size: 13px;
+	}
+	.recovery-error button {
+		color: inherit;
+		background: transparent;
+		border: 1px solid currentColor;
+		border-radius: var(--radius);
+		padding: 4px 8px;
+		cursor: pointer;
 	}
 	.title {
 		font-weight: 700;

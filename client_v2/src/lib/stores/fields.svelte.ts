@@ -18,6 +18,8 @@ function byOrder(list: FieldDef[]): FieldDef[] {
 
 class Fields {
 	private defs = $state<Record<EntityType, FieldDef[]>>({ spool: [], filament: [], vendor: [] });
+	private readonly loading = new Map<EntityType, Promise<void>>();
+	private readonly revisions: Record<EntityType, number> = { spool: 0, filament: 0, vendor: 0 };
 	// Reactive so views can wait for the definitions rather than render against an
 	// empty list and then rearrange themselves once they arrive.
 	private loaded = $state<EntityType[]>([]);
@@ -36,11 +38,26 @@ class Fields {
 		if (!this.loaded.includes(entity)) void this.load(entity);
 	}
 
+	async loadRequired(entity: EntityType) {
+		let pending = this.loading.get(entity);
+		if (!pending) {
+			const revision = this.revisions[entity];
+			pending = getFields(entity).then((list) => {
+				if (this.revisions[entity] === revision) this.defs = { ...this.defs, [entity]: byOrder(list) };
+				if (!this.loaded.includes(entity)) this.loaded = [...this.loaded, entity];
+			});
+			this.loading.set(entity, pending);
+		}
+		try {
+			await pending;
+		} finally {
+			if (this.loading.get(entity) === pending) this.loading.delete(entity);
+		}
+	}
+
 	async load(entity: EntityType) {
 		try {
-			const list = await getFields(entity);
-			this.defs = { ...this.defs, [entity]: byOrder(list) };
-			if (!this.loaded.includes(entity)) this.loaded = [...this.loaded, entity];
+			await this.loadRequired(entity);
 		} catch (e) {
 			console.error(`Failed to load ${entity} fields`, e);
 		}
@@ -52,11 +69,13 @@ class Fields {
 
 	async save(entity: EntityType, key: string, params: FieldParams) {
 		const list = await setField(entity, key, params);
+		this.revisions[entity]++;
 		this.defs = { ...this.defs, [entity]: byOrder(list) };
 	}
 
 	async remove(entity: EntityType, key: string) {
 		const list = await deleteField(entity, key);
+		this.revisions[entity]++;
 		this.defs = { ...this.defs, [entity]: byOrder(list) };
 	}
 }

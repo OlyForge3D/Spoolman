@@ -1,10 +1,10 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('./config', () => ({ API_BASE: 'http://spoolman.test/api/v1' }));
 
 import { inventory } from '$lib/stores/inventory.svelte';
 import { mapSpool } from './map';
-import { spoolSource } from './spoolSource';
+import { SpoolBatchError, spoolSource } from './spoolSource';
 
 // GET /location only knows locations that hold a spool, so an idle toolhead set up
 // as a dashboard card could not be picked for a spool (#1261).
@@ -207,6 +207,10 @@ describe('vendorNames', () => {
 });
 
 describe('entity write ordering', () => {
+	beforeEach(() => {
+		inventory.spools = [];
+	});
+
 	function controlledFetch() {
 		const requests: { url: string; init?: RequestInit; respond: (response: Response) => void }[] = [];
 		const fetch = vi.fn(
@@ -325,10 +329,13 @@ describe('entity write ordering', () => {
 		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(4));
 		expect(requests[3].url).toContain('/spool/field/location');
 		requests[3].respond(Response.json({ spools_updated: 1 }));
-		expect(await rename).toBe(1);
-		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(5));
-		expect(requests[4].url).toContain('/spool/9007');
-		requests[4].respond(Response.json({ id: 9007, location: 'Office' }));
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(6));
+		const refresh = requests.find(({ url }, index) => index > 3 && url.endsWith('/spool/9006'));
+		const laterWrite = requests.find(({ url }) => url.endsWith('/spool/9007'));
+		if (!refresh || !laterWrite) throw new Error('Expected the rename refresh and later write');
+		refresh.respond(Response.json({ id: 9006, location: 'Office' }));
+		laterWrite.respond(Response.json({ id: 9007, location: 'Office' }));
+		expect(await rename).toEqual({ updated: 1, cacheRefreshed: true });
 		await later;
 	});
 
@@ -412,6 +419,36 @@ describe('entity write ordering', () => {
 		}
 	});
 
+	it('keeps an earlier bulk write as a barrier when a later rename expires', async () => {
+		vi.useFakeTimers();
+		const { fetch, requests } = controlledFetch();
+		try {
+			const first = spoolSource.renameFieldValue('location', 'Shelf', 'Office');
+			const expired = spoolSource.renameFieldValue('location', 'Office', 'Desk');
+			const failure = expect(expired).rejects.toThrow('An earlier write is still pending');
+			await vi.advanceTimersByTimeAsync(10_000);
+			const alreadyWaiting = spoolSource.createSpool({ filament_id: 1, location: 'Shelf' });
+			await vi.advanceTimersByTimeAsync(20_000);
+			await failure;
+
+			const later = spoolSource.saveSpool(9021, { location: 'Shelf' });
+			await vi.advanceTimersByTimeAsync(0);
+			expect(fetch).toHaveBeenCalledOnce();
+			requests[0].respond(Response.json({ spools_updated: 0 }));
+			await first;
+			await vi.advanceTimersByTimeAsync(0);
+			expect(fetch).toHaveBeenCalledTimes(3);
+			expect(requests[1].url).toMatch(/\/spool$/);
+			expect(requests[2].url).toContain('/spool/9021');
+			requests[1].respond(Response.json({ id: 9022, location: 'Shelf' }));
+			requests[2].respond(Response.json({ id: 9021, location: 'Shelf' }));
+			await Promise.all([alreadyWaiting, later]);
+			expect(requests.filter(({ url }) => url.includes('/spool/field/'))).toHaveLength(1);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it('orders spool creation on both sides of a bulk rename', async () => {
 		const { fetch, requests } = controlledFetch();
 		const before = spoolSource.createSpool({ filament_id: 1, location: 'Shelf' });
@@ -423,26 +460,234 @@ describe('entity write ordering', () => {
 		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
 		expect(requests[1].url).toContain('/spool/field/location');
 		requests[1].respond(Response.json({ spools_updated: 1 }));
-		await rename;
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(4));
+		const refresh = requests.find(({ url }) => url.endsWith('/spool/9012'));
+		const creation = requests.find(({ init }, index) => index > 1 && init?.method === 'POST');
+		if (!refresh || !creation) throw new Error('Expected both the rename refresh and later creation');
+		refresh.respond(Response.json({ id: 9012, location: 'Office' }));
+		creation.respond(Response.json({ id: 9013, location: 'Shelf' }));
+		await Promise.all([rename, after]);
 		expect(inventory.spoolById(9012)?.location).toBe('Office');
-		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(3));
-		expect(requests[2].url).toMatch(/\/spool$/);
-		requests[2].respond(Response.json({ id: 9013, location: 'Shelf' }));
-		await after;
 		expect(inventory.spoolById(9013)?.location).toBe('Shelf');
 	});
 
 	it('updates every matching cached spool after an extra-field rename', async () => {
-		const { requests } = controlledFetch();
+		const { requests, fetch } = controlledFetch();
 		inventory.upsertSpool(mapSpool({ id: 9014, extra: { printer: '"Rack \\"A\\""' } }));
 		inventory.upsertSpool(mapSpool({ id: 9015, extra: { printer: '"Other"' } }));
 		inventory.upsertSpool(mapSpool({ id: 9020, extra: { printer: '"Rack \\"A\\""', note: '"keep"' } }));
 		const rename = spoolSource.renameFieldValue('extra.printer', 'Rack "A"', 'Office');
 		requests[0].respond(Response.json({ spools_updated: 2 }));
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(3));
+		requests[1].respond(Response.json({ id: 9014, extra: { printer: '"Office"' } }));
+		requests[2].respond(Response.json({ id: 9020, extra: { printer: '"Office"', note: '"keep"' } }));
 		await rename;
 		expect(inventory.spoolById(9014)?.extra.printer).toBe('"Office"');
 		expect(inventory.spoolById(9015)?.extra.printer).toBe('"Other"');
 		expect(inventory.spoolById(9020)?.extra).toEqual({ printer: '"Office"', note: '"keep"' });
+	});
+
+	it('refreshes an unchanged stale cache entry even when no server spools were renamed', async () => {
+		const { requests, fetch } = controlledFetch();
+		inventory.upsertSpool(mapSpool({ id: 9099, location: 'Race A' }));
+		const rename = spoolSource.renameFieldValue('location', 'Race A', 'Race B');
+		requests[0].respond(Response.json({ spools_updated: 0 }));
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+		requests[1].respond(Response.json({ id: 9099, location: 'Race C' }));
+		expect(await rename).toEqual({ updated: 0, cacheRefreshed: true });
+		expect(inventory.spoolById(9099)?.location).toBe('Race C');
+	});
+
+	it.each([
+		{ name: 'before', serverLocation: 'Race B' },
+		{ name: 'after', serverLocation: 'Race A' }
+	])('refreshes a live update made $name the server rename', async ({ serverLocation }) => {
+		const { requests, fetch } = controlledFetch();
+		inventory.upsertSpool(mapSpool({ id: 9100, location: 'Race X' }));
+		const rename = spoolSource.renameFieldValue('location', 'Race A', 'Race B');
+		inventory.upsertSpool(mapSpool({ id: 9100, location: 'Race A' }));
+		requests[0].respond(Response.json({ spools_updated: 1 }));
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+		expect(requests[1].url).toMatch(/\/spool\/9100$/);
+		requests[1].respond(Response.json({ id: 9100, location: serverLocation }));
+		expect(await rename).toEqual({ updated: 1, cacheRefreshed: true });
+		expect(inventory.spoolById(9100)?.location).toBe(serverLocation);
+	});
+
+	it('retries reconciliation when a newer event arrives during the refresh', async () => {
+		const { requests, fetch } = controlledFetch();
+		inventory.upsertSpool(mapSpool({ id: 9101, location: 'Race X' }));
+		const rename = spoolSource.renameFieldValue('location', 'Race A', 'Race B');
+		inventory.upsertSpool(mapSpool({ id: 9101, location: 'Race A' }));
+		requests[0].respond(Response.json({ spools_updated: 1 }));
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+		inventory.upsertSpool(mapSpool({ id: 9101, location: 'Race C' }));
+		requests[1].respond(Response.json({ id: 9101, location: 'Race B' }));
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(3));
+		requests[2].respond(Response.json({ id: 9101, location: 'Race C' }));
+		expect((await rename).cacheRefreshed).toBe(true);
+		expect(inventory.spoolById(9101)?.location).toBe('Race C');
+	});
+
+	it('does not overwrite an optimistic write queued after the rename', async () => {
+		const { requests, fetch } = controlledFetch();
+		inventory.upsertSpool(mapSpool({ id: 9102, location: 'Race X' }));
+		const rename = spoolSource.renameFieldValue('location', 'Race A', 'Race B');
+		inventory.patchSpool(9102, { location: 'Race A' });
+		const later = spoolSource.saveSpool(9102, { location: 'Race A' });
+		requests[0].respond(Response.json({ spools_updated: 0 }));
+		expect(inventory.spoolById(9102)?.location).toBe('Race A');
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+		expect(requests[1].init?.method).toBe('PATCH');
+		requests[1].respond(Response.json({ id: 9102, location: 'Race A' }));
+		await later;
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(3));
+		requests[2].respond(Response.json({ id: 9102, location: 'Race A' }));
+		expect((await rename).cacheRefreshed).toBe(true);
+	});
+
+	it('does not apply an in-flight refresh over a newly queued optimistic write', async () => {
+		const { requests, fetch } = controlledFetch();
+		inventory.upsertSpool(mapSpool({ id: 9105, location: 'Race A' }));
+		const rename = spoolSource.renameFieldValue('location', 'Race A', 'Race B');
+		requests[0].respond(Response.json({ spools_updated: 1 }));
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+		inventory.patchSpool(9105, { location: 'Race C' });
+		const later = spoolSource.saveSpool(9105, { location: 'Race C' });
+		requests[1].respond(Response.json({ id: 9105, location: 'Race B' }));
+		expect(inventory.spoolById(9105)?.location).toBe('Race C');
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(3));
+		expect(requests[2].init?.method).toBe('PATCH');
+		requests[2].respond(Response.json({ id: 9105, location: 'Race C' }));
+		await later;
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(4));
+		requests[3].respond(Response.json({ id: 9105, location: 'Race C' }));
+		expect((await rename).cacheRefreshed).toBe(true);
+	});
+
+	it('refreshes the renamed value when a later queued write fails', async () => {
+		const { requests, fetch } = controlledFetch();
+		inventory.upsertSpool(mapSpool({ id: 9109, location: 'Race A' }));
+		const rename = spoolSource.renameFieldValue('location', 'Race A', 'Race B');
+		inventory.patchSpool(9109, { location: 'Race C' });
+		const later = spoolSource.saveSpool(9109, { location: 'Race C' });
+		const rejected = expect(later).rejects.toMatchObject({ status: 503 });
+		requests[0].respond(Response.json({ spools_updated: 1 }));
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+		expect(requests[1].init?.method).toBe('PATCH');
+		requests[1].respond(new Response('{}', { status: 503 }));
+		await rejected;
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(3));
+		requests[2].respond(Response.json({ id: 9109, location: 'Race B' }));
+		expect(await rename).toEqual({ updated: 1, cacheRefreshed: true });
+		expect(inventory.spoolById(9109)?.location).toBe('Race B');
+	});
+
+	it('retries an older read after a later bulk rename completes', async () => {
+		const { requests, fetch } = controlledFetch();
+		inventory.upsertSpool(mapSpool({ id: 9111, location: 'Race A' }));
+		const first = spoolSource.renameFieldValue('location', 'Race A', 'Race B');
+		requests[0].respond(Response.json({ spools_updated: 1 }));
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+		const second = spoolSource.renameFieldValue('location', 'Race B', 'Race C');
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(3));
+		expect(requests[2].url).toContain('/spool/field/location');
+		requests[2].respond(Response.json({ spools_updated: 1 }));
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(4));
+		requests[3].respond(Response.json({ id: 9111, location: 'Race C' }));
+		expect(await second).toEqual({ updated: 1, cacheRefreshed: true });
+		requests[1].respond(Response.json({ id: 9111, location: 'Race B' }));
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(5));
+		requests[4].respond(Response.json({ id: 9111, location: 'Race C' }));
+		expect(await first).toEqual({ updated: 1, cacheRefreshed: true });
+		expect(inventory.spoolById(9111)?.location).toBe('Race C');
+	});
+
+	it('preserves other cached fields while refreshing a changed extra field', async () => {
+		const { requests, fetch } = controlledFetch();
+		inventory.upsertSpool(mapSpool({ id: 9103, extra: { rack: '"Race X"', note: '"local"' } }));
+		const rename = spoolSource.renameFieldValue('extra.rack', 'Race A', 'Race B');
+		inventory.upsertSpool(mapSpool({ id: 9103, extra: { rack: '"Race A"', note: '"newer"' } }));
+		requests[0].respond(Response.json({ spools_updated: 1 }));
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+		requests[1].respond(Response.json({ id: 9103, extra: { rack: '"Race B"', note: '"stale"' } }));
+		expect((await rename).cacheRefreshed).toBe(true);
+		expect(inventory.spoolById(9103)?.extra).toEqual({ rack: '"Race B"', note: '"newer"' });
+	});
+
+	it('reports a reconciliation failure without reporting the rename as failed', async () => {
+		const { requests, fetch } = controlledFetch();
+		const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+		try {
+			inventory.upsertSpool(mapSpool({ id: 9104, location: 'Race X' }));
+			const rename = spoolSource.renameFieldValue('location', 'Race A', 'Race B');
+			inventory.upsertSpool(mapSpool({ id: 9104, location: 'Race A' }));
+			requests[0].respond(Response.json({ spools_updated: 1 }));
+			await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+			requests[1].respond(new Response('{}', { status: 503 }));
+			expect(await rename).toEqual({ updated: 1, cacheRefreshed: false });
+			expect(inventory.spoolById(9104)?.location).toBe('Race A');
+			expect(log).toHaveBeenCalled();
+		} finally {
+			log.mockRestore();
+		}
+	});
+
+	it('removes a concurrently deleted spool when its refresh returns 404', async () => {
+		const { requests, fetch } = controlledFetch();
+		inventory.upsertSpool(mapSpool({ id: 9106, location: 'Race A' }));
+		const rename = spoolSource.renameFieldValue('location', 'Race A', 'Race B');
+		requests[0].respond(Response.json({ spools_updated: 1 }));
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+		requests[1].respond(new Response('{}', { status: 404 }));
+		expect((await rename).cacheRefreshed).toBe(true);
+		expect(inventory.spoolById(9106)).toBeUndefined();
+	});
+
+	it('bounds a stalled reconciliation and releases later writes', async () => {
+		vi.useFakeTimers();
+		const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+		const fetch = vi.fn((url: string, init?: RequestInit) => {
+			if (url.endsWith('/field/location')) return Promise.resolve(Response.json({ spools_updated: 1 }));
+			if (init?.method === 'PATCH') return Promise.resolve(Response.json({ id: 9108, location: 'Done' }));
+			return new Promise<Response>((_resolve, reject) => {
+				init?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')));
+			});
+		});
+		vi.stubGlobal('fetch', fetch);
+		try {
+			inventory.upsertSpool(mapSpool({ id: 9107, location: 'Race A' }));
+			const rename = spoolSource.renameFieldValue('location', 'Race A', 'Race B');
+			const later = spoolSource.saveSpool(9108, { location: 'Done' });
+			await vi.advanceTimersByTimeAsync(0);
+			expect(fetch).toHaveBeenCalledTimes(3);
+			await later;
+			await vi.advanceTimersByTimeAsync(10_000);
+			expect(await rename).toEqual({ updated: 1, cacheRefreshed: false });
+			expect(fetch).toHaveBeenCalledTimes(3);
+		} finally {
+			log.mockRestore();
+			vi.useRealTimers();
+		}
+	});
+
+	it('bounds reconciliation while a later write remains pending', async () => {
+		vi.useFakeTimers();
+		const { requests, fetch } = controlledFetch();
+		try {
+			inventory.upsertSpool(mapSpool({ id: 9110, location: 'Race A' }));
+			const rename = spoolSource.renameFieldValue('location', 'Race A', 'Race B');
+			const later = spoolSource.saveSpool(9110, { comment: 'pending' });
+			requests[0].respond(Response.json({ spools_updated: 1 }));
+			await vi.advanceTimersByTimeAsync(0);
+			expect(fetch).toHaveBeenCalledTimes(2);
+			await vi.advanceTimersByTimeAsync(10_000);
+			expect(await rename).toEqual({ updated: 1, cacheRefreshed: false });
+			requests[1].respond(Response.json({ id: 9110, location: 'Race B', comment: 'pending' }));
+			await later;
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	it('keeps a multi-spool creation together before a bulk rename', async () => {
@@ -457,6 +702,23 @@ describe('entity write ordering', () => {
 		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(3));
 		expect(requests[2].url).toContain('/spool/field/location');
 		requests[2].respond(Response.json({ spools_updated: 2 }));
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(5));
+		requests[3].respond(Response.json({ id: 9018, location: 'Office' }));
+		requests[4].respond(Response.json({ id: 9019, location: 'Office' }));
 		await rename;
+	});
+
+	it('reports the confirmed creations when a later spool POST fails', async () => {
+		const { requests, fetch } = controlledFetch();
+		const creating = spoolSource.createSpools({ filament_id: 1 }, 3);
+		const failure = creating.catch((error: unknown) => error);
+		requests[0].respond(Response.json({ id: 9023 }));
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+		requests[1].respond(new Response('{}', { status: 503 }));
+		const error: unknown = await failure;
+		expect(error).toBeInstanceOf(SpoolBatchError);
+		expect(error).toMatchObject({ created: 1, cause: { status: 503 } });
+		expect(inventory.spoolById(9023)).toBeDefined();
+		expect(fetch).toHaveBeenCalledTimes(2);
 	});
 });

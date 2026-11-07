@@ -1,7 +1,7 @@
 import type { Extra, Spool } from '$lib/types';
 import type { GroupField } from '$lib/api/types';
 import { FieldType, type FieldDef } from '$lib/api/fields';
-import { spoolSource } from '$lib/api/spoolSource';
+import { spoolSource, type SpoolRenameResult } from '$lib/api/spoolSource';
 import { inventory } from '$lib/stores/inventory.svelte';
 import * as m from '$lib/paraglide/messages';
 
@@ -38,7 +38,7 @@ export interface DashboardField {
 	 * Give every spool in `from` the value `to`, in one request. Uniform across fields, so a
 	 * group can be renamed whether or not the board has paged its spools in.
 	 */
-	rename(from: GroupKey, to: GroupKey): Promise<void>;
+	rename(from: GroupKey, to: GroupKey): Promise<SpoolRenameResult>;
 	/** Fixed set of permitted values (single-choice fields); undefined means free text. */
 	choices?: string[];
 }
@@ -54,9 +54,7 @@ const LOCATION: DashboardField = {
 		inventory.patchSpool(spool.id, { location: value });
 		await spoolSource.saveSpool(spool.id, { location: value });
 	},
-	rename: async (from, to) => {
-		await spoolSource.renameFieldValue('location', from, to);
-	}
+	rename: (from, to) => spoolSource.renameFieldValue('location', from, to)
 };
 
 /**
@@ -96,9 +94,7 @@ function extraField(def: FieldDef): DashboardField {
 			inventory.patchSpool(spool.id, { extra: applied(spool.extra, value) });
 			await spoolSource.saveSpool(spool.id, { extra: { [def.key]: encode(value) } });
 		},
-		rename: async (from, to) => {
-			await spoolSource.renameFieldValue(key, from, to);
-		},
+		rename: (from, to) => spoolSource.renameFieldValue(key, from, to),
 		choices: def.field_type === FieldType.choice ? (def.choices ?? []) : undefined
 	};
 }

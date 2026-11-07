@@ -13,7 +13,7 @@
 	import { inventory } from '$lib/stores/inventory.svelte';
 	import { settings } from '$lib/stores/settings.svelte';
 	import { serverInfo } from '$lib/stores/serverInfo.svelte';
-	import { spoolSource } from '$lib/api/spoolSource';
+	import { SpoolBatchError, spoolSource } from '$lib/api/spoolSource';
 	import { fields } from '$lib/stores/fields.svelte';
 	import type { EntityType } from '$lib/api/fields';
 	import { externalColors, externalDirection, type ExternalFilament } from '$lib/api/external';
@@ -58,6 +58,8 @@
 	let creating = $state(false);
 	let submitting = $state(false);
 	let createdForFlow: Filament | null = null;
+	let batchFailure = $state<{ created: number; remaining: number } | null>(null);
+	let checkedInventory = $state(false);
 	let locations = $state<string[]>([]);
 	// The filament the current new-filament form was copied from, if any. Drives
 	// the "duplicate of X" heading, the rename nudge, and the extra-field carry-over.
@@ -184,6 +186,7 @@
 	let firstUsed = $state<string | undefined>(undefined);
 	let lastUsed = $state<string | undefined>(undefined);
 	let extraValues = $state<Extra>({});
+	const clearedFields: Record<EntityType, string[]> = { spool: [], filament: [], vendor: [] };
 
 	const FILL_MODES: { key: FillMode; labelKey: () => string }[] = [
 		{ key: 'full', labelKey: m['add.fill.full'] },
@@ -219,7 +222,8 @@
 	function withDefaults(entity: EntityType, current: Extra): Extra {
 		const out = { ...current };
 		for (const f of fields.get(entity))
-			if (f.default_value != null && !(f.key in out)) out[f.key] = f.default_value;
+			if (f.default_value != null && !(f.key in out) && !clearedFields[entity].includes(f.key))
+				out[f.key] = f.default_value;
 		return out;
 	}
 	// Definitions are fetched on open, so they can land after the form is already on
@@ -237,20 +241,25 @@
 		});
 	});
 
-	function setExtraOn(current: Extra, key: string, json: string | undefined): Extra {
+	function setExtraOn(entity: EntityType, current: Extra, key: string, json: string | undefined): Extra {
 		const next = { ...current };
-		if (json === undefined) delete next[key];
-		else next[key] = json;
+		if (json === undefined) {
+			delete next[key];
+			if (!clearedFields[entity].includes(key)) clearedFields[entity].push(key);
+		} else {
+			next[key] = json;
+			clearedFields[entity] = clearedFields[entity].filter((cleared) => cleared !== key);
+		}
 		return next;
 	}
 	function setExtra(key: string, json: string | undefined) {
-		extraValues = setExtraOn(extraValues, key, json);
+		extraValues = setExtraOn('spool', extraValues, key, json);
 	}
 	function setFilamentExtra(key: string, json: string | undefined) {
-		filamentExtra = setExtraOn(filamentExtra, key, json);
+		filamentExtra = setExtraOn('filament', filamentExtra, key, json);
 	}
 	function setVendorExtra(key: string, json: string | undefined) {
-		vendorExtra = setExtraOn(vendorExtra, key, json);
+		vendorExtra = setExtraOn('vendor', vendorExtra, key, json);
 	}
 
 	/** Back to a quiet form: nothing revealed until the user leaves a field or submits. */
@@ -260,7 +269,10 @@
 	}
 
 	function resetSpoolForm() {
+		clearedFields.spool = [];
 		count = '1';
+		batchFailure = null;
+		checkedInventory = false;
 		location = '';
 		lot = '';
 		comment = '';
@@ -289,6 +301,8 @@
 	}
 
 	function startCreate() {
+		clearedFields.filament = [];
+		clearedFields.vendor = [];
 		createdForFlow = null;
 		creating = true;
 		cloneSource = null;
@@ -315,6 +329,8 @@
 	 * with a nudge below the field until it's changed.
 	 */
 	function startDuplicate(f: Filament) {
+		clearedFields.filament = [];
+		clearedFields.vendor = [];
 		createdForFlow = null;
 		creating = true;
 		cloneSource = f;
@@ -336,7 +352,12 @@
 	}
 
 	function reset() {
+		clearedFields.spool = [];
+		clearedFields.filament = [];
+		clearedFields.vendor = [];
 		createdForFlow = null;
+		batchFailure = null;
+		checkedInventory = false;
 		step = 1;
 		query = '';
 		localResults = [];
@@ -348,12 +369,13 @@
 		submitting = false;
 	}
 	function close() {
+		if (submitting) return;
 		reset();
 		onclose?.();
 	}
 
 	async function submit(andAnother = false) {
-		if (submitting || !(creating || chosen)) return;
+		if (submitting || !(creating || chosen) || (batchFailure && !checkedInventory)) return;
 		// The button stays clickable while the form is incomplete: a dead button
 		// answers "why can't I add this?" with silence. Pressing it instead marks
 		// every outstanding error visible and takes you to the first one — opening
@@ -364,8 +386,23 @@
 			return;
 		}
 		submitting = true;
+		const n = countN;
 		try {
-			const n = countN;
+			try {
+				const required: EntityType[] = ['spool'];
+				if (creating) {
+					required.push('filament');
+					if (vendorIsNew) required.push('vendor');
+				}
+				await Promise.all(
+					required.filter((entity) => !fields.isLoaded(entity)).map((entity) => fields.loadRequired(entity))
+				);
+				await tick();
+			} catch (error) {
+				reportSaveError(error, 'Failed to load custom fields', m['add.fieldsLoadFailed']());
+				submitting = false;
+				return;
+			}
 			const net = parseDecimal(netWeight) ?? 0;
 			const spool = parseDecimal(spoolWeight) ?? 0;
 			const body: Record<string, unknown> = {
@@ -428,11 +465,18 @@
 				reset();
 				runSearch();
 			} else {
+				submitting = false;
 				close();
 			}
 		} catch (e) {
+			if (e instanceof SpoolBatchError) {
+				const remaining = n - e.created;
+				count = String(remaining);
+				batchFailure = { created: e.created, remaining };
+				checkedInventory = false;
+			}
 			reportSaveError(
-				e,
+				e instanceof SpoolBatchError ? e.cause : e,
 				'Failed to add spools',
 				createdForFlow ? m['add.createdButFailed']() : m['add.failed']()
 			);
@@ -535,7 +579,9 @@
 					     too, so the hint can't call the whole step "spool details". -->
 					<span class="step-hint">{creating ? m['add.step2New']() : m['add.step2']()}</span>
 				{/if}
-				<button class="x" onclick={close} aria-label={m['buttons.close']()}><X size={16} /></button>
+				<button class="x" onclick={close} disabled={submitting} aria-label={m['buttons.close']()}
+					><X size={16} /></button
+				>
 			</div>
 
 			{#if step === 1}
@@ -617,7 +663,7 @@
 					</button>
 				</div>
 			{:else}
-				<div class="body">
+				<fieldset class="body" disabled={submitting}>
 					<!-- Step 2 can create up to three records at once, so it is laid out as one
 					     block per entity — manufacturer, filament, spool — each with its own
 					     heading. Without that, the fields read as one flat form and there is no
@@ -884,18 +930,35 @@
 
 					<ExtraFieldsSection entity="spool" extra={extraValues} onchange={setExtra} />
 
+					{#if batchFailure}
+						<div class="batch-warning" role="alert">
+							<p>
+								{m['add.partialBatch']({ count: batchFailure.created, remaining: batchFailure.remaining })}
+							</p>
+							<label>
+								<input type="checkbox" bind:checked={checkedInventory} />
+								{m['add.checkedInventory']()}
+							</label>
+						</div>
+					{/if}
+
 					<div class="submit-row">
 						<div class="summary">{summary}</div>
 						<div class="actions">
-							<Button variant="outline" disabled={submitting} onclick={() => submit(true)}
-								>{m['add.addAndNew']()}</Button
+							<Button
+								variant="outline"
+								disabled={submitting || (!!batchFailure && !checkedInventory)}
+								onclick={() => submit(true)}>{m['add.addAndNew']()}</Button
 							>
-							<Button disabled={submitting} onclick={() => submit(false)}>
+							<Button
+								disabled={submitting || (!!batchFailure && !checkedInventory)}
+								onclick={() => submit(false)}
+							>
 								{submitting ? m['add.adding']() : m['add.addN']({ count: countN })}
 							</Button>
 						</div>
 					</div>
-				</div>
+				</fieldset>
 			{/if}
 		</div>
 	</div>
@@ -965,6 +1028,24 @@
 	.body {
 		padding: 14px 20px 20px;
 		overflow-y: auto;
+	}
+	fieldset.body {
+		min-width: 0;
+		margin: 0;
+		border: 0;
+	}
+	.batch-warning {
+		margin-top: 16px;
+		color: var(--text);
+		font-size: 13px;
+	}
+	.batch-warning p {
+		margin: 0 0 8px;
+	}
+	.batch-warning label {
+		display: flex;
+		align-items: flex-start;
+		gap: 8px;
 	}
 	.search-big {
 		width: 100%;

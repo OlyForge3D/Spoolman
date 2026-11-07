@@ -69,6 +69,21 @@ export interface NewFilamentDraft {
 	vendorExtra?: Extra;
 }
 
+export class SpoolBatchError extends Error {
+	constructor(
+		readonly created: number,
+		readonly cause: unknown
+	) {
+		super('Not all spools could be added');
+		this.name = 'SpoolBatchError';
+	}
+}
+
+export interface SpoolRenameResult {
+	updated: number;
+	cacheRefreshed: boolean;
+}
+
 // Map a filter chip prop → API query param. Values are quoted for exact match.
 const FILTER_PARAM: Record<string, string> = {
 	filament: 'filament.id',
@@ -176,34 +191,38 @@ function cacheSpools(raw: unknown[]): Spool[] {
 	return spools;
 }
 
-function renameCachedSpoolValues(field: GroupField, value: string, newValue: string): void {
-	inventory.mapSpools((spool) => {
-		if (field === 'location' && spool.location === value) {
-			return { ...spool, location: newValue };
-		} else if (field.startsWith('extra.')) {
-			const key = field.slice('extra.'.length);
-			const raw = spool.extra[key];
-			if (raw === undefined) return spool;
-			let decoded: unknown;
-			try {
-				decoded = JSON.parse(raw);
-			} catch (error) {
-				console.warn(`Invalid cached spool extra field ${key}`, error);
-				return spool;
-			}
-			if (decoded === value) {
-				return { ...spool, extra: { ...spool.extra, [key]: JSON.stringify(newValue) } };
-			}
-		}
-		return spool;
-	});
+function spoolHasFieldValue(spool: Spool, field: GroupField, value: string): boolean {
+	if (field === 'location') return spool.location === value;
+	if (!field.startsWith('extra.')) return false;
+	const key = field.slice('extra.'.length);
+	const raw = spool.extra[key];
+	if (raw === undefined) return false;
+	try {
+		return JSON.parse(raw) === value;
+	} catch (error) {
+		console.warn(`Invalid cached spool extra field ${key}`, error);
+		return false;
+	}
+}
+
+function withServerSpoolField(spool: Spool, server: Spool, field: GroupField): Spool {
+	if (field === 'location') return { ...spool, location: server.location };
+	const key = field.slice('extra.'.length);
+	const extra = { ...spool.extra };
+	if (server.extra[key] === undefined) delete extra[key];
+	else extra[key] = server.extra[key];
+	return { ...spool, extra };
 }
 
 const WRITE_WAIT_TIMEOUT_MS = 30_000;
+const RENAME_REFRESH_TIMEOUT_MS = 10_000;
+const RENAME_REFRESH_CONCURRENCY = 4;
 
 class HttpSpoolSource {
 	private readonly pendingWrites = new Map<string, Promise<unknown>>();
 	private pendingSpoolBulk: Promise<unknown> | undefined;
+	private spoolBulkRevision = 0;
+	private readonly reconcilingSpools = new Map<number, number>();
 	private nextSpoolCreation = 0;
 
 	// Full write responses replace the cached entity, so writes to the same
@@ -234,15 +253,20 @@ class HttpSpoolSource {
 		const dependencies = [...this.pendingWrites.entries()]
 			.filter(([key]) => key.startsWith('spool:'))
 			.map(([, promise]) => promise);
-		if (this.pendingSpoolBulk) dependencies.push(this.pendingSpoolBulk);
+		const previousBulk = this.pendingSpoolBulk;
+		if (previousBulk) dependencies.push(previousBulk);
 		const { result } = this.schedule(dependencies, action);
-		// A timed-out bulk operation never reaches the server, so it must stop
-		// blocking unrelated spool lanes as soon as the timeout is reported.
-		this.pendingSpoolBulk = result;
+		// An expired rename was never sent. Release it without dropping an
+		// earlier bulk write that is still in flight.
+		const barrier = result.catch((error: unknown) => {
+			if (error instanceof WriteQueueTimeoutError && previousBulk) return previousBulk;
+			throw error;
+		});
+		this.pendingSpoolBulk = barrier;
 		const clear = () => {
-			if (this.pendingSpoolBulk === result) this.pendingSpoolBulk = undefined;
+			if (this.pendingSpoolBulk === barrier) this.pendingSpoolBulk = undefined;
 		};
-		void result.then(clear, clear);
+		void barrier.then(clear, clear);
 		return result;
 	}
 
@@ -584,8 +608,12 @@ class HttpSpoolSource {
 		return this.write(`spool:create:${++this.nextSpoolCreation}`, async () => {
 			const spools: Spool[] = [];
 			for (let i = 0; i < count; i++) {
-				const created = await postJson<Json>('/spool', body);
-				spools.push(cacheSpools([created])[0]);
+				try {
+					const created = await postJson<Json>('/spool', body);
+					spools.push(cacheSpools([created])[0]);
+				} catch (error) {
+					throw new SpoolBatchError(spools.length, error);
+				}
 			}
 			return spools;
 		});
@@ -690,14 +718,88 @@ class HttpSpoolSource {
 		const [inUse, layout] = await Promise.all([this.locations(), loadLayout().catch(() => null)]);
 		return [...new Set([...inUse, ...(layout?.groups.location ?? [])])].filter(Boolean).sort();
 	}
+
+	private async refreshRenamedSpool(id: number, field: GroupField, signal: AbortSignal): Promise<boolean> {
+		for (let attempt = 0; attempt < 3; attempt++) {
+			const pending = this.pendingWrites.get(`spool:${id}`);
+			if (pending) {
+				const settled = await new Promise<boolean>((resolve) => {
+					if (signal.aborted) {
+						resolve(false);
+						return;
+					}
+					const abort = () => resolve(false);
+					signal.addEventListener('abort', abort, { once: true });
+					const finish = () => {
+						signal.removeEventListener('abort', abort);
+						resolve(true);
+					};
+					void pending.then(finish, finish);
+				});
+				if (!settled) return false;
+				continue;
+			}
+			const current = inventory.spoolById(id);
+			if (!current) return true;
+			const revision = this.spoolBulkRevision;
+			const raw = await getJson<Json | null>(`/spool/${id}`, {}, signal).catch(swallow404);
+			if (
+				this.spoolBulkRevision !== revision ||
+				this.pendingWrites.has(`spool:${id}`) ||
+				inventory.spoolById(id) !== current
+			)
+				continue;
+			if (raw) inventory.upsertSpool(withServerSpoolField(current, mapSpool(raw), field));
+			else inventory.removeSpool(id);
+			return true;
+		}
+		console.warn(`Spool ${id} kept changing during rename reconciliation`);
+		return false;
+	}
+
+	private async refreshRenamedSpools(ids: number[], field: GroupField): Promise<boolean> {
+		if (!ids.length) return true;
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), RENAME_REFRESH_TIMEOUT_MS);
+		let next = 0;
+		let refreshed = true;
+		try {
+			const worker = async () => {
+				while (next < ids.length) {
+					if (controller.signal.aborted) {
+						refreshed = false;
+						return;
+					}
+					const id = ids[next++];
+					try {
+						if (!(await this.refreshRenamedSpool(id, field, controller.signal))) {
+							refreshed = false;
+						}
+					} catch (error) {
+						console.error(`Failed to refresh spool ${id} after rename`, error);
+						refreshed = false;
+					}
+				}
+			};
+			await Promise.all(Array.from({ length: Math.min(ids.length, RENAME_REFRESH_CONCURRENCY) }, worker));
+		} finally {
+			clearTimeout(timer);
+		}
+		return refreshed;
+	}
+
 	/**
 	 * Replace one value of one spool field wherever it occurs, in a single request. Works for
 	 * any field the spool owns, so the dashboard can rename a whole group without paging in its
-	 * members — and without leaving out the ones it never loaded. Returns how many spools held
-	 * the old value.
+	 * members — and without leaving out the ones it never loaded.
 	 */
-	async renameFieldValue(field: GroupField, value: string, newValue: string): Promise<number> {
-		return this.writeSpools(async () => {
+	async renameFieldValue(field: GroupField, value: string, newValue: string): Promise<SpoolRenameResult> {
+		// Release the write barrier after the PATCH, so later writes can settle
+		// before reconciliation without waiting on the reconciliation itself.
+		const { updated, uncertain } = await this.writeSpools(async () => {
+			const uncertain = new Set(
+				inventory.spools.filter((spool) => spoolHasFieldValue(spool, field, value)).map((spool) => spool.id)
+			);
 			const result = await patchJson<{ spools_updated: number }>(
 				`/spool/field/${encodeURIComponent(field)}`,
 				{
@@ -705,9 +807,26 @@ class HttpSpoolSource {
 					new_value: newValue
 				}
 			);
-			renameCachedSpoolValues(field, value, newValue);
-			return result.spools_updated;
+			this.spoolBulkRevision++;
+			// A cached old value may have arrived before or after the bulk statement,
+			// or may already have been stale. Only the server can distinguish those.
+			for (const spool of inventory.spools)
+				if (spoolHasFieldValue(spool, field, value)) uncertain.add(spool.id);
+			// Earlier renames may still be reconciling a value that this rename
+			// just changed again, even if the cache has not caught up yet.
+			for (const id of this.reconcilingSpools.keys()) uncertain.add(id);
+			for (const id of uncertain) this.reconcilingSpools.set(id, (this.reconcilingSpools.get(id) ?? 0) + 1);
+			return { updated: result.spools_updated, uncertain: [...uncertain] };
 		});
+		try {
+			return { updated, cacheRefreshed: await this.refreshRenamedSpools(uncertain, field) };
+		} finally {
+			for (const id of uncertain) {
+				const remaining = (this.reconcilingSpools.get(id) ?? 1) - 1;
+				if (remaining) this.reconcilingSpools.set(id, remaining);
+				else this.reconcilingSpools.delete(id);
+			}
+		}
 	}
 	async lotNumbers(): Promise<string[]> {
 		return getJson<string[]>('/lot-number');
