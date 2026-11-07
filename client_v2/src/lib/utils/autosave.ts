@@ -11,19 +11,21 @@ import { toasts } from '$lib/stores/toasts.svelte';
 import * as m from '$lib/paraglide/messages';
 
 /**
- * Report the outcome of an auto-save. Always resolves — callers are fire-and-
- * forget and must not produce unhandled rejections.
+ * Report the outcome of an auto-save. Always resolves so fire-and-forget callers
+ * do not produce unhandled rejections; the result lets inputs retain failed drafts.
  *
  * @param context Short label for the console log when the save fails.
  */
-export function trackSave(promise: Promise<unknown>, context = 'Save failed'): Promise<void> {
+export function trackSave(promise: Promise<unknown>, context = 'Save failed'): Promise<boolean> {
 	return promise.then(
 		() => {
 			toasts.success(m['notifications.saveSuccessful']());
+			return true;
 		},
 		(e: unknown) => {
 			console.error(context, e);
 			toasts.error(m['notifications.error']({ statusCode: e instanceof HttpError ? e.status : '?' }));
+			return false;
 		}
 	);
 }

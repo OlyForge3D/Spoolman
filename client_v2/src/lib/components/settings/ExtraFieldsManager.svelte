@@ -429,7 +429,13 @@
 					{#if isChoice && choices.length === 0}
 						<span class="hint">{m['settings.extraFields.addChoicesFirst']()}</span>
 					{:else}
-						<ExtraFieldInput field={draftField} value={defaultJson} onchange={(v) => (defaultJson = v)} />
+						<ExtraFieldInput
+							field={draftField}
+							value={defaultJson}
+							onchange={(v) => {
+								defaultJson = v;
+							}}
+						/>
 					{/if}
 				</div>
 			</div>

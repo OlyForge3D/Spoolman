@@ -69,7 +69,7 @@
 
 	function set(patch: Partial<Vendor>) {
 		inventory.patchVendor(vendor.id, patch);
-		saver.push(vendor.id, patch);
+		return saver.push(vendor.id, patch);
 	}
 
 	const extraSaver = makeExtraSaver(
@@ -174,6 +174,7 @@
 				<Field label={m['vendor.fields.emptySpoolWeight']()} help={m['vendor.fieldsHelp.emptySpoolWeight']()}>
 					<NumberInput
 						dense
+						protectDraft
 						unit="g"
 						step={10}
 						min={0}

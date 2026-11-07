@@ -204,3 +204,102 @@ describe('vendorNames', () => {
 		expect(await spoolSource.vendorNames()).toEqual(['Polymaker', 'Prusament']);
 	});
 });
+
+describe('entity write ordering', () => {
+	function controlledFetch() {
+		const requests: { url: string; init?: RequestInit; respond: (response: Response) => void }[] = [];
+		const fetch = vi.fn(
+			(url: string, init?: RequestInit) =>
+				new Promise<Response>((respond) => requests.push({ url, init, respond }))
+		);
+		vi.stubGlobal('fetch', fetch);
+		return { fetch, requests };
+	}
+
+	it('serializes writes for the same entity while allowing other entities to proceed', async () => {
+		const { fetch, requests } = controlledFetch();
+		const first = spoolSource.saveFilament('9001', { name: 'first' });
+		const second = spoolSource.saveFilament('9001', { name: 'second' });
+		const other = spoolSource.saveFilament('9002', { name: 'other' });
+		expect(fetch).toHaveBeenCalledTimes(2);
+		expect(requests.map((request) => request.url)).toEqual([
+			'http://spoolman.test/api/v1/filament/9001',
+			'http://spoolman.test/api/v1/filament/9002'
+		]);
+
+		requests[1].respond(Response.json({ id: 9002, name: 'other' }));
+		await other;
+		requests[0].respond(Response.json({ id: 9001, name: 'first' }));
+		await first;
+		expect(fetch).toHaveBeenCalledTimes(3);
+		expect(JSON.parse(requests[2].init?.body as string)).toEqual({ name: 'second' });
+		requests[2].respond(Response.json({ id: 9001, name: 'second' }));
+		await second;
+		expect(inventory.filamentById('9001')?.name).toBe('second');
+	});
+
+	it('reports a failed write and still runs the next queued write', async () => {
+		const { fetch, requests } = controlledFetch();
+		const first = spoolSource.saveVendor('9003', { name: 'first' });
+		const failure = expect(first).rejects.toMatchObject({ status: 500 });
+		const second = spoolSource.saveVendor('9003', { name: 'second' });
+		expect(fetch).toHaveBeenCalledOnce();
+
+		requests[0].respond(new Response('{}', { status: 500 }));
+		await failure;
+		expect(fetch).toHaveBeenCalledTimes(2);
+		requests[1].respond(Response.json({ id: 9003, name: 'second' }));
+		await second;
+		expect(inventory.vendorById('9003')?.name).toBe('second');
+	});
+
+	it('waits for an in-flight spool edit before deleting the spool', async () => {
+		const { fetch, requests } = controlledFetch();
+		const save = spoolSource.saveSpool(9004, { lot: 'updated' });
+		const deletion = spoolSource.deleteSpool(9004);
+		expect(fetch).toHaveBeenCalledOnce();
+
+		requests[0].respond(Response.json({ id: 9004, lot_nr: 'updated' }));
+		await save;
+		expect(fetch).toHaveBeenCalledTimes(2);
+		expect(requests[1].init?.method).toBe('DELETE');
+		requests[1].respond(new Response(null, { status: 204 }));
+		await deletion;
+		expect(inventory.spoolById(9004)).toBeUndefined();
+	});
+
+	it.each([
+		{
+			name: 'length',
+			write: (id: number) => spoolSource.useSpoolLength(id, 20),
+			path: '/use',
+			body: { use_length: 20 }
+		},
+		{
+			name: 'weight',
+			write: (id: number) => spoolSource.useSpoolWeight(id, 30),
+			path: '/use',
+			body: { use_weight: 30 }
+		},
+		{
+			name: 'measurement',
+			write: (id: number) => spoolSource.measureSpool(id, 40),
+			path: '/measure',
+			body: { weight: 40 }
+		}
+	])('orders a spool $name operation after a pending edit', async ({ write, path, body }) => {
+		const { fetch, requests } = controlledFetch();
+		const save = spoolSource.saveSpool(9005, { lot: 'updated' });
+		const adjustment = write(9005);
+		expect(fetch).toHaveBeenCalledOnce();
+		requests[0].respond(Response.json({ id: 9005, lot_nr: 'updated' }));
+		await save;
+
+		expect(fetch).toHaveBeenCalledTimes(2);
+		expect(requests[1].url).toBe(`http://spoolman.test/api/v1/spool/9005${path}`);
+		expect(requests[1].init?.method).toBe('PUT');
+		expect(JSON.parse(requests[1].init?.body as string)).toEqual(body);
+		requests[1].respond(Response.json({ id: 9005, lot_nr: 'updated' }));
+		expect((await adjustment).lot).toBe('updated');
+	});
+});

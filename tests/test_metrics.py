@@ -3,11 +3,12 @@
 from datetime import datetime, timezone
 
 import pytest
+from prometheus_client import CollectorRegistry, Gauge
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 from spoolman.database import models
-from spoolman.prometheus.metrics import filament_metrics, registry, spool_metrics
+from spoolman.prometheus.metrics import _publish, filament_metrics, registry, spool_metrics
 
 
 async def refresh(engine: AsyncEngine) -> None:
@@ -32,6 +33,22 @@ def info(filament_id: int, name: str) -> float | None:
     """Return a vendorless filament's exported info sample, or None if it is not exported."""
     labels = {"filament_id": str(filament_id), "vendor": "-", "name": name, "material": "None", "color": "None"}
     return registry.get_sample_value("spoolman_filament_info", labels)
+
+
+def test_refresh_compares_labels_as_prometheus_strings() -> None:
+    local_registry = CollectorRegistry()
+    gauge = Gauge("test_label_normalization", "Test label normalization", ["name"], registry=local_registry)
+
+    _publish(gauge, {(None,): 1})
+    _publish(gauge, {("None",): 2})
+    assert local_registry.get_sample_value("test_label_normalization", {"name": "None"}) == 2
+
+    _publish(gauge, {(None,): 3})
+    assert local_registry.get_sample_value("test_label_normalization", {"name": "None"}) == 3
+
+    _publish(gauge, {("other",): 4})
+    assert local_registry.get_sample_value("test_label_normalization", {"name": "None"}) is None
+    assert local_registry.get_sample_value("test_label_normalization", {"name": "other"}) == 4
 
 
 @pytest.mark.asyncio

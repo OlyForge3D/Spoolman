@@ -237,7 +237,7 @@
 
 	function set(patch: Partial<Spool>) {
 		inventory.patchSpool(spool.id, patch);
-		saver.push(spool.id, patch);
+		return saver.push(spool.id, patch);
 	}
 
 	/**
@@ -256,7 +256,7 @@
 			initial: effective,
 			remaining: Math.max(effective - spool.usedWeight, 0)
 		});
-		saver.push(spool.id, { initial: v });
+		return saver.push(spool.id, { initial: v });
 	}
 
 	const extraSaver = makeExtraSaver(
@@ -461,6 +461,7 @@
 				<Field label={m['spool.fields.weight']()} help={m['spool.fieldsHelp.weight']()}>
 					<NumberInput
 						dense
+						protectDraft
 						width="285px"
 						unit="g"
 						step={50}
@@ -475,6 +476,7 @@
 				<Field label={m['spool.fields.spoolWeight']()} help={m['spool.fieldsHelp.spoolWeight']()}>
 					<NumberInput
 						dense
+						protectDraft
 						width="285px"
 						unit="g"
 						step={10}
@@ -491,6 +493,7 @@
 				<Field label={m['spool.fields.price']()} help={m['spool.fieldsHelp.price']()}>
 					<NumberInput
 						dense
+						protectDraft
 						width="285px"
 						unit={settings.currencySymbol}
 						min={0}

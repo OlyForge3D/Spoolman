@@ -8,12 +8,13 @@
 	import { extraFieldsHref } from '$lib/settings/params';
 	import type { EntityType } from '$lib/api/fields';
 	import type { Extra } from '$lib/types';
+	import type { SaveResult } from '$lib/utils/saver';
 	import ArrowRight from '@lucide/svelte/icons/arrow-right';
 
 	interface Props {
 		entity: EntityType;
 		extra: Extra;
-		onchange: (key: string, json: string | undefined) => void;
+		onchange: (key: string, json: string | undefined) => SaveResult;
 		readonly?: boolean;
 		/**
 		 * Show the section even when this entity has no extra fields, with a link to

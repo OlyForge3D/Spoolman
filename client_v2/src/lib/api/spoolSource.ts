@@ -168,6 +168,19 @@ function cacheSpools(raw: unknown[]): Spool[] {
 }
 
 class HttpSpoolSource {
+	private readonly pendingWrites = new Map<string, Promise<unknown>>();
+
+	// Full write responses replace the cached entity, so writes to the same
+	// entity must land in order, even when they come from different controls.
+	private write<T>(key: string, action: () => Promise<T>): Promise<T> {
+		const previous = this.pendingWrites.get(key);
+		const current = previous ? previous.then(action, action) : action();
+		this.pendingWrites.set(key, current);
+		return current.finally(() => {
+			if (this.pendingWrites.get(key) === current) this.pendingWrites.delete(key);
+		});
+	}
+
 	async listGroups(query: GroupQuery): Promise<Page<GroupSummary>> {
 		const params: QueryParams = {
 			group_by: query.field,
@@ -423,44 +436,56 @@ class HttpSpoolSource {
 	// --- writes -------------------------------------------------------------
 
 	async saveSpool(id: number, patch: SpoolPatch): Promise<void> {
-		const updated = await patchJson<Json>(`/spool/${id}`, spoolPatchToApi(patch));
-		inventory.upsertSpool(mapSpool(updated));
+		return this.write(`spool:${id}`, async () => {
+			const updated = await patchJson<Json>(`/spool/${id}`, spoolPatchToApi(patch));
+			inventory.upsertSpool(mapSpool(updated));
+		});
 	}
 	async setSpoolArchived(id: number, archived: boolean): Promise<void> {
 		await this.saveSpool(id, { archived });
 	}
 	/** Consume (or, if negative, add back) filament by length. */
 	async useSpoolLength(id: number, length: number): Promise<Spool> {
-		const updated = await putJson<Json>(`/spool/${id}/use`, { use_length: length });
-		const spool = mapSpool(updated);
-		inventory.upsertSpool(spool);
-		return spool;
+		return this.write(`spool:${id}`, async () => {
+			const updated = await putJson<Json>(`/spool/${id}/use`, { use_length: length });
+			const spool = mapSpool(updated);
+			inventory.upsertSpool(spool);
+			return spool;
+		});
 	}
 	/** Consume (or, if negative, add back) filament by weight. */
 	async useSpoolWeight(id: number, weight: number): Promise<Spool> {
-		const updated = await putJson<Json>(`/spool/${id}/use`, { use_weight: weight });
-		const spool = mapSpool(updated);
-		inventory.upsertSpool(spool);
-		return spool;
+		return this.write(`spool:${id}`, async () => {
+			const updated = await putJson<Json>(`/spool/${id}/use`, { use_weight: weight });
+			const spool = mapSpool(updated);
+			inventory.upsertSpool(spool);
+			return spool;
+		});
 	}
 	/** Consume filament based on the current gross (spool + filament) weight measurement. */
 	async measureSpool(id: number, weight: number): Promise<Spool> {
-		const updated = await putJson<Json>(`/spool/${id}/measure`, { weight });
-		const spool = mapSpool(updated);
-		inventory.upsertSpool(spool);
-		return spool;
+		return this.write(`spool:${id}`, async () => {
+			const updated = await putJson<Json>(`/spool/${id}/measure`, { weight });
+			const spool = mapSpool(updated);
+			inventory.upsertSpool(spool);
+			return spool;
+		});
 	}
 	async saveFilament(id: string, patch: FilamentPatch): Promise<void> {
-		const updated = await patchJson<Json>(`/filament/${id}`, filamentPatchToApi(patch));
-		// The response embeds the manufacturer, which this patch may just have
-		// changed — cache it too, so a filament re-filed under one the cache has
-		// never seen resolves to a name rather than to nothing.
-		if (updated.vendor) inventory.upsertVendor(mapVendor(updated.vendor));
-		inventory.upsertFilament(mapFilament(updated));
+		return this.write(`filament:${id}`, async () => {
+			const updated = await patchJson<Json>(`/filament/${id}`, filamentPatchToApi(patch));
+			// The response embeds the manufacturer, which this patch may just have
+			// changed — cache it too, so a filament re-filed under one the cache has
+			// never seen resolves to a name rather than to nothing.
+			if (updated.vendor) inventory.upsertVendor(mapVendor(updated.vendor));
+			inventory.upsertFilament(mapFilament(updated));
+		});
 	}
 	async saveVendor(id: string, patch: VendorPatch): Promise<void> {
-		const updated = await patchJson<Json>(`/vendor/${id}`, vendorPatchToApi(patch));
-		inventory.upsertVendor(mapVendor(updated));
+		return this.write(`vendor:${id}`, async () => {
+			const updated = await patchJson<Json>(`/vendor/${id}`, vendorPatchToApi(patch));
+			inventory.upsertVendor(mapVendor(updated));
+		});
 	}
 	async createSpool(body: Json): Promise<Spool> {
 		const created = await postJson<Json>('/spool', body);
@@ -492,14 +517,18 @@ class HttpSpoolSource {
 	 * flag and the foreign key still holds.
 	 */
 	async deleteSpool(id: number): Promise<void> {
-		await deleteResource(`/spool/${id}`);
-		inventory.removeSpool(id);
+		return this.write(`spool:${id}`, async () => {
+			await deleteResource(`/spool/${id}`);
+			inventory.removeSpool(id);
+		});
 	}
 
 	/** Delete a filament. Rejects with a 403 HttpError if it still has spools. */
 	async deleteFilament(id: string): Promise<void> {
-		await deleteResource(`/filament/${id}`);
-		inventory.removeFilament(id);
+		return this.write(`filament:${id}`, async () => {
+			await deleteResource(`/filament/${id}`);
+			inventory.removeFilament(id);
+		});
 	}
 
 	/**
@@ -507,8 +536,10 @@ class HttpSpoolSource {
 	 * their vendor and leaves them in the catalog, which `removeVendor` mirrors.
 	 */
 	async deleteVendor(id: string): Promise<void> {
-		await deleteResource(`/vendor/${id}`);
-		inventory.removeVendor(id);
+		return this.write(`vendor:${id}`, async () => {
+			await deleteResource(`/vendor/${id}`);
+			inventory.removeVendor(id);
+		});
 	}
 
 	// --- filter option lists -----------------------------------------------

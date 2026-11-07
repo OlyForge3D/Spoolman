@@ -15,7 +15,9 @@ function harness(initial: Extra, id = 1) {
 		(_id, extra) => {
 			current = extra;
 		},
-		(id, patch) => persisted.push({ id, patch }),
+		(id, patch) => {
+			persisted.push({ id, patch });
+		},
 		() => current,
 		10
 	);
@@ -127,7 +129,9 @@ describe('cancel', () => {
 		vi.useFakeTimers();
 		try {
 			const saved: { id: number; patch: { name?: string } }[] = [];
-			const saver = makeSaver<number, { name: string }>((id, patch) => saved.push({ id, patch }), 10);
+			const saver = makeSaver<number, { name: string }>((id, patch) => {
+				saved.push({ id, patch });
+			}, 10);
 			saver.push(1, { name: 'renamed' });
 			saver.cancel();
 			vi.advanceTimersByTime(100);
@@ -140,11 +144,69 @@ describe('cancel', () => {
 
 	it('leaves the saver usable afterwards', () => {
 		const saved: { id: number; patch: { name?: string } }[] = [];
-		const saver = makeSaver<number, { name: string }>((id, patch) => saved.push({ id, patch }), 10);
+		const saver = makeSaver<number, { name: string }>((id, patch) => {
+			saved.push({ id, patch });
+		}, 10);
 		saver.push(1, { name: 'dropped' });
 		saver.cancel();
 		saver.push(2, { name: 'kept' });
 		saver.flush();
 		expect(saved).toEqual([{ id: 2, patch: { name: 'kept' } }]);
+	});
+});
+
+describe('save outcomes', () => {
+	it('resolves every coalesced edit only after the save completes', async () => {
+		let finish!: (success: boolean) => void;
+		const result = new Promise<boolean>((resolve) => (finish = resolve));
+		const save = vi.fn(() => result);
+		const saver = makeSaver<number, { name?: string; comment?: string }>(save);
+		const first = saver.push(1, { name: 'new name' });
+		const second = saver.push(1, { comment: 'new comment' });
+		let settled = false;
+		void first.then(() => (settled = true));
+
+		saver.flush();
+		expect(save).toHaveBeenCalledOnce();
+		expect(save).toHaveBeenCalledWith(1, { name: 'new name', comment: 'new comment' });
+		await Promise.resolve();
+		expect(settled).toBe(false);
+		finish(true);
+		expect(await Promise.all([first, second])).toEqual([true, true]);
+	});
+
+	it('returns the failure of the batch that contained each edit', async () => {
+		const saver = makeSaver<number, { name: string }>(() => Promise.resolve(false));
+		const edit = saver.push(1, { name: 'unsaved' });
+		saver.flush();
+		expect(await edit).toBe(false);
+	});
+
+	it('resolves cancelled pending edits without cancelling an in-flight save', async () => {
+		let finish!: (success: boolean) => void;
+		const saver = makeSaver<number, { name: string }>(
+			() => new Promise<boolean>((resolve) => (finish = resolve))
+		);
+		const inFlight = saver.push(1, { name: 'first' });
+		saver.flush();
+		const cancelled = saver.push(1, { name: 'second' });
+		saver.cancel();
+		expect(await cancelled).toBe(false);
+		finish(true);
+		expect(await inFlight).toBe(true);
+	});
+
+	it('logs an unexpected rejection and resolves the edit as failed', async () => {
+		const error = new Error('unexpected');
+		const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+		try {
+			const saver = makeSaver<number, { name: string }>(() => Promise.reject(error));
+			const edit = saver.push(1, { name: 'unsaved' });
+			saver.flush();
+			expect(await edit).toBe(false);
+			expect(log).toHaveBeenCalledWith('Unexpected autosave failure', error);
+		} finally {
+			log.mockRestore();
+		}
 	});
 });

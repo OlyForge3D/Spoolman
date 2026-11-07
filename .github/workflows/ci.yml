@@ -402,7 +402,7 @@ jobs:
       - name: Start Spoolman
         run: docker compose -f tests_frontend_v2/docker-compose.yml up -d --wait
 
-      # Screenshots first: they seed a fixed dataset and need the database empty.
+      # Screenshots first: they seed a fixed dataset in the dedicated test database.
       # Argos uploads are opt-in for this fork and are skipped for tag builds.
       - name: Take client_v2 screenshots
         env:

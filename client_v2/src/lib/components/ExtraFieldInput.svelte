@@ -6,6 +6,8 @@
 	import LinkedText from './LinkedText.svelte';
 	import { formatDateTime } from '$lib/utils/datetime';
 	import { numericInput, parseDecimal } from '$lib/utils/numeric';
+	import { makeDraftTracker } from '$lib/utils/draftTracker';
+	import type { SaveResult } from '$lib/utils/saver';
 	import * as m from '$lib/paraglide/messages';
 
 	interface Props {
@@ -13,7 +15,7 @@
 		/** Current raw JSON-encoded value (or undefined if unset). */
 		value: string | undefined;
 		/** Emit the new JSON-encoded value, or undefined to leave unset. */
-		onchange: (json: string | undefined) => void;
+		onchange: (json: string | undefined) => SaveResult;
 		/** Render the value as plain text instead of an editable input. */
 		readonly?: boolean;
 	}
@@ -36,43 +38,46 @@
 		// holding "" is not distinguishable from an unset one anywhere it is read — it renders
 		// as em-dash, groups as "unassigned" and matches the unset filter — so storing one only
 		// creates a value that looks unset but isn't. Single-choice below does the same.
-		emit(v === '' ? undefined : v);
+		return emit(v === '' ? undefined : v);
 	}
 	// The numeric fields are text inputs guarded by `numericInput` so a decimal comma
 	// is accepted and letters can't be typed at all; `parseDecimal` reads either
-	// separator. What the user typed is kept in `drafts` and shown back until they
-	// leave the box: emitting "1," (which stores 1) would otherwise rewrite the box to
-	// "1" and eat the comma mid-typing, and autosave responses and live updates carry
-	// the number as the server had it a moment ago (#1307, as in EditableField).
+	// separator. Keep the raw value while editing and until its save has landed:
+	// emitting "1," (which stores 1) must not eat the comma or newer typing.
 	let drafts = $state<Record<string, string>>({});
+	const tracker = makeDraftTracker((key) => delete drafts[key]);
+	$effect(() => () => tracker.dispose());
 	function shown(key: string, stored: unknown): string {
 		return drafts[key] ?? (stored === undefined || stored === null ? '' : String(stored));
 	}
-	function typed(key: string, raw: string): string {
+	function typed(key: string, raw: string, save: (value: string) => SaveResult) {
 		drafts[key] = raw;
-		return raw;
-	}
-	function left(key: string) {
-		delete drafts[key];
+		tracker.change(key, save(raw));
 	}
 
 	function onInt(v: string) {
 		const n = parseDecimal(v);
-		emit(n === null ? undefined : Math.round(n));
+		return emit(n === null ? undefined : Math.round(n));
 	}
 	function onFloat(v: string) {
-		emit(parseDecimal(v) ?? undefined);
+		return emit(parseDecimal(v) ?? undefined);
 	}
 
 	// Ranges: [low, high], each number-or-null.
 	let lo = $derived(Array.isArray(parsed) ? (parsed[0] ?? '') : '');
 	let hi = $derived(Array.isArray(parsed) ? (parsed[1] ?? '') : '');
-	function onRange(which: 0 | 1, raw: string, isInt: boolean) {
+	function rangeTyped(key: 'lo' | 'hi', raw: string, isInt: boolean) {
+		drafts[key] = raw;
 		const cur: [unknown, unknown] = Array.isArray(parsed) ? [parsed[0], parsed[1]] : [null, null];
-		const parsedNum = parseDecimal(raw);
-		cur[which] = parsedNum === null ? null : isInt ? Math.round(parsedNum) : parsedNum;
-		if (cur[0] === null && cur[1] === null) emit(undefined);
-		else emit(cur);
+		for (const [index, bound] of ['lo', 'hi'].entries()) {
+			if (drafts[bound] === undefined) continue;
+			const n = parseDecimal(drafts[bound]);
+			cur[index] = n === null ? null : isInt ? Math.round(n) : n;
+		}
+		const result = emit(cur[0] === null && cur[1] === null ? undefined : cur);
+		for (const bound of ['lo', 'hi']) {
+			if (drafts[bound] !== undefined) tracker.change(bound, result);
+		}
 	}
 
 	// Datetime: stored as a JSON-encoded ISO string; edited via the shared
@@ -120,8 +125,9 @@
 			use:numericInput
 			value={shown('int', parsed)}
 			aria-label={field.name}
-			oninput={(e) => onInt(typed('int', e.currentTarget.value))}
-			onblur={() => left('int')}
+			onfocus={() => tracker.focus('int')}
+			oninput={(e) => typed('int', e.currentTarget.value, onInt)}
+			onblur={() => tracker.blur('int')}
 		/>
 		{#if field.unit}<span class="unit">{field.unit}</span>{/if}
 	</span>
@@ -134,8 +140,9 @@
 			use:numericInput
 			value={shown('float', parsed)}
 			aria-label={field.name}
-			oninput={(e) => onFloat(typed('float', e.currentTarget.value))}
-			onblur={() => left('float')}
+			onfocus={() => tracker.focus('float')}
+			oninput={(e) => typed('float', e.currentTarget.value, onFloat)}
+			onblur={() => tracker.blur('float')}
 		/>
 		{#if field.unit}<span class="unit">{field.unit}</span>{/if}
 	</span>
@@ -149,8 +156,9 @@
 			use:numericInput
 			value={shown('lo', lo)}
 			aria-label={`${field.name} ${m['settings.extraFields.min']()}`}
-			oninput={(e) => onRange(0, typed('lo', e.currentTarget.value), isInt)}
-			onblur={() => left('lo')}
+			onfocus={() => tracker.focus('lo')}
+			oninput={(e) => rangeTyped('lo', e.currentTarget.value, isInt)}
+			onblur={() => tracker.blur('lo')}
 			placeholder={m['settings.extraFields.min']()}
 		/>
 		<span class="dash">–</span>
@@ -161,8 +169,9 @@
 			use:numericInput
 			value={shown('hi', hi)}
 			aria-label={`${field.name} ${m['settings.extraFields.max']()}`}
-			oninput={(e) => onRange(1, typed('hi', e.currentTarget.value), isInt)}
-			onblur={() => left('hi')}
+			onfocus={() => tracker.focus('hi')}
+			oninput={(e) => rangeTyped('hi', e.currentTarget.value, isInt)}
+			onblur={() => tracker.blur('hi')}
 			placeholder={m['settings.extraFields.max']()}
 		/>
 		{#if field.unit}<span class="unit">{field.unit}</span>{/if}

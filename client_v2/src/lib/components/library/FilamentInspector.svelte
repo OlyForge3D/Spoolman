@@ -135,7 +135,7 @@
 
 	function set(patch: Partial<Filament>) {
 		inventory.patchFilament(filament.id, patch);
-		saver.push(filament.id, patch);
+		return saver.push(filament.id, patch);
 	}
 
 	// A GTIN is stored normalized and the API refuses anything that isn't a whole, valid
@@ -147,12 +147,11 @@
 	function setGtin(value: string) {
 		if (!value.trim()) {
 			gtinInvalid = false;
-			set({ gtin: '' });
-			return;
+			return set({ gtin: '' });
 		}
 		const normalized = normalizeGtin(value);
 		gtinInvalid = normalized === null;
-		if (normalized !== null && normalized !== filament.gtin) set({ gtin: normalized });
+		if (normalized !== null) return set({ gtin: normalized });
 	}
 
 	const extraSaver = makeExtraSaver(
@@ -377,6 +376,7 @@
 				<Field label={m['filament.fields.diameter']()}>
 					<NumberInput
 						dense
+						protectDraft
 						width="200px"
 						unit="mm"
 						step={0.05}
@@ -388,6 +388,7 @@
 				<Field label={m['filament.fields.density']()}>
 					<NumberInput
 						dense
+						protectDraft
 						width="200px"
 						unit="g/cm³"
 						step={0.01}
@@ -399,6 +400,7 @@
 				<Field label={m['filament.fields.weight']()} help={m['filament.fieldsHelp.weight']()}>
 					<NumberInput
 						dense
+						protectDraft
 						width="200px"
 						unit="g"
 						step={50}
@@ -413,6 +415,7 @@
 				<Field label={m['filament.fields.spoolWeight']()} help={m['filament.fieldsHelp.spoolWeight']()}>
 					<NumberInput
 						dense
+						protectDraft
 						width="200px"
 						unit="g"
 						step={10}
@@ -429,6 +432,7 @@
 				<Field label={m['filament.fields.settingsExtruderTemp']()}>
 					<NumberInput
 						dense
+						protectDraft
 						width="200px"
 						unit="°C"
 						step={5}
@@ -440,6 +444,7 @@
 				<Field label={m['filament.fields.settingsBedTemp']()}>
 					<NumberInput
 						dense
+						protectDraft
 						width="200px"
 						unit="°C"
 						step={5}
@@ -451,6 +456,7 @@
 				<Field label={m['filament.fields.price']()}>
 					<NumberInput
 						dense
+						protectDraft
 						width="200px"
 						unit={settings.currency}
 						step={1}
