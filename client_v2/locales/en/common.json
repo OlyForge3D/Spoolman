@@ -565,6 +565,7 @@
     "settings.scanner.use": "Use this one",
     "settings.scanner.waiting": "Tap any tag on the reader you want...",
     "sponsor": "Sponsor me on GitHub",
+    "spool.ambiguousAssignment": "This value may still be affected by an unfinished group rename. Check the inventory and reload before assigning it.",
     "spool.fields.archived": "Archived",
     "spool.fields.comment": "Comment",
     "spool.fields.filament": "Filament",

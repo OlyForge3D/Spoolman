@@ -217,6 +217,7 @@
 	}
 
 	function spoolLabel(s: Spool): string {
+		if (inventory.isSpoolUncertain(s.id)) return `#${s.id} · ${m['spool.uncertainShort']()}`;
 		const f = inventory.filamentById(s.filamentId);
 		const v = f ? inventory.vendorById(f.vendorId) : undefined;
 		const name = f ? `${v ? v.name + ' ' : ''}${f.name}` : m['labels.unknownFilament']();
@@ -322,7 +323,12 @@
 	);
 	const missingIds = $derived(
 		kind === 'spool'
-			? [...selected].filter((id) => !inventory.spoolById(id) && !inventory.isSpoolUncertain(id))
+			? [...selected].filter((id) => {
+					if (inventory.isSpoolUncertain(id)) return false;
+					const spool = inventory.spoolById(id);
+					const filament = spool && inventory.filamentById(spool.filamentId);
+					return !spool || !filament || (!!filament.vendorId && !inventory.vendorById(filament.vendorId));
+				})
 			: []
 	);
 
@@ -348,7 +354,13 @@
 			jobBindings.every(({ spool }, index) => {
 				if (!spool || inventory.isSpoolUncertain(spool.id)) return false;
 				const current = inventory.spoolById(spool.id);
-				return !!current && labelBindingSnapshot(bindingFor(current)) === snapshots[index];
+				if (!current) return false;
+				const binding = bindingFor(current);
+				return (
+					!!binding.filament &&
+					(!binding.filament.vendorId || !!binding.vendor) &&
+					labelBindingSnapshot(binding) === snapshots[index]
+				);
 			});
 	}
 

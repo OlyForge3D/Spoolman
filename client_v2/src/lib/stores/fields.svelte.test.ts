@@ -126,7 +126,7 @@ describe('required field definitions', () => {
 		expect(fields.failedEntities()).not.toContain('spool');
 	});
 
-	it('refetches when a delayed save response follows a newer definition load', async () => {
+	it('blocks required reads until an overlapping mutation and its refresh finish', async () => {
 		const requests: { method: string; respond: (response: Response) => void }[] = [];
 		vi.stubGlobal(
 			'fetch',
@@ -137,15 +137,21 @@ describe('required field definitions', () => {
 		);
 		const local = { key: 'local', entity_type: 'vendor', name: 'Local', order: 0, field_type: 'text' };
 		const remote = { key: 'remote', entity_type: 'vendor', name: 'Remote', order: 1, field_type: 'text' };
-		const saved = fields.save('vendor', 'local', { name: 'Local', order: 0, field_type: FieldType.text });
 		const loaded = fields.loadRequired('vendor');
-		requests[1].respond(Response.json([local, remote]));
+		const saved = fields.save('vendor', 'local', { name: 'Local', order: 0, field_type: FieldType.text });
+		const required = fields.loadRequired('vendor');
+		expect(fields.isLoaded('vendor')).toBe(false);
+		requests[0].respond(Response.json([remote]));
 		await loaded;
-		expect(fields.get('vendor').map((field) => field.key)).toEqual(['local', 'remote']);
-		requests[0].respond(Response.json([local]));
-		await vi.waitFor(() => expect(requests.map((request) => request.method)).toEqual(['POST', 'GET', 'GET']));
+		expect(fields.isLoaded('vendor')).toBe(false);
+		requests[1].respond(Response.json([local]));
+		await vi.waitFor(() => expect(requests.map((request) => request.method)).toEqual(['GET', 'POST', 'GET']));
 		requests[2].respond(Response.json([local, remote]));
 		await saved;
+		await vi.waitFor(() => expect(requests).toHaveLength(4));
+		requests[3].respond(Response.json([local, remote]));
+		await required;
+		expect(fields.isLoaded('vendor')).toBe(true);
 		expect(fields.get('vendor').map((field) => field.key)).toEqual(['local', 'remote']);
 	});
 });

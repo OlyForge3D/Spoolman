@@ -140,7 +140,25 @@ export function renameLayoutGroup(
 
 /** Re-read persisted layout after navigation before applying a completed rename. */
 export async function renameSavedGroup(field: string, oldKey: string, newKey: string): Promise<void> {
-	await serialize(async () => {
+	const write = serialize(async () => {
+		for (const queued of queuedGroups) {
+			if (queued.field === field)
+				queued.order = renameLayoutGroup(
+					{ groups: { [field]: queued.order }, spoolOrders: {} },
+					field,
+					oldKey,
+					newKey
+				).groups[field];
+		}
+		for (const queued of queuedSpoolOrders) {
+			if (queued.field === field)
+				queued.orders = renameLayoutGroup(
+					{ groups: {}, spoolOrders: { [field]: queued.orders } },
+					field,
+					oldKey,
+					newKey
+				).spoolOrders[field];
+		}
 		const current = await loadLayout();
 		const renamed = renameLayoutGroup(current, field, oldKey, newKey);
 		const writes: { kind: 'groups' | 'orders'; promise: Promise<void> }[] = [];
@@ -150,34 +168,15 @@ export async function renameSavedGroup(field: string, oldKey: string, newKey: st
 			writes.push({ kind: 'orders', promise: setSetting('dashboard_spoolorders', renamed.spoolOrders) });
 		const results = await Promise.allSettled(writes.map((write) => write.promise));
 		if (writes.length) writeRevision++;
-		const savedGroups = !writes.some(
-			(write, index) => write.kind === 'groups' && results[index].status === 'rejected'
-		);
-		const savedOrders = !writes.some(
-			(write, index) => write.kind === 'orders' && results[index].status === 'rejected'
-		);
-		for (const queued of queuedGroups) {
-			if (savedGroups && queued.field === field)
-				queued.order = renameLayoutGroup(
-					{ groups: { [field]: queued.order }, spoolOrders: {} },
-					field,
-					oldKey,
-					newKey
-				).groups[field];
-		}
-		for (const queued of queuedSpoolOrders) {
-			if (savedOrders && queued.field === field)
-				queued.orders = renameLayoutGroup(
-					{ groups: {}, spoolOrders: { [field]: queued.orders } },
-					field,
-					oldKey,
-					newKey
-				).spoolOrders[field];
-		}
 		const failed = results.find((result) => result.status === 'rejected');
 		if (failed?.status === 'rejected') throw failed.reason;
 	});
 	for (const listener of renameListeners) listener(field, oldKey, newKey);
+	try {
+		await write;
+	} finally {
+		for (const listener of renameListeners) listener(field, oldKey, newKey);
+	}
 }
 
 export function saveGroups(field: string, order: string[]): void {

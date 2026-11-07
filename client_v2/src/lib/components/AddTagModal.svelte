@@ -35,7 +35,7 @@
 	import { scanRelay } from '$lib/api/scanRelay';
 	import { scanner } from '$lib/stores/scanner.svelte';
 	import { inventory } from '$lib/stores/inventory.svelte';
-	import { spoolSource } from '$lib/api/spoolSource';
+	import { spoolSource, SpoolRenameUncertainError } from '$lib/api/spoolSource';
 	import { toasts } from '$lib/stores/toasts.svelte';
 	import { isAbortError } from '$lib/api/http';
 	import { nfcSupported, readTagUid, NfcError, type NfcErrorReason } from '$lib/utils/nfc';
@@ -240,8 +240,15 @@
 		}
 		busy = true;
 		error = null;
+		const destination = { ...target };
 		try {
-			await linkTag(target, value, format);
+			const link = () => {
+				if (destination.kind === 'spool' && inventory.isSpoolUncertain(Number(destination.id)))
+					throw new SpoolRenameUncertainError(undefined);
+				return linkTag(destination, value, format);
+			};
+			if (destination.kind === 'spool') await spoolSource.withSpoolWriteBarrier(async () => link());
+			else await link();
 			toasts.success(m['tags.added']());
 			close();
 		} catch (err) {
@@ -253,6 +260,8 @@
 				const holder = await fetchHolder(conflict.holder).catch(() => undefined);
 				lookup = holder ? { state: 'taken', holder } : { state: 'unknown' };
 				error = holder ? null : conflict.message;
+			} else if (err instanceof SpoolRenameUncertainError) {
+				error = m['spool.uncertainDetails']();
 			} else if (isBadUid(err)) {
 				lookup = { state: 'bad' };
 			} else {
@@ -280,21 +289,47 @@
 		}
 		busy = true;
 		error = null;
+		const destination = { ...target };
+		const source = holderTarget(from);
 		try {
-			await unlinkTag(holderTarget(from), value);
-			await linkTag(target, value, format);
+			const uncertain = () =>
+				(source.kind === 'spool' && inventory.isSpoolUncertain(Number(source.id))) ||
+				(destination.kind === 'spool' && inventory.isSpoolUncertain(Number(destination.id)));
+			const transfer = async () => {
+				if (uncertain()) throw new SpoolRenameUncertainError(undefined);
+				await unlinkTag(source, value);
+				if (uncertain()) {
+					lookup = { state: 'free' };
+					return false;
+				}
+				await linkTag(destination, value, format);
+				return true;
+			};
+			const moved =
+				source.kind === 'spool' || destination.kind === 'spool'
+					? await spoolSource.withSpoolWriteBarrier(transfer)
+					: await transfer();
+			if (!moved) {
+				error =
+					source.kind === 'spool' && destination.kind === 'spool'
+						? m['tags.modal.moveFailed']()
+						: m['tags.modal.moveFailedFilament']();
+				return;
+			}
 			toasts.success(
 				from.kind === 'spool'
 					? m['tags.moved']({ id: from.spool.id })
 					: m['tags.movedFromFilament']({ name: nameOf(from.filament) })
 			);
 			close();
-		} catch {
+		} catch (err) {
 			// "neither spool" is only the truth when both ends are spools.
 			error =
-				from.kind === 'spool' && target.kind === 'spool'
-					? m['tags.modal.moveFailed']()
-					: m['tags.modal.moveFailedFilament']();
+				err instanceof SpoolRenameUncertainError
+					? m['spool.uncertainDetails']()
+					: source.kind === 'spool' && destination.kind === 'spool'
+						? m['tags.modal.moveFailed']()
+						: m['tags.modal.moveFailedFilament']();
 		} finally {
 			busy = false;
 		}

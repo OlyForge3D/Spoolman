@@ -1,7 +1,7 @@
 import type { Extra, Spool } from '$lib/types';
 import type { GroupField } from '$lib/api/types';
 import { FieldType, type FieldDef } from '$lib/api/fields';
-import { spoolSource, type SpoolRenameResult } from '$lib/api/spoolSource';
+import { spoolSource, SpoolRenameUncertainError, type SpoolRenameResult } from '$lib/api/spoolSource';
 import { inventory } from '$lib/stores/inventory.svelte';
 import * as m from '$lib/paraglide/messages';
 
@@ -51,6 +51,8 @@ const LOCATION: DashboardField = {
 	valueOf: (s) => s.location,
 	withValue: (s, value) => ({ ...s, location: value }),
 	async assign(spool, value) {
+		if (spoolSource.isAmbiguousSpoolAssignment({ location: value }))
+			throw new SpoolRenameUncertainError(undefined);
 		inventory.patchSpool(spool.id, { location: value });
 		await spoolSource.saveSpool(spool.id, { location: value });
 	},
@@ -91,6 +93,8 @@ function extraField(def: FieldDef): DashboardField {
 		},
 		withValue: (spool, value) => ({ ...spool, extra: applied(spool.extra, value) }),
 		async assign(spool, value) {
+			if (spoolSource.isAmbiguousSpoolAssignment({ extra: { [def.key]: encode(value) } }))
+				throw new SpoolRenameUncertainError(undefined);
 			inventory.patchSpool(spool.id, { extra: applied(spool.extra, value) });
 			await spoolSource.saveSpool(spool.id, { extra: { [def.key]: encode(value) } });
 		},

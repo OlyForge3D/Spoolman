@@ -53,9 +53,17 @@
 				.catch((e) => console.error('Failed to load spools for preview', e));
 		}
 	});
-	const previewSpools = $derived(inventory.spools.filter((s) => !s.archived).sort((a, b) => a.id - b.id));
+	const previewSpoolIds = $derived(
+		[
+			...new Set([
+				...inventory.spools.filter((s) => !s.archived).map((s) => s.id),
+				...inventory.uncertainSpoolIds()
+			])
+		].sort((a, b) => a - b)
+	);
 	const previewFilaments = $derived([...inventory.filaments].sort((a, b) => a.name.localeCompare(b.name)));
 	function spoolLabel(s: Spool): string {
+		if (inventory.isSpoolUncertain(s.id)) return `#${s.id} · ${m['spool.uncertainShort']()}`;
 		const f = inventory.filamentById(s.filamentId);
 		const v = f ? inventory.vendorById(f.vendorId) : undefined;
 		return `#${s.id} · ${f ? `${v ? v.name + ' ' : ''}${f.name}` : m.unknown()}`;
@@ -222,8 +230,11 @@
 						<option value={f.id}>{filamentLabel(f)}</option>
 					{/each}
 				{:else}
-					{#each previewSpools as s (s.id)}
-						<option value={String(s.id)}>{spoolLabel(s)}</option>
+					{#each previewSpoolIds as id (id)}
+						{@const spool = inventory.spoolById(id)}
+						<option value={String(id)}
+							>{spool ? spoolLabel(spool) : `#${id} · ${m['spool.uncertainShort']()}`}</option
+						>
 					{/each}
 				{/if}
 			</select>

@@ -134,23 +134,25 @@ export async function unlinkTag(target: TagTarget, uid: string): Promise<void> {
  * reported to the user as an unknown tag.
  */
 export async function findTagHolder(uid: string, signal?: AbortSignal): Promise<TagHolder | undefined> {
+	let relationRevision = 0;
 	return readSpoolSnapshot(
-		() =>
-			Promise.all([
+		() => {
+			relationRevision = inventory.relationReadRevision();
+			return Promise.all([
 				getList('/spool', { tag: uid, allow_archived: 'true', limit: 1 }, signal),
 				getList('/filament', { tag: uid, limit: 1 }, signal)
-			]),
+			]);
+		},
 		([spools, filaments]) => {
 			const rawSpool = spools.items[0] as Json | undefined;
 			if (rawSpool) {
 				const spool = mapSpool(rawSpool);
-				return { kind: 'spool' as const, spool: cacheSpoolRead(rawSpool, spool) };
+				return { kind: 'spool' as const, spool: cacheSpoolRead(rawSpool, spool, relationRevision) };
 			}
 			const rawFilament = filaments.items[0] as Json | undefined;
 			if (rawFilament) {
-				if (rawFilament.vendor) inventory.upsertVendor(mapVendor(rawFilament.vendor));
-				const filament = mapFilament(rawFilament);
-				inventory.upsertFilament(filament);
+				if (rawFilament.vendor) inventory.cacheVendorRead(mapVendor(rawFilament.vendor), relationRevision);
+				const filament = inventory.cacheFilamentRead(mapFilament(rawFilament), relationRevision);
 				return { kind: 'filament' as const, filament };
 			}
 			return undefined;

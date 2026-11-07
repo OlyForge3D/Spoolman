@@ -354,6 +354,51 @@ test("a tag cannot be moved from an uncertain spool until its details are verifi
   }
 });
 
+test("a tag move stops after unlink if its spool becomes uncertain", async ({ page, request }) => {
+  const item = await createRenamedSpool(page, request);
+  const uid = randomBytes(4).toString("hex").toUpperCase();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  let unlinked!: () => void;
+  const unlinkReached = new Promise<void>((resolve) => (unlinked = resolve));
+  try {
+    expect((await request.post(`${API_BASE}/spool/${item.spoolId}/tag`, { data: { uid } })).ok()).toBeTruthy();
+    await item.renamed.locator(".chip").filter({ hasText: `#${item.spoolId}` }).click();
+    await page.locator(".insp").getByRole("link", { name: item.filamentName, exact: true }).first().click();
+    await page.locator(".insp").getByRole("button", { name: "Add tag" }).click();
+    const dialog = page.getByRole("dialog", { name: "Link a tag" });
+    await dialog.getByLabel("Tag UID").fill(uid);
+    const move = dialog.getByRole("button", { name: `Move it here from #${item.spoolId}` });
+    await expect(move).toBeEnabled();
+    await page.route(`**/api/v1/spool/${item.spoolId}/tag/**`, async (route) => {
+      if (route.request().method() !== "DELETE") return route.fallback();
+      const response = await route.fetch();
+      unlinked();
+      await gate;
+      await route.fulfill({ response });
+    });
+    await move.click();
+    await unlinkReached;
+    expect(
+      (await request.patch(`${API_BASE}/spool/${item.spoolId}`, { data: { location: unique("During unlink") } })).ok(),
+    ).toBeTruthy();
+    await expect(dialog.locator(".notice").filter({ hasText: "Spool details need refreshing" })).toBeVisible();
+    release();
+    await expect(dialog).toContainText("It may now be linked to nothing");
+    const filament = await (await request.get(`${API_BASE}/filament/${item.filamentId}`)).json();
+    expect(filament.tags.map((tag: { uid: string }) => tag.uid)).not.toContain(uid);
+    const spool = await (await request.get(`${API_BASE}/spool/${item.spoolId}`)).json();
+    expect(spool.tags.map((tag: { uid: string }) => tag.uid)).not.toContain(uid);
+  } finally {
+    release();
+    if (!page.isClosed()) {
+      await page.unrouteAll({ behavior: "wait" });
+      await page.close();
+    }
+    await deleteSpool(request, item);
+  }
+});
+
 test("a tag scan does not announce stale details while its spool is uncertain", async ({ page, request }) => {
   const item = await createRenamedSpool(page, request);
   const uid = randomBytes(4).toString("hex").toUpperCase();
@@ -622,7 +667,7 @@ test("uncertain spools cannot be previewed, printed, or exported without losing 
     ).toBeTruthy();
     warning = page.locator(".print-panel .notice").filter({ hasText: "Spool details need refreshing" });
     await expect(warning).toBeVisible();
-    await expect(selected).toBeChecked();
+    await expect(page.getByRole("checkbox", { name: new RegExp(`#${item.spoolId} · Needs refresh`) })).toBeChecked();
     await expect(page.getByRole("button", { name: "Print 1 label", exact: true })).toBeDisabled();
     await page.getByRole("button", { name: "Files", exact: true }).click();
     await expect(page.getByRole("button", { name: "Save as PNG", exact: true })).toBeDisabled();

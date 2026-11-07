@@ -269,6 +269,10 @@
 
 	function set(patch: Partial<Spool>) {
 		if (!canEdit()) return Promise.resolve(false);
+		if (spoolSource.isAmbiguousSpoolAssignment(patch)) {
+			toasts.error(m['spool.ambiguousAssignment']());
+			return Promise.resolve(false);
+		}
 		const result = saver.push(spool.id, patch);
 		inventory.patchSpool(spool.id, patch);
 		return result;
@@ -312,6 +316,10 @@
 
 	function setExtra(key: string, value: string | undefined) {
 		if (!canEdit()) return Promise.resolve(false);
+		if (spoolSource.isAmbiguousSpoolAssignment({ extra: { [key]: value ?? null } })) {
+			toasts.error(m['spool.ambiguousAssignment']());
+			return Promise.resolve(false);
+		}
 		return extraSaver.change(key, value);
 	}
 

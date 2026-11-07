@@ -8,9 +8,12 @@ import type { Spool } from '$lib/types';
 // dragging onto the unassigned card (issue #1019).
 
 const saveSpool = vi.fn();
+const isAmbiguousSpoolAssignment = vi.fn<(patch: unknown) => boolean>(() => false);
 vi.mock('$lib/api/spoolSource', () => ({
+	SpoolRenameUncertainError: class extends Error {},
 	spoolSource: {
 		saveSpool: (...args: unknown[]) => saveSpool(...args),
+		isAmbiguousSpoolAssignment: (patch: unknown) => isAmbiguousSpoolAssignment(patch),
 		renameFieldValue: vi.fn()
 	}
 }));
@@ -56,5 +59,12 @@ describe('dashboard extra field', () => {
 		saveSpool.mockClear();
 		await f.assign(spool({}), 'Prusa');
 		expect(saveSpool).toHaveBeenCalledWith(7, { extra: { printer: '"Prusa"' } });
+	});
+
+	it('rejects an ambiguous destination before updating or saving the spool', async () => {
+		isAmbiguousSpoolAssignment.mockReturnValueOnce(true);
+		saveSpool.mockClear();
+		await expect(printerField().assign(spool({}), 'Prusa')).rejects.toThrow();
+		expect(saveSpool).not.toHaveBeenCalled();
 	});
 });

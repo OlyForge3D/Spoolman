@@ -75,7 +75,8 @@ describe('saved layout writes', () => {
 				location: { new: [1, 2] },
 				material: { PETG: [4], PLA: [3] }
 			});
-			expect(listener).toHaveBeenCalledExactlyOnceWith('location', 'old', 'new');
+			expect(listener).toHaveBeenCalledTimes(2);
+			expect(listener).toHaveBeenCalledWith('location', 'old', 'new');
 		} finally {
 			unsubscribe();
 		}
@@ -119,6 +120,53 @@ describe('saved layout writes', () => {
 				material: { PLA: [9] }
 			})
 		);
+	});
+
+	it('updates listeners and rebases queued writes when only part of a rename is saved', async () => {
+		const { state } = mockSettings();
+		const listener = vi.fn();
+		const unsubscribe = observeLayoutRenames(listener);
+		let failed = false;
+		vi.mocked(settings.setSetting).mockImplementation(async (key, value) => {
+			if (key === 'dashboard_spoolorders' && !failed) {
+				failed = true;
+				throw new Error('orders failed');
+			}
+			state[key] = value;
+		});
+		try {
+			const rename = renameSavedGroup('location', 'old', 'new');
+			saveGroups('location', ['old', 'added']);
+			saveSpoolOrders('location', { old: [1, 2], added: [4] });
+			await expect(rename).rejects.toThrow('orders failed');
+			expect(listener).toHaveBeenCalledTimes(2);
+			expect(listener).toHaveBeenCalledWith('location', 'old', 'new');
+			await vi.waitFor(() => {
+				expect(state.dashboard_groups).toEqual({ location: ['new', 'added'], material: ['PLA'] });
+				expect(state.dashboard_spoolorders).toEqual({
+					location: { new: [1, 2], added: [4] },
+					material: { PLA: [3] }
+				});
+			});
+		} finally {
+			unsubscribe();
+		}
+	});
+
+	it('rebases queued writes even when the rename cannot load the layout', async () => {
+		const { state } = mockSettings();
+		vi.mocked(settings.getSettings).mockRejectedValueOnce(new Error('load failed'));
+		const rename = renameSavedGroup('location', 'old', 'new');
+		saveGroups('location', ['old', 'added']);
+		saveSpoolOrders('location', { old: [1, 2], added: [4] });
+		await expect(rename).rejects.toThrow('load failed');
+		await vi.waitFor(() => {
+			expect(state.dashboard_groups).toEqual({ location: ['new', 'added'], material: ['PLA'] });
+			expect(state.dashboard_spoolorders).toEqual({
+				location: { new: [1, 2], added: [4] },
+				material: { PLA: [3] }
+			});
+		});
 	});
 
 	it('rebases queued group and spool-order snapshots over an earlier rename', async () => {

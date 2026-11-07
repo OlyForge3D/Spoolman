@@ -154,7 +154,9 @@
 
 	function set(patch: Partial<Filament>) {
 		inventory.patchFilament(filament.id, patch);
-		return saver.push(filament.id, patch);
+		const pending = saver.push(filament.id, patch);
+		inventory.trackRelationWrite('filament', filament.id, pending);
+		return pending;
 	}
 
 	// A GTIN is stored normalized and the API refuses anything that isn't a whole, valid
@@ -180,6 +182,18 @@
 		() => filament.extra
 	);
 	$effect(() => () => extraSaver.flush());
+	$effect(() =>
+		inventory.observeRelationDrafts(() => {
+			saver.flush();
+			extraSaver.flush();
+		})
+	);
+
+	function setExtra(key: string, value: string | undefined) {
+		const pending = extraSaver.change(key, value);
+		inventory.trackRelationWrite('filament', filament.id, pending);
+		return pending;
+	}
 
 	// --- delete -------------------------------------------------------------
 
@@ -515,7 +529,7 @@
 				</Field>
 			</FieldGrid>
 
-			<ExtraFieldsSection entity="filament" extra={filament.extra} onchange={extraSaver.change} manage />
+			<ExtraFieldsSection entity="filament" extra={filament.extra} onchange={setExtra} manage />
 
 			<TagsSection kind="filament" id={filament.id} tags={filament.tags} />
 		</div>

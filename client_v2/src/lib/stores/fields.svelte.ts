@@ -6,6 +6,7 @@ import {
 	type FieldDef,
 	type FieldParams
 } from '$lib/api/fields';
+import { SvelteSet } from 'svelte/reactivity';
 
 // Reactive cache of extra-field definitions per entity type. Loaded on demand
 // (inspectors) and by the settings manager; refetched after mutations.
@@ -21,6 +22,8 @@ class Fields {
 	private defs = $state<Record<EntityType, FieldDef[]>>({ spool: [], filament: [], vendor: [] });
 	private readonly loading = new Map<EntityType, Promise<void>>();
 	private readonly revisions: Record<EntityType, number> = { spool: 0, filament: 0, vendor: 0 };
+	private readonly mutations = new Map<EntityType, Set<Promise<void>>>();
+	private mutating = $state<Record<EntityType, number>>({ spool: 0, filament: 0, vendor: 0 });
 	// Reactive so views can wait for the definitions rather than render against an
 	// empty list and then rearrange themselves once they arrive.
 	private loaded = $state<EntityType[]>([]);
@@ -32,7 +35,7 @@ class Fields {
 
 	/** Whether this entity's definitions are in hand — an empty list is a real answer. */
 	isLoaded(entity: EntityType): boolean {
-		return this.loaded.includes(entity);
+		return this.loaded.includes(entity) && !this.failed.includes(entity) && this.mutating[entity] === 0;
 	}
 
 	failedEntities(): EntityType[] {
@@ -45,6 +48,11 @@ class Fields {
 	}
 
 	async loadRequired(entity: EntityType) {
+		while (this.mutations.get(entity)?.size) await Promise.allSettled([...this.mutations.get(entity)!]);
+		await this.loadNow(entity);
+	}
+
+	private async loadNow(entity: EntityType) {
 		let pending = this.loading.get(entity);
 		if (!pending) {
 			const controller = new AbortController();
@@ -117,19 +125,39 @@ class Fields {
 				if (this.loading.get(entity) === pending) this.loading.delete(entity);
 			}
 		}
-		await this.loadRequired(entity);
+		await this.loadNow(entity);
 	}
 
-	async save(entity: EntityType, key: string, params: FieldParams) {
+	private mutate(entity: EntityType, action: () => Promise<FieldDef[]>): Promise<void> {
 		const revision = this.revisions[entity];
-		const list = await setField(entity, key, params);
-		await this.finishMutation(entity, revision, list);
+		this.mutating = { ...this.mutating, [entity]: this.mutating[entity] + 1 };
+		const operation = (async () => {
+			let list: FieldDef[];
+			try {
+				list = await action();
+			} catch (error) {
+				this.loaded = this.loaded.filter((loaded) => loaded !== entity);
+				if (!this.failed.includes(entity)) this.failed = [...this.failed, entity];
+				throw error;
+			}
+			await this.finishMutation(entity, revision, list);
+		})();
+		const pending = operation.finally(() => {
+			this.mutations.get(entity)?.delete(pending);
+			this.mutating = { ...this.mutating, [entity]: this.mutating[entity] - 1 };
+		});
+		const mutations = this.mutations.get(entity) ?? new SvelteSet<Promise<void>>();
+		mutations.add(pending);
+		this.mutations.set(entity, mutations);
+		return pending;
 	}
 
-	async remove(entity: EntityType, key: string) {
-		const revision = this.revisions[entity];
-		const list = await deleteField(entity, key);
-		await this.finishMutation(entity, revision, list);
+	save(entity: EntityType, key: string, params: FieldParams) {
+		return this.mutate(entity, () => setField(entity, key, params));
+	}
+
+	remove(entity: EntityType, key: string) {
+		return this.mutate(entity, () => deleteField(entity, key));
 	}
 }
 

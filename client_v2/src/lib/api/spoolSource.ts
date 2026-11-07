@@ -39,7 +39,7 @@ import { type ExternalFilament } from './external';
 import { searchAll } from './search';
 import { loadLayout } from '$lib/dashboard/layout';
 import { withExtraDefaults } from '$lib/utils/extraDefaults';
-import { cacheSpoolRead } from './cacheSpoolRead';
+import { cacheSpoolRead, cacheSpoolRelations } from './cacheSpoolRead';
 import {
 	isCurrentSpoolRead,
 	noteSpoolRename,
@@ -202,14 +202,14 @@ function swallow404(e: unknown): null {
 	throw e;
 }
 
-function cacheMappedSpools(raw: unknown[], spools: Spool[]): void {
+function cacheMappedSpools(raw: unknown[], spools: Spool[], revision: number): void {
 	for (const [index, spool] of spools.entries())
-		spools[index] = cacheSpoolRead((raw as Json[])[index], spool);
+		spools[index] = cacheSpoolRead((raw as Json[])[index], spool, revision);
 }
 
-function cacheSpools(raw: unknown[]): Spool[] {
+function cacheSpools(raw: unknown[], revision: number): Spool[] {
 	const spools = (raw as Json[]).map(mapSpool);
-	cacheMappedSpools(raw, spools);
+	cacheMappedSpools(raw, spools, revision);
 	return spools;
 }
 
@@ -282,6 +282,7 @@ class HttpSpoolSource {
 	}
 
 	private refreshEventSpool(id: number) {
+		for (const field of inventory.uncertainSpoolFields(id)) inventory.markSpoolUncertain(id, field);
 		this.eventRefreshGenerations.set(id, (this.eventRefreshGenerations.get(id) ?? 0) + 1);
 		this.eventFullRefreshNeeded.add(id);
 		this.enqueueEventRefresh(id);
@@ -317,7 +318,10 @@ class HttpSpoolSource {
 	}
 
 	ingestLiveEvent(event: LiveEvent): void {
-		if (event.resource === 'spool' && event.type === 'deleted') this.spoolDeletionRevision++;
+		if (event.resource === 'spool' && event.type === 'deleted') {
+			this.spoolDeletionRevision++;
+			this.eventFullRefreshNeeded.delete(Number(event.id));
+		}
 		const spool =
 			event.resource === 'spool' && event.type !== 'deleted' && event.payload
 				? mapSpool(event.payload)
@@ -339,6 +343,22 @@ class HttpSpoolSource {
 		return true;
 	}
 
+	/** Assigning an ambiguous source can race with a disconnected bulk rename. */
+	isAmbiguousSpoolAssignment(patch: SpoolPatch): boolean {
+		return this.ambiguousRenames.some(({ field, value }) => {
+			if (field === 'location') return 'location' in patch && (patch.location ?? '') === value;
+			if (!field.startsWith('extra.') || !patch.extra) return false;
+			const raw = patch.extra[field.slice('extra.'.length)];
+			if (raw == null) return false;
+			try {
+				return JSON.parse(raw) === value;
+			} catch (error) {
+				console.warn('Invalid spool extra field in assignment', error);
+				return false;
+			}
+		});
+	}
+
 	// Full write responses replace the cached entity, so writes to the same
 	// entity must land in order, even when they come from different controls.
 	private write<T>(key: string, action: () => Promise<T>): Promise<T> {
@@ -354,6 +374,12 @@ class HttpSpoolSource {
 			throw error;
 		});
 		this.pendingWrites.set(key, lane);
+		const relationKind = key.startsWith('filament:')
+			? 'filament'
+			: key.startsWith('vendor:')
+				? 'vendor'
+				: undefined;
+		if (relationKind) inventory.trackRelationWrite(relationKind, key.slice(relationKind.length + 1), lane);
 		const clear = () => {
 			if (this.pendingWrites.get(key) === lane) this.pendingWrites.delete(key);
 		};
@@ -382,6 +408,11 @@ class HttpSpoolSource {
 		};
 		void barrier.then(clear, clear);
 		return result;
+	}
+
+	/** Keep multi-request spool operations ordered with renames and verification. */
+	withSpoolWriteBarrier<T>(action: () => Promise<T>): Promise<T> {
+		return this.writeSpools(action);
 	}
 
 	private schedule<T>(dependencies: Promise<unknown>[], action: () => Promise<T>) {
@@ -419,15 +450,19 @@ class HttpSpoolSource {
 		};
 		applyFilters(params, query.filters);
 
+		let relationRevision = 0;
 		return readSpoolSnapshot(
-			() => getList('/spool/group', params, query.signal),
+			() => {
+				relationRevision = inventory.relationReadRevision();
+				return getList('/spool/group', params, query.signal);
+			},
 			({ items, total, totalSpools, totalRemaining }) => {
 				for (const g of items as Json[]) {
 					if (g.filament) {
-						inventory.upsertFilament(mapFilament(g.filament));
-						if (g.filament.vendor) inventory.upsertVendor(mapVendor(g.filament.vendor));
+						inventory.cacheFilamentRead(mapFilament(g.filament), relationRevision);
+						if (g.filament.vendor) inventory.cacheVendorRead(mapVendor(g.filament.vendor), relationRevision);
 					}
-					if (g.vendor) inventory.upsertVendor(mapVendor(g.vendor));
+					if (g.vendor) inventory.cacheVendorRead(mapVendor(g.vendor), relationRevision);
 				}
 				return { items: (items as Json[]).map(mapGroup), total, totalSpools, totalRemaining };
 			},
@@ -445,8 +480,12 @@ class HttpSpoolSource {
 		applyFilters(params, query.filters);
 		scopeParams(params, query.groupScope);
 
+		let relationRevision = 0;
 		return readSpoolSnapshot(
-			() => getList('/spool', params, query.signal),
+			() => {
+				relationRevision = inventory.relationReadRevision();
+				return getList('/spool', params, query.signal);
+			},
 			({ items, total }, revision) => {
 				const spools = (items as Json[]).map(mapSpool);
 				const isCurrent = () => isCurrentSpoolRead(revision);
@@ -456,7 +495,7 @@ class HttpSpoolSource {
 					isCurrent,
 					commit: () => {
 						if (!isCurrent()) return false;
-						cacheMappedSpools(items, spools);
+						cacheMappedSpools(items, spools, relationRevision);
 						return true;
 					}
 				};
@@ -477,16 +516,16 @@ class HttpSpoolSource {
 	async listFilamentPage(
 		query: Pick<SpoolQuery, 'sort' | 'limit' | 'offset' | 'signal'>
 	): Promise<Page<Filament>> {
+		const revision = inventory.relationReadRevision();
 		const { items, total } = await getList(
 			'/filament',
 			{ sort: sortParam(query.sort), limit: query.limit, offset: query.offset },
 			query.signal
 		);
 		const filaments = (items as Json[]).map((f) => {
-			if (f.vendor) inventory.upsertVendor(mapVendor(f.vendor));
-			return mapFilament(f);
+			if (f.vendor) inventory.cacheVendorRead(mapVendor(f.vendor), revision);
+			return inventory.cacheFilamentRead(mapFilament(f), revision);
 		});
-		inventory.upsertFilaments(filaments);
 		return { items: filaments, total };
 	}
 
@@ -507,12 +546,12 @@ class HttpSpoolSource {
 			// No query yet: browse a slice of the catalog (sorted by name) so the
 			// picker has something to show as soon as it opens.
 			const params: QueryParams = { limit, sort: 'name:asc' };
+			const revision = inventory.relationReadRevision();
 			const items = await getJson<Json[]>('/filament', params);
 			const filaments = items.map((f) => {
-				if (f.vendor) inventory.upsertVendor(mapVendor(f.vendor));
-				return mapFilament(f);
+				if (f.vendor) inventory.cacheVendorRead(mapVendor(f.vendor), revision);
+				return inventory.cacheFilamentRead(mapFilament(f), revision);
 			});
-			inventory.upsertFilaments(filaments);
 			return filaments;
 		}
 		// Reuse the cross-entity /search backend that powers the library search bar,
@@ -543,12 +582,11 @@ class HttpSpoolSource {
 	 */
 	async importExternalFilament(ext: ExternalFilament): Promise<Filament> {
 		// Already imported?
+		const existingRevision = inventory.relationReadRevision();
 		const existing = await getJson<Json[]>('/filament', { external_id: quote(ext.id) });
 		if (existing.length) {
-			if (existing[0].vendor) inventory.upsertVendor(mapVendor(existing[0].vendor));
-			const f = mapFilament(existing[0]);
-			inventory.upsertFilament(f);
-			return f;
+			if (existing[0].vendor) inventory.cacheVendorRead(mapVendor(existing[0].vendor), existingRevision);
+			return inventory.cacheFilamentRead(mapFilament(existing[0]), existingRevision);
 		}
 
 		const defaults = async (entity: 'filament' | 'vendor'): Promise<Extra> => {
@@ -559,9 +597,10 @@ class HttpSpoolSource {
 
 		// Match the vendor by external_id first, then by name.
 		let vendorId: number | undefined;
+		const vendorRevision = inventory.relationReadRevision();
 		const vendors = await getJson<Json[]>('/vendor', { external_id: quote(ext.manufacturer) });
 		if (vendors.length) {
-			inventory.upsertVendor(mapVendor(vendors[0]));
+			inventory.cacheVendorRead(mapVendor(vendors[0]), vendorRevision);
 			vendorId = vendors[0].id;
 		} else {
 			vendorId = await this.getOrCreateVendor(ext.manufacturer, () => defaults('vendor'), ext.manufacturer);
@@ -606,10 +645,11 @@ class HttpSpoolSource {
 	): Promise<number | undefined> {
 		const trimmed = name.trim();
 		if (!trimmed) return undefined;
+		const revision = inventory.relationReadRevision();
 		const all = await getJson<Json[]>('/vendor');
 		const match = all.find((v) => (v.name ?? '').toLowerCase() === trimmed.toLowerCase());
 		if (match) {
-			inventory.upsertVendor(mapVendor(match));
+			inventory.cacheVendorRead(mapVendor(match), revision);
 			return match.id;
 		}
 		const newExtra = typeof extra === 'function' ? await extra() : extra;
@@ -657,19 +697,19 @@ class HttpSpoolSource {
 	 * pickers fetch it whole and filter it in the browser.
 	 */
 	async listVendors(signal?: AbortSignal): Promise<Vendor[]> {
+		const revision = inventory.relationReadRevision();
 		const items = await getJson<Json[]>('/vendor', {}, signal);
-		const vendors = items.map(mapVendor);
-		inventory.upsertVendors(vendors);
+		const vendors = items.map((item) => inventory.cacheVendorRead(mapVendor(item), revision));
 		return vendors.sort((a, b) => a.name.localeCompare(b.name));
 	}
 
 	async listFilamentsByVendor(vendorId: string): Promise<Filament[]> {
+		const revision = inventory.relationReadRevision();
 		const items = await getJson<Json[]>('/filament', { 'vendor.id': vendorId });
 		const filaments = items.map((f) => {
-			if (f.vendor) inventory.upsertVendor(mapVendor(f.vendor));
-			return mapFilament(f);
+			if (f.vendor) inventory.cacheVendorRead(mapVendor(f.vendor), revision);
+			return inventory.cacheFilamentRead(mapFilament(f), revision);
 		});
-		inventory.upsertFilaments(filaments);
 		return filaments;
 	}
 
@@ -681,33 +721,38 @@ class HttpSpoolSource {
 	// entity) resolves to undefined rather than throwing.
 
 	async fetchSpool(id: number, signal?: AbortSignal): Promise<Spool | undefined> {
+		let relationRevision = 0;
 		return readSpoolSnapshot(
-			() => getJson<Json | null>(`/spool/${id}`, {}, signal).catch(swallow404),
-			(s) => (s ? cacheSpools([s])[0] : undefined),
+			() => {
+				relationRevision = inventory.relationReadRevision();
+				return getJson<Json | null>(`/spool/${id}`, {}, signal).catch(swallow404);
+			},
+			(s) => (s ? cacheSpools([s], relationRevision)[0] : undefined),
 			signal
 		);
 	}
 	async fetchFilament(id: string, signal?: AbortSignal): Promise<Filament | undefined> {
+		const revision = inventory.relationReadRevision();
 		const f = await getJson<Json | null>(`/filament/${id}`, {}, signal).catch(swallow404);
 		if (!f) return undefined;
-		if (f.vendor) inventory.upsertVendor(mapVendor(f.vendor));
-		const filament = mapFilament(f);
-		inventory.upsertFilament(filament);
-		return filament;
+		if (f.vendor) inventory.cacheVendorRead(mapVendor(f.vendor), revision);
+		return inventory.cacheFilamentRead(mapFilament(f), revision);
 	}
 	async fetchVendor(id: string, signal?: AbortSignal): Promise<Vendor | undefined> {
+		const revision = inventory.relationReadRevision();
 		const v = await getJson<Json | null>(`/vendor/${id}`, {}, signal).catch(swallow404);
 		if (!v) return undefined;
-		const vendor = mapVendor(v);
-		inventory.upsertVendor(vendor);
-		return vendor;
+		return inventory.cacheVendorRead(mapVendor(v), revision);
 	}
 
 	// --- writes -------------------------------------------------------------
 
 	async saveSpool(id: number, patch: SpoolPatch): Promise<void> {
 		return this.write(`spool:${id}`, async () => {
+			if (this.isAmbiguousSpoolAssignment(patch)) throw new SpoolRenameUncertainError(undefined);
+			const relationRevision = inventory.relationReadRevision();
 			const updated = await patchJson<Json>(`/spool/${id}`, spoolPatchToApi(patch));
+			cacheSpoolRelations(updated, relationRevision);
 			inventory.upsertSpool(mapSpool(updated));
 		});
 	}
@@ -743,11 +788,12 @@ class HttpSpoolSource {
 	}
 	async saveFilament(id: string, patch: FilamentPatch): Promise<void> {
 		return this.write(`filament:${id}`, async () => {
+			const revision = inventory.relationReadRevision();
 			const updated = await patchJson<Json>(`/filament/${id}`, filamentPatchToApi(patch));
 			// The response embeds the manufacturer, which this patch may just have
 			// changed — cache it too, so a filament re-filed under one the cache has
 			// never seen resolves to a name rather than to nothing.
-			if (updated.vendor) inventory.upsertVendor(mapVendor(updated.vendor));
+			if (updated.vendor) inventory.cacheVendorRead(mapVendor(updated.vendor), revision);
 			inventory.upsertFilament(mapFilament(updated));
 		});
 	}
@@ -767,8 +813,11 @@ class HttpSpoolSource {
 			const spools: Spool[] = [];
 			for (let i = 0; i < count; i++) {
 				try {
+					if (this.isAmbiguousSpoolAssignment({ location: body.location ?? '', extra: body.extra }))
+						throw new SpoolRenameUncertainError(undefined);
+					const relationRevision = inventory.relationReadRevision();
 					const created = await postJson<Json>('/spool', body);
-					spools.push(cacheSpools([created])[0]);
+					spools.push(cacheSpools([created], relationRevision)[0]);
 				} catch (error) {
 					throw new SpoolBatchError(spools.length, error);
 				}
@@ -840,12 +889,12 @@ class HttpSpoolSource {
 	 * the chosen chip can render its label from the reactive store.
 	 */
 	async filamentOptions(): Promise<FilterOption[]> {
+		const revision = inventory.relationReadRevision();
 		const items = await getJson<Json[]>('/filament');
 		const filaments = items.map((f) => {
-			if (f.vendor) inventory.upsertVendor(mapVendor(f.vendor));
-			return mapFilament(f);
+			if (f.vendor) inventory.cacheVendorRead(mapVendor(f.vendor), revision);
+			return inventory.cacheFilamentRead(mapFilament(f), revision);
 		});
-		inventory.upsertFilaments(filaments);
 		// The label already carries the manufacturer, so the material is what's left
 		// to tell two same-named filaments apart; the colors are what the eye goes
 		// to first. Both are free here — this fetches whole filaments anyway.
@@ -885,9 +934,18 @@ class HttpSpoolSource {
 
 	private async refreshRenamedSpool(id: number, field: GroupField, signal: AbortSignal): Promise<boolean> {
 		for (let attempt = 0; attempt < 3;) {
-			const pending = [this.pendingWrites.get(`spool:${id}`), this.pendingSpoolBulk].filter(
-				(promise): promise is Promise<unknown> => promise !== undefined
-			);
+			const fullRefresh = this.eventFullRefreshNeeded.has(id);
+			const refreshRelations = fullRefresh || !inventory.spoolById(id);
+			if (refreshRelations) inventory.flushRelationDrafts();
+			const pending = [
+				this.pendingWrites.get(`spool:${id}`),
+				this.pendingSpoolBulk,
+				...(refreshRelations
+					? [...this.pendingWrites.entries()]
+							.filter(([key]) => key.startsWith('filament:') || key.startsWith('vendor:'))
+							.map(([, promise]) => promise)
+					: [])
+			].filter((promise): promise is Promise<unknown> => promise !== undefined);
 			if (pending.length) {
 				const settled = await new Promise<boolean>((resolve) => {
 					if (signal.aborted) {
@@ -907,7 +965,6 @@ class HttpSpoolSource {
 			}
 			const current = inventory.spoolById(id);
 			const uncertainty = inventory.spoolUncertainty(id, field);
-			const fullRefresh = this.eventFullRefreshNeeded.has(id);
 			const eventGeneration = this.eventRefreshGenerations.get(id);
 			const uncertainties = fullRefresh
 				? inventory.uncertainSpoolFields(id).map((uncertainField) => ({
@@ -920,6 +977,7 @@ class HttpSpoolSource {
 			if (!current && uncertainty === undefined && !fullRefresh) return true;
 			const revision = this.spoolBulkRevision;
 			const deletionRevision = this.spoolDeletionRevision;
+			const relationRevision = inventory.relationReadRevision();
 			attempt++;
 			const raw = await getJson<Json | null>(`/spool/${id}`, {}, signal).catch(swallow404);
 			if (
@@ -934,20 +992,18 @@ class HttpSpoolSource {
 			if (raw) {
 				const server = mapSpool(raw);
 				if (fullRefresh || !current) {
-					// Embedded relations may have newer optimistic edits of their own.
-					// Seed missing relations, but never replace an existing one here.
 					if (raw.filament) {
 						const filament = mapFilament(raw.filament);
-						if (!inventory.filamentById(filament.id) && !this.pendingWrites.has(`filament:${filament.id}`))
-							inventory.upsertFilament(filament);
-						if (raw.filament.vendor) {
-							const vendor = mapVendor(raw.filament.vendor);
-							if (!inventory.vendorById(vendor.id) && !this.pendingWrites.has(`vendor:${vendor.id}`))
-								inventory.upsertVendor(vendor);
-						}
+						const vendor = raw.filament.vendor ? mapVendor(raw.filament.vendor) : undefined;
+						if (
+							!inventory.canCacheRelation('filament', filament.id, relationRevision) ||
+							(vendor && !inventory.canCacheRelation('vendor', vendor.id, relationRevision))
+						)
+							continue;
+						inventory.cacheFilamentRead(filament, relationRevision);
+						if (vendor) inventory.cacheVendorRead(vendor, relationRevision);
 					}
 					inventory.upsertSpool(server);
-					this.eventFullRefreshNeeded.delete(id);
 				} else inventory.upsertSpool(withServerSpoolField(current, server, field));
 				let fieldStillPending = false;
 				for (const entry of uncertainties) {
@@ -959,6 +1015,7 @@ class HttpSpoolSource {
 					}
 				}
 				if (fieldStillPending) return false;
+				if (!inventory.isSpoolUncertain(id)) this.eventFullRefreshNeeded.delete(id);
 			} else {
 				inventory.removeSpool(id);
 				this.eventFullRefreshNeeded.delete(id);
@@ -1032,6 +1089,11 @@ class HttpSpoolSource {
 	 * members — and without leaving out the ones it never loaded.
 	 */
 	async renameFieldValue(field: GroupField, value: string, newValue: string): Promise<SpoolRenameResult> {
+		const assignment =
+			field === 'location'
+				? { location: newValue }
+				: { extra: { [field.slice('extra.'.length)]: JSON.stringify(newValue) } };
+		if (this.isAmbiguousSpoolAssignment(assignment)) throw new SpoolRenameUncertainError(undefined);
 		const inherited = new Set(inventory.uncertainSpoolIds());
 		for (const active of this.activeRenames) for (const id of active.candidates.keys()) inherited.add(id);
 		const active: ActiveRename = { field, value, candidates: new Map(), accepting: true };
@@ -1048,6 +1110,7 @@ class HttpSpoolSource {
 			let updated: number;
 			try {
 				updated = await this.writeSpools(async () => {
+					if (this.isAmbiguousSpoolAssignment(assignment)) throw new SpoolRenameUncertainError(undefined);
 					this.addRenameCandidates(matching());
 					sent = true;
 					this.spoolBulkRevision++;

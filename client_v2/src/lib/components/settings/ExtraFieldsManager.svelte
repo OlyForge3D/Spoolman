@@ -100,6 +100,7 @@
 	});
 
 	function startAdd() {
+		if (!fields.isLoaded(entity)) return;
 		isNew = true;
 		editing = true;
 		error = '';
@@ -200,6 +201,10 @@
 	async function save() {
 		error = '';
 		errorField = null;
+		if (!fields.isLoaded(entity)) {
+			error = m['fields.loadFailed']();
+			return;
+		}
 		if (!/^[a-z0-9_]+$/.test(key)) {
 			fail('key', m['settings.extraFields.errors.keyFormat']());
 			return;
@@ -457,7 +462,7 @@
 		</div>
 	</div>
 {:else}
-	<button class="add-btn" onclick={startAdd}
+	<button class="add-btn" onclick={startAdd} disabled={!fields.isLoaded(entity)}
 		><Plus size={14} /> {m['settings.extraFields.addEntityField']({ entity: entityLabel })}</button
 	>
 {/if}

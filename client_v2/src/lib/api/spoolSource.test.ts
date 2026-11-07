@@ -472,6 +472,54 @@ describe('entity write ordering', () => {
 		expect(inventory.isSpoolUncertain(lateId)).toBe(false);
 	});
 
+	it('rejects new assignments into an ambiguous rename source before sending a write', async () => {
+		const { fetch, requests } = controlledFetch();
+		const id = 88022;
+		inventory.upsertSpool(mapSpool({ id, location: 'Ambiguous assignment source' }));
+		const rename = spoolSource.renameFieldValue('location', 'Ambiguous assignment source', 'Destination');
+		const failure = expect(rename).rejects.toBeInstanceOf(SpoolRenameUncertainError);
+		requests[0].respond(new Response('{}', { status: 503 }));
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+		requests[1].respond(Response.json({ id, location: 'Ambiguous assignment source' }));
+		await failure;
+
+		expect(spoolSource.isAmbiguousSpoolAssignment({ location: 'Ambiguous assignment source' })).toBe(true);
+		await expect(
+			spoolSource.saveSpool(88023, { location: 'Ambiguous assignment source' })
+		).rejects.toBeInstanceOf(SpoolRenameUncertainError);
+		await expect(
+			spoolSource.renameFieldValue('location', 'Somewhere else', 'Ambiguous assignment source')
+		).rejects.toBeInstanceOf(SpoolRenameUncertainError);
+		expect(fetch).toHaveBeenCalledTimes(2);
+	});
+
+	it('retains the full refresh requirement while an ambiguous source is still pending', async () => {
+		const { fetch, requests } = controlledFetch();
+		const id = 88024;
+		inventory.upsertSpool(mapSpool({ id, location: 'Full retry source', comment: 'Original' }));
+		const rename = spoolSource.renameFieldValue('location', 'Full retry source', 'Full retry destination');
+		const failure = expect(rename).rejects.toBeInstanceOf(SpoolRenameUncertainError);
+		requests[0].respond(new Response('{}', { status: 503 }));
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+		requests[1].respond(Response.json({ id, location: 'Full retry source', comment: 'Original' }));
+		await failure;
+		spoolSource.ingestLiveEvent({
+			resource: 'spool',
+			type: 'updated',
+			id,
+			payload: { id, location: 'Full retry source', comment: 'Stale event' }
+		});
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(3));
+		requests[2].respond(Response.json({ id, location: 'Full retry source', comment: 'First read' }));
+		await vi.waitFor(() => expect(inventory.spoolById(id)?.comment).toBe('First read'));
+		const retry = spoolSource.refreshUncertainSpools([id]);
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(4));
+		requests[3].respond(Response.json({ id, location: 'Full retry destination', comment: 'Latest comment' }));
+		expect(await retry).toBe(true);
+		expect(inventory.spoolById(id)?.comment).toBe('Latest comment');
+		expect(inventory.isSpoolUncertain(id)).toBe(false);
+	});
+
 	it.each([400, 422])('releases candidates after a definite validation rejection: %s', async (status) => {
 		const { fetch, requests } = controlledFetch();
 		const id = 88011;
@@ -483,6 +531,46 @@ describe('entity write ordering', () => {
 		await failure;
 		expect(fetch).toHaveBeenCalledOnce();
 		expect(inventory.isSpoolUncertain(id)).toBe(false);
+	});
+
+	it('still verifies an event after its overlapping rename is rejected', async () => {
+		const { fetch, requests } = controlledFetch();
+		const id = 88027;
+		inventory.upsertSpool(mapSpool({ id, location: 'Rejected event source', comment: 'Before' }));
+		const rename = spoolSource.renameFieldValue('location', 'Rejected event source', 'Destination');
+		const failure = expect(rename).rejects.toMatchObject({ status: 422 });
+		spoolSource.ingestLiveEvent({
+			resource: 'spool',
+			type: 'updated',
+			id,
+			payload: { id, location: 'Rejected event source', comment: 'Event' }
+		});
+		requests[0].respond(new Response('{}', { status: 422 }));
+		await failure;
+		expect(inventory.isSpoolUncertain(id)).toBe(true);
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+		requests[1].respond(Response.json({ id, location: 'Rejected event source', comment: 'Verified' }));
+		await vi.waitFor(() => expect(inventory.isSpoolUncertain(id)).toBe(false));
+		expect(inventory.spoolById(id)?.comment).toBe('Verified');
+	});
+
+	it('waits for a spool operation before sending an overlapping bulk rename', async () => {
+		const { fetch, requests } = controlledFetch();
+		const id = 88028;
+		inventory.upsertSpool(mapSpool({ id, location: 'Tag barrier source' }));
+		let release!: () => void;
+		const hold = new Promise<void>((resolve) => (release = resolve));
+		const operation = spoolSource.withSpoolWriteBarrier(() => hold);
+		const rename = spoolSource.renameFieldValue('location', 'Tag barrier source', 'Tag barrier destination');
+		expect(inventory.isSpoolUncertain(id)).toBe(true);
+		expect(fetch).not.toHaveBeenCalled();
+		release();
+		await operation;
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+		requests[0].respond(Response.json({ spools_updated: 1 }));
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+		requests[1].respond(Response.json({ id, location: 'Tag barrier destination' }));
+		expect(await rename).toEqual({ updated: 1, cacheRefreshed: true });
 	});
 
 	it('rejects a staged page that became stale before commit', async () => {
@@ -746,7 +834,7 @@ describe('entity write ordering', () => {
 		expect(inventory.isSpoolUncertain(id)).toBe(false);
 	});
 
-	it('does not publish stale embedded relations or replace newer cached relations during verification', async () => {
+	it('ignores stale event relations and refreshes cached relations from the authoritative spool', async () => {
 		const { fetch, requests } = controlledFetch();
 		const id = 88014;
 		const rename = spoolSource.renameFieldValue('location', 'Relation old', 'Relation new');
@@ -776,8 +864,89 @@ describe('entity write ordering', () => {
 			})
 		);
 		await vi.waitFor(() => expect(inventory.isSpoolUncertain(id)).toBe(false));
-		expect(inventory.filamentById(String(id))?.name).toBe('Newer filament');
-		expect(inventory.vendorById(String(id))?.name).toBe('Newer vendor');
+		expect(inventory.filamentById(String(id))?.name).toBe('Server filament');
+		expect(inventory.vendorById(String(id))?.name).toBe('Server vendor');
+	});
+
+	it('does not overwrite a newer shared filament or vendor from an older spool page', async () => {
+		const { requests } = controlledFetch();
+		const id = 88025;
+		const list = spoolSource.listSpools({ filters: {}, sort: [], limit: 30, offset: 0, lowThreshold: 0 });
+		inventory.upsertFilament(mapFilament({ id, name: 'New filament', vendor: { id } }));
+		inventory.upsertVendor(mapVendor({ id, name: 'New vendor' }));
+		requests[0].respond(
+			Response.json([{ id, filament: { id, name: 'Old filament', vendor: { id, name: 'Old vendor' } } }])
+		);
+		await list;
+		expect(inventory.filamentById(String(id))?.name).toBe('New filament');
+		expect(inventory.vendorById(String(id))?.name).toBe('New vendor');
+	});
+
+	it('does not overwrite relation drafts with live spool, filament or vendor events', async () => {
+		const id = 88029;
+		inventory.upsertSpool(mapSpool({ id, filament: { id } }));
+		inventory.upsertFilament(mapFilament({ id, name: 'Draft filament', vendor: { id } }));
+		inventory.upsertVendor(mapVendor({ id, name: 'Draft vendor' }));
+		let release!: () => void;
+		const pending = new Promise<void>((resolve) => (release = resolve));
+		inventory.trackRelationWrite('filament', String(id), pending);
+		inventory.trackRelationWrite('vendor', String(id), pending);
+		const oldVendor = { id, name: 'Old vendor' };
+		const oldFilament = { id, name: 'Old filament', vendor: oldVendor };
+		spoolSource.ingestLiveEvent({
+			resource: 'spool',
+			type: 'updated',
+			id,
+			payload: { id, filament: oldFilament }
+		});
+		spoolSource.ingestLiveEvent({ resource: 'filament', type: 'updated', id, payload: oldFilament });
+		spoolSource.ingestLiveEvent({ resource: 'vendor', type: 'updated', id, payload: oldVendor });
+		expect(inventory.filamentById(String(id))?.name).toBe('Draft filament');
+		expect(inventory.vendorById(String(id))?.name).toBe('Draft vendor');
+		release();
+		await pending;
+	});
+
+	it('flushes a relation draft changed during verification before accepting its response', async () => {
+		const { fetch, requests } = controlledFetch();
+		const id = 88026;
+		const rename = spoolSource.renameFieldValue('location', 'Relation draft old', 'Relation draft new');
+		requests[0].respond(Response.json({ spools_updated: 0 }));
+		await rename;
+		inventory.upsertSpool(mapSpool({ id, location: 'Relation draft new', filament: { id } }));
+		inventory.upsertFilament(mapFilament({ id, name: 'Before' }));
+		spoolSource.ingestLiveEvent({
+			resource: 'spool',
+			type: 'updated',
+			id,
+			payload: { id, location: 'Relation draft old', filament: { id, name: 'Stale' } }
+		});
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+		const saver = makeSaver<string, { name: string }>((filamentId, patch) =>
+			spoolSource.saveFilament(filamentId, patch).then(() => true)
+		);
+		const stop = inventory.observeRelationDrafts(() => saver.flush());
+		try {
+			inventory.patchFilament(String(id), { name: 'Pending draft' });
+			const draft = saver.push(String(id), { name: 'Pending draft' });
+			inventory.trackRelationWrite('filament', String(id), draft);
+			requests[1].respond(
+				Response.json({ id, location: 'Relation draft new', filament: { id, name: 'Before' } })
+			);
+			await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(3));
+			expect(requests[2].init?.method).toBe('PATCH');
+			requests[2].respond(Response.json({ id, name: 'Pending draft' }));
+			expect(await draft).toBe(true);
+			await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(4));
+			requests[3].respond(
+				Response.json({ id, location: 'Relation draft new', filament: { id, name: 'Pending draft' } })
+			);
+			await vi.waitFor(() => expect(inventory.isSpoolUncertain(id)).toBe(false));
+			expect(inventory.filamentById(String(id))?.name).toBe('Pending draft');
+		} finally {
+			stop();
+			saver.cancel();
+		}
 	});
 
 	it('flushes an optimistic draft before a full event refresh and ignores overlapping list reads', async () => {
