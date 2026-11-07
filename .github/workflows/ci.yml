@@ -649,7 +649,7 @@ jobs:
         if: always()
         run: docker rm -f spoolman-smoke
   #
-  # Release images GHCR and Docker Hub if tests pass
+  # Publish to GHCR and, when configured, the secondary registry if tests pass.
   # Don't run this for pull requests
   #
   publish-images:
@@ -717,7 +717,18 @@ jobs:
             type=semver,pattern={{major}}
             type=ref,event=branch,enable=${{ github.ref_name != 'master' }}
 
+      - name: Configure secondary registry
+        id: remote-registry
+        env:
+          REMOTE_REGISTRY_URL: ${{ vars.REMOTE_REGISTRY_URL }}
+          REMOTE_REGISTRY_NAMESPACE: ${{ vars.REMOTE_REGISTRY_NAMESPACE }}
+          REMOTE_REGISTRY_REPOSITORY: ${{ vars.REMOTE_REGISTRY_REPOSITORY }}
+          REMOTE_REGISTRY_USERNAME: ${{ secrets.REMOTE_REGISTRY_USERNAME }}
+          REMOTE_REGISTRY_PASSWORD: ${{ secrets.REMOTE_REGISTRY_PASSWORD }}
+        run: bash scripts/configure-remote-registry.sh
+
       - name: Extract metadata (tags, labels) for Docker Hub
+        if: ${{ steps.remote-registry.outputs.enabled == 'true' }}
         id: meta-dh
         uses: docker/metadata-action@v5.5.1
         with:
@@ -730,6 +741,7 @@ jobs:
             type=semver,pattern={{major}}
 
       - name: Log in to DockerHub
+        if: ${{ steps.remote-registry.outputs.enabled == 'true' }}
         uses: docker/login-action@v3.3.0
         with:
           registry: ${{ vars.REMOTE_REGISTRY_URL }}
