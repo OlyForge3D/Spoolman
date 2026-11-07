@@ -37,7 +37,7 @@
 	import { classifyDeleteFailure } from '$lib/library/deletion';
 	import { toasts } from '$lib/stores/toasts.svelte';
 	import { makeSaver, makeExtraSaver } from '$lib/utils/saver';
-	import { trackSave } from '$lib/utils/autosave';
+	import { reportSaveError, trackSave } from '$lib/utils/autosave';
 	import { page } from '$app/state';
 	import { resolve } from '$app/paths';
 	import * as m from '$lib/paraglide/messages';
@@ -226,13 +226,21 @@
 	}
 	// Optimistic flip, then persist. The list filters archived spools out by
 	// default, so unarchiving from here is the only way back once one is hidden.
-	function toggleArchived() {
+	let archiving = $state(false);
+	async function toggleArchived() {
+		if (archiving) return;
+		const id = spool.id;
 		const next = !spool.archived;
-		inventory.patchSpool(spool.id, { archived: next });
-		spoolSource.setSpoolArchived(spool.id, next).catch((e) => {
-			inventory.patchSpool(spool.id, { archived: !next });
-			console.error('Archive toggle failed', e);
-		});
+		archiving = true;
+		inventory.patchSpool(id, { archived: next });
+		try {
+			await spoolSource.setSpoolArchived(id, next);
+		} catch (e) {
+			inventory.patchSpool(id, { archived: !next });
+			reportSaveError(e, 'Archive toggle failed', m['inspector.archiveFailed']());
+		} finally {
+			archiving = false;
+		}
 	}
 
 	function set(patch: Partial<Spool>) {
@@ -355,6 +363,7 @@
 			>
 			<Button
 				variant="outline"
+				disabled={archiving}
 				onclick={toggleArchived}
 				title={spool.archived ? m['buttons.unArchive']() : m['buttons.archive']()}
 			>
@@ -450,6 +459,7 @@
 						placeholder={m['library.noLocation']()}
 						options={locationOptions}
 						underline
+						protectDraft
 						oninput={(v) => set({ location: v })}
 					/>
 				</Field>

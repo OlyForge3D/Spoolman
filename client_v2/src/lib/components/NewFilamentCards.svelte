@@ -140,7 +140,9 @@
 			options={vendorNames}
 			placeholder={m['add.manufacturerPlaceholder']()}
 			invalid={!!err('vendor')}
-			oninput={(v) => (draft.vendorName = v)}
+			oninput={(v) => {
+				draft.vendorName = v;
+			}}
 		/>
 		{#if err('vendor')}
 			<span class="err">{err('vendor')}</span>

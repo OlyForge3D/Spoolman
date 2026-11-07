@@ -361,6 +361,7 @@
 						value={filament.material}
 						options={materialNames}
 						underline
+						protectDraft
 						oninput={(v) => set({ material: v })}
 					/>
 				</Field>

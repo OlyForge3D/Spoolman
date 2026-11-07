@@ -176,11 +176,35 @@ function cacheSpools(raw: unknown[]): Spool[] {
 	return spools;
 }
 
+function renameCachedSpoolValues(field: GroupField, value: string, newValue: string): void {
+	inventory.mapSpools((spool) => {
+		if (field === 'location' && spool.location === value) {
+			return { ...spool, location: newValue };
+		} else if (field.startsWith('extra.')) {
+			const key = field.slice('extra.'.length);
+			const raw = spool.extra[key];
+			if (raw === undefined) return spool;
+			let decoded: unknown;
+			try {
+				decoded = JSON.parse(raw);
+			} catch (error) {
+				console.warn(`Invalid cached spool extra field ${key}`, error);
+				return spool;
+			}
+			if (decoded === value) {
+				return { ...spool, extra: { ...spool.extra, [key]: JSON.stringify(newValue) } };
+			}
+		}
+		return spool;
+	});
+}
+
 const WRITE_WAIT_TIMEOUT_MS = 30_000;
 
 class HttpSpoolSource {
 	private readonly pendingWrites = new Map<string, Promise<unknown>>();
 	private pendingSpoolBulk: Promise<unknown> | undefined;
+	private nextSpoolCreation = 0;
 
 	// Full write responses replace the cached entity, so writes to the same
 	// entity must land in order, even when they come from different controls.
@@ -189,12 +213,18 @@ class HttpSpoolSource {
 		const dependencies = [previous, key.startsWith('spool:') ? this.pendingSpoolBulk : undefined].filter(
 			(promise): promise is Promise<unknown> => promise !== undefined
 		);
-		const { result, tail } = this.schedule(dependencies, action);
-		this.pendingWrites.set(key, tail);
+		const { result } = this.schedule(dependencies, action);
+		// An expired operation was never sent. Keep its own earlier write as the
+		// lane barrier, but do not keep an unrelated, expired bulk operation there.
+		const lane = result.catch((error: unknown) => {
+			if (error instanceof WriteQueueTimeoutError && previous) return previous;
+			throw error;
+		});
+		this.pendingWrites.set(key, lane);
 		const clear = () => {
-			if (this.pendingWrites.get(key) === tail) this.pendingWrites.delete(key);
+			if (this.pendingWrites.get(key) === lane) this.pendingWrites.delete(key);
 		};
-		void tail.then(clear, clear);
+		void lane.then(clear, clear);
 		return result;
 	}
 
@@ -205,12 +235,14 @@ class HttpSpoolSource {
 			.filter(([key]) => key.startsWith('spool:'))
 			.map(([, promise]) => promise);
 		if (this.pendingSpoolBulk) dependencies.push(this.pendingSpoolBulk);
-		const { result, tail } = this.schedule(dependencies, action);
-		this.pendingSpoolBulk = tail;
+		const { result } = this.schedule(dependencies, action);
+		// A timed-out bulk operation never reaches the server, so it must stop
+		// blocking unrelated spool lanes as soon as the timeout is reported.
+		this.pendingSpoolBulk = result;
 		const clear = () => {
-			if (this.pendingSpoolBulk === tail) this.pendingSpoolBulk = undefined;
+			if (this.pendingSpoolBulk === result) this.pendingSpoolBulk = undefined;
 		};
-		void tail.then(clear, clear);
+		void result.then(clear, clear);
 		return result;
 	}
 
@@ -544,8 +576,19 @@ class HttpSpoolSource {
 		});
 	}
 	async createSpool(body: Json): Promise<Spool> {
-		const created = await postJson<Json>('/spool', body);
-		return cacheSpools([created])[0];
+		return (await this.createSpools(body, 1))[0];
+	}
+	async createSpools(body: Json, count: number): Promise<Spool[]> {
+		if (!Number.isSafeInteger(count) || count < 1)
+			throw new RangeError('Spool count must be a positive integer');
+		return this.write(`spool:create:${++this.nextSpoolCreation}`, async () => {
+			const spools: Spool[] = [];
+			for (let i = 0; i < count; i++) {
+				const created = await postJson<Json>('/spool', body);
+				spools.push(cacheSpools([created])[0]);
+			}
+			return spools;
+		});
 	}
 
 	// --- deletes ------------------------------------------------------------
@@ -662,6 +705,7 @@ class HttpSpoolSource {
 					new_value: newValue
 				}
 			);
+			renameCachedSpoolValues(field, value, newValue);
 			return result.spools_updated;
 		});
 	}

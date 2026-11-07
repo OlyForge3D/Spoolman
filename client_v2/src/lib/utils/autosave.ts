@@ -10,6 +10,15 @@ import { HttpError, WriteQueueTimeoutError } from '$lib/api/http';
 import { toasts } from '$lib/stores/toasts.svelte';
 import * as m from '$lib/paraglide/messages';
 
+export function reportSaveError(error: unknown, context = 'Save failed', message?: string): void {
+	console.error(context, error);
+	const detail =
+		error instanceof WriteQueueTimeoutError
+			? m['notifications.writePending']()
+			: m['notifications.error']({ statusCode: error instanceof HttpError ? error.status : '?' });
+	toasts.error(message ? `${message} ${detail}` : detail);
+}
+
 /**
  * Report the outcome of an auto-save. Always resolves so fire-and-forget callers
  * do not produce unhandled rejections; the result lets inputs retain failed drafts.
@@ -23,12 +32,7 @@ export function trackSave(promise: Promise<unknown>, context = 'Save failed'): P
 			return true;
 		},
 		(e: unknown) => {
-			console.error(context, e);
-			toasts.error(
-				e instanceof WriteQueueTimeoutError
-					? m['notifications.writePending']()
-					: m['notifications.error']({ statusCode: e instanceof HttpError ? e.status : '?' })
-			);
+			reportSaveError(e, context);
 			return false;
 		}
 	);

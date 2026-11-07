@@ -24,6 +24,7 @@
 	import { toasts } from '$lib/stores/toasts.svelte';
 	import { weightAuto } from '$lib/utils/format';
 	import { parseDecimal } from '$lib/utils/numeric';
+	import { reportSaveError } from '$lib/utils/autosave';
 	import {
 		FILAMENT_ADVANCED_KEYS,
 		emptyFilamentDraft,
@@ -269,28 +270,39 @@
 			return;
 		}
 		busy = true;
+		let createdFilament = false;
 		try {
-			const filamentId = creating
-				? (
-						await spoolSource.createFilament({
-							...toNewFilamentDraft(nf, nfWeights, filamentExtra),
-							// Dropped when the typed name matches an existing manufacturer —
-							// which is also when the inputs for it aren't shown.
-							vendorExtra: vendorIsNew ? vendorExtra : undefined
-						})
-					).id
-				: chosen!.source === 'external'
-					? (await spoolSource.importExternalFilament(chosen!.ext)).id
-					: chosen!.filament.id;
+			const initial = weightDiffers && adoptWeight ? newWeight : undefined;
+			let filamentId: string;
+			if (creating) {
+				const draft = {
+					...toNewFilamentDraft(nf, nfWeights, filamentExtra),
+					// Only a newly created manufacturer receives these fields.
+					vendorExtra: vendorIsNew ? vendorExtra : undefined
+				};
+				const created = await spoolSource.createFilament(draft);
+				createdFilament = true;
+				filamentId = created.id;
+				chosen = { source: 'catalog', filament: created };
+				creating = false;
+			} else {
+				filamentId =
+					chosen!.source === 'external'
+						? (await spoolSource.importExternalFilament(chosen!.ext)).id
+						: chosen!.filament.id;
+			}
 			await spoolSource.saveSpool(spool.id, {
 				filamentId,
-				...(weightDiffers && adoptWeight ? { initial: newWeight } : {})
+				...(initial !== undefined ? { initial } : {})
 			});
 			toasts.success(m['changeFilament.done']());
 			onclose();
 		} catch (e) {
-			console.error('Failed to change spool filament', e);
-			toasts.error(m['changeFilament.failed']());
+			reportSaveError(
+				e,
+				'Failed to change spool filament',
+				createdFilament ? m['changeFilament.createdButFailed']() : m['changeFilament.failed']()
+			);
 			busy = false;
 		}
 	}

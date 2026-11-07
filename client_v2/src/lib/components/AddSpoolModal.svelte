@@ -21,6 +21,7 @@
 	import { roundGrams, weightAuto } from '$lib/utils/format';
 	import { numErr } from '$lib/utils/validate';
 	import { parseDecimal } from '$lib/utils/numeric';
+	import { reportSaveError } from '$lib/utils/autosave';
 	import {
 		FILAMENT_ADVANCED_KEYS,
 		FILAMENT_FIELD_ORDER,
@@ -56,6 +57,7 @@
 	let chosen = $state<Choice | null>(null);
 	let creating = $state(false);
 	let submitting = $state(false);
+	let createdForFlow: Filament | null = null;
 	let locations = $state<string[]>([]);
 	// The filament the current new-filament form was copied from, if any. Drives
 	// the "duplicate of X" heading, the rename nudge, and the extra-field carry-over.
@@ -273,6 +275,7 @@
 	}
 
 	function choose(c: Choice) {
+		createdForFlow = null;
 		creating = false;
 		cloneSource = null;
 		chosen = c;
@@ -286,6 +289,7 @@
 	}
 
 	function startCreate() {
+		createdForFlow = null;
 		creating = true;
 		cloneSource = null;
 		chosen = null;
@@ -311,6 +315,7 @@
 	 * with a nudge below the field until it's changed.
 	 */
 	function startDuplicate(f: Filament) {
+		createdForFlow = null;
 		creating = true;
 		cloneSource = f;
 		chosen = null;
@@ -331,6 +336,7 @@
 	}
 
 	function reset() {
+		createdForFlow = null;
 		step = 1;
 		query = '';
 		localResults = [];
@@ -359,34 +365,10 @@
 		}
 		submitting = true;
 		try {
-			let filamentId: number;
-			// Set when this submit created a filament, so "Add & new" can offer the
-			// next colour of it without going back through search.
-			let created: Filament | null = null;
-			if (creating) {
-				// Weight/spool weight/price come from the spool block: this flow writes
-				// each of them to both records.
-				const draft = {
-					...toNewFilamentDraft(nf, { weight: netWeight, spoolWeight, price }, filamentExtra),
-					// Dropped when the typed name matches an existing manufacturer —
-					// which is also when the inputs for it aren't shown.
-					vendorExtra: vendorIsNew ? vendorExtra : undefined
-				};
-				const f = await spoolSource.createFilament(draft);
-				created = f;
-				filamentId = Number(f.id);
-			} else if (chosen!.source === 'external') {
-				const imported = await spoolSource.importExternalFilament(chosen!.ext);
-				filamentId = Number(imported.id);
-			} else {
-				filamentId = Number(chosen!.filament.id);
-			}
-
 			const n = countN;
 			const net = parseDecimal(netWeight) ?? 0;
 			const spool = parseDecimal(spoolWeight) ?? 0;
 			const body: Record<string, unknown> = {
-				filament_id: filamentId,
 				initial_weight: parseDecimal(netWeight) ?? undefined,
 				spool_weight: parseDecimal(spoolWeight) ?? undefined,
 				price: parseDecimal(price) ?? undefined,
@@ -403,9 +385,39 @@
 				body.used_weight = roundGrams(Math.max(0, net + spool - (parseDecimal(fillWeight) ?? 0)));
 			if (firstUsed) body.first_used = firstUsed;
 			if (lastUsed) body.last_used = lastUsed;
-			if (Object.keys(extraValues).length) body.extra = extraValues;
+			if (Object.keys(extraValues).length) body.extra = { ...extraValues };
 
-			for (let i = 0; i < n; i++) await spoolSource.createSpool(body);
+			let filamentId: number;
+			// Set when this submit created a filament, so "Add & new" can offer the
+			// next colour of it without going back through search.
+			let created: Filament | null = null;
+			if (creating) {
+				// Weight/spool weight/price come from the spool block: this flow writes
+				// each of them to both records.
+				const draft = {
+					...toNewFilamentDraft(nf, { weight: netWeight, spoolWeight, price }, filamentExtra),
+					// Dropped when the typed name matches an existing manufacturer —
+					// which is also when the inputs for it aren't shown.
+					vendorExtra: vendorIsNew ? vendorExtra : undefined
+				};
+				const f = await spoolSource.createFilament(draft);
+				createdForFlow = f;
+				created = f;
+				filamentId = Number(f.id);
+				// It is now a catalog record, even if a later spool creation fails.
+				chosen = { source: 'catalog', filament: f };
+				creating = false;
+				cloneSource = null;
+			} else if (chosen!.source === 'external') {
+				const imported = await spoolSource.importExternalFilament(chosen!.ext);
+				filamentId = Number(imported.id);
+			} else {
+				filamentId = Number(chosen!.filament.id);
+				if (createdForFlow?.id === chosen!.filament.id) created = createdForFlow;
+			}
+
+			body.filament_id = filamentId;
+			await spoolSource.createSpools(body, n);
 			if (andAnother && created) {
 				// Just added a brand-new filament: the overwhelmingly likely next entry
 				// is a sibling of it (the multi-colour shopping trip this flow exists
@@ -419,7 +431,11 @@
 				close();
 			}
 		} catch (e) {
-			console.error('Failed to add spools', e);
+			reportSaveError(
+				e,
+				'Failed to add spools',
+				createdForFlow ? m['add.createdButFailed']() : m['add.failed']()
+			);
 			submitting = false;
 		}
 	}
@@ -782,7 +798,9 @@
 								value={location}
 								options={locations}
 								placeholder={m['add.locationPlaceholder']()}
-								oninput={(v) => (location = v)}
+								oninput={(v) => {
+									location = v;
+								}}
 							/>
 							<!-- Always-on rather than behind the ⓘ used elsewhere: "Location" reads as
 							     metadata until you're told it means the physical shelf, and testers

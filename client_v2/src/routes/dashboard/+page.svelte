@@ -16,6 +16,7 @@
 	import { truncTitle } from '$lib/actions/truncated';
 	import { extraFieldsHref } from '$lib/settings/params';
 	import { weightAuto } from '$lib/utils/format';
+	import { reportSaveError } from '$lib/utils/autosave';
 	import * as m from '$lib/paraglide/messages';
 	import { dashboardFields, DEFAULT_FIELD_KEY, type DashboardField } from '$lib/dashboard/fields';
 	import { loadLayout, saveGroups, saveSpoolOrders, type DashboardLayout } from '$lib/dashboard/layout';
@@ -151,6 +152,7 @@
 	let cards = $state<Card[]>([]);
 	let dragging = $state(false);
 	let cardsDragDisabled = $state(true);
+	let reloadAfterMoveFailure = $state(false);
 	let displayKeys = $derived(cards.map((c) => c.key));
 	// Nothing at all to show: no saved cards and no spools. Only decided once both loads have
 	// settled, so the help text doesn't flash on the way in.
@@ -186,6 +188,7 @@
 					signal
 				})
 			);
+			if (signal.aborted) return;
 			// A NULL value and an empty-string one are distinct rows to the database but the
 			// same "unassigned" card here, so counts are summed by key.
 			// eslint-disable-next-line svelte/prefer-svelte-reactivity -- transient local, not reactive state
@@ -210,9 +213,21 @@
 			if (isAbortError(e, signal)) return;
 			console.error('Failed to load dashboard groups', e);
 		} finally {
-			groupsLoaded = true;
+			if (!signal.aborted) groupsLoaded = true;
 		}
 	}
+
+	$effect(() => {
+		if (!reloadAfterMoveFailure || dragging) return;
+		reloadAfterMoveFailure = false;
+		if (pageAbort.signal.aborted) return;
+		pageAbort.abort();
+		pageAbort = new AbortController();
+		buckets = {};
+		cards = [];
+		groupsLoaded = false;
+		void loadGroups(field.key);
+	});
 
 	// A screenful can be a dozen cards, and firing that many requests at once both queues
 	// behind the browser's per-host connection limit (which the live-update sockets already
@@ -510,8 +525,16 @@
 			// moved rather than recomputed from the list.
 			b.total += b.spools.length - before;
 		}
+		const changedField = field;
 		for (const { spool, key } of changed) {
-			field.assign(spool, key).catch((e) => console.error('Move failed', e));
+			changedField.assign(spool, key).catch((e) => {
+				const cached = inventory.spoolById(spool.id);
+				if (cached && changedField.valueOf(cached) === key) {
+					inventory.upsertSpool(changedField.withValue(cached, changedField.valueOf(spool)));
+				}
+				reportSaveError(e, 'Move failed', m['dashboard.moveFailed']());
+				if (field.key === changedField.key && !pageAbort.signal.aborted) reloadAfterMoveFailure = true;
+			});
 		}
 
 		// A card's saved order can only speak for the spools it has loaded. Ids from the
@@ -595,10 +618,8 @@
 			if (old && old.total > 0) {
 				// One request moves the whole group, including the pages this card never loaded.
 				await field.rename(oldKey, newKey);
-				// Carry the loaded page over so the card doesn't have to refetch, and keep the
-				// shared cache in step so an inspector opened next shows the new value.
-				const moved = old.spools.map((s) => field.withValue(s, newKey));
-				for (const spool of moved) inventory.upsertSpool(spool);
+				// Carry the loaded page over without overwriting newer cached fields.
+				const moved = old.spools.map((s) => field.withValue(inventory.spoolById(s.id) ?? s, newKey));
 				buckets[newKey] = { ...old, spools: moved };
 				delete buckets[oldKey];
 			}

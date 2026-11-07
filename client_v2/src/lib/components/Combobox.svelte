@@ -1,5 +1,7 @@
 <script lang="ts">
 	import { portal } from '$lib/actions/portal';
+	import { makeDraftTracker } from '$lib/utils/draftTracker';
+	import type { SaveResult } from '$lib/utils/saver';
 	import { getFieldLabelId } from './fieldLabel';
 
 	interface Props {
@@ -14,8 +16,10 @@
 		/** Dashed-underline style (matches EditableField) instead of the bordered
 		 *  box style used in forms. */
 		underline?: boolean;
+		/** Preserve an autosaved draft through delayed or failed writes. */
+		protectDraft?: boolean;
 		/** Fired on every change — typing or picking an option. */
-		oninput?: (value: string) => void;
+		oninput?: (value: string) => SaveResult;
 		/** Accessible name, for use outside a <Field> or <label> that supplies one. */
 		ariaLabel?: string;
 	}
@@ -29,6 +33,7 @@
 		required = false,
 		disabled = false,
 		underline = false,
+		protectDraft = false,
 		oninput,
 		ariaLabel
 	}: Props = $props();
@@ -40,6 +45,13 @@
 	let highlight = $state(-1);
 	let inputEl = $state<HTMLInputElement>();
 	let listEl = $state<HTMLUListElement>();
+	let draft = $state<string | null>(null);
+	const tracker = makeDraftTracker(
+		() => (draft = null),
+		() => !invalid
+	);
+	let displayValue = $derived(protectDraft && draft !== null ? draft : String(value ?? ''));
+	$effect(() => () => tracker.dispose());
 	// Dropdown is position:fixed and anchored to the input's rect so it never gets
 	// clipped by scrollable/overflow-hidden ancestors (e.g. the modal body).
 	let rect = $state({ top: 0, left: 0, width: 0 });
@@ -51,7 +63,7 @@
 	// to "PLA"/"PLA+" rather than snapping back to the full list).
 	let typing = $state(false);
 	let filtered = $derived.by(() => {
-		const q = String(value).trim().toLowerCase();
+		const q = displayValue.trim().toLowerCase();
 		if (!typing || !q) return options;
 		return options.filter((o) => o.toLowerCase().includes(q));
 	});
@@ -73,8 +85,13 @@
 		open = false;
 		highlight = -1;
 	}
+	function change(value: string) {
+		if (protectDraft) draft = value;
+		const result = oninput?.(value);
+		if (protectDraft) tracker.change('value', result);
+	}
 	function choose(opt: string) {
-		oninput?.(opt);
+		change(opt);
 		close();
 		inputEl?.focus();
 	}
@@ -86,9 +103,10 @@
 		const next = e.relatedTarget as Node | null;
 		if (next && listEl?.contains(next)) return;
 		close();
+		if (protectDraft) tracker.blur('value');
 	}
 	function onInput(e: Event & { currentTarget: HTMLInputElement }) {
-		oninput?.(e.currentTarget.value);
+		change(e.currentTarget.value);
 		if (!open) openList();
 		typing = true;
 		highlight = -1;
@@ -115,7 +133,7 @@
 			if (highlight >= 0 && highlight < filtered.length) {
 				choose(filtered[highlight]);
 			} else {
-				const q = String(value).trim().toLowerCase();
+				const q = displayValue.trim().toLowerCase();
 				const exact = filtered.find((o) => o.toLowerCase() === q);
 				if (exact) choose(exact);
 				else close();
@@ -155,7 +173,7 @@
 	class:mono
 	class:underline
 	class:invalid
-	{value}
+	value={displayValue}
 	{placeholder}
 	{disabled}
 	role="combobox"
@@ -167,7 +185,10 @@
 	aria-invalid={invalid ? 'true' : undefined}
 	aria-required={required ? 'true' : undefined}
 	autocomplete="off"
-	onfocus={openList}
+	onfocus={() => {
+		if (protectDraft) tracker.focus('value');
+		openList();
+	}}
 	onclick={openList}
 	onblur={onBlur}
 	oninput={onInput}
@@ -183,12 +204,12 @@
 		style="top:{rect.top}px; left:{rect.left}px; width:{rect.width}px;"
 	>
 		{#each filtered as opt, i (opt)}
-			<li role="option" aria-selected={opt === String(value)}>
+			<li role="option" aria-selected={opt === displayValue}>
 				<button
 					type="button"
 					class="cbx-opt"
 					class:hl={i === highlight}
-					class:sel={opt === String(value)}
+					class:sel={opt === displayValue}
 					onpointerdown={(e) => {
 						e.preventDefault();
 						choose(opt);

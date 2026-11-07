@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 vi.mock('./config', () => ({ API_BASE: 'http://spoolman.test/api/v1' }));
 
 import { inventory } from '$lib/stores/inventory.svelte';
+import { mapSpool } from './map';
 import { spoolSource } from './spoolSource';
 
 // GET /location only knows locations that hold a spool, so an idle toolhead set up
@@ -231,7 +232,7 @@ describe('entity write ordering', () => {
 		await other;
 		requests[0].respond(Response.json({ id: 9001, name: 'first' }));
 		await first;
-		expect(fetch).toHaveBeenCalledTimes(3);
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(3));
 		expect(JSON.parse(requests[2].init?.body as string)).toEqual({ name: 'second' });
 		requests[2].respond(Response.json({ id: 9001, name: 'second' }));
 		await second;
@@ -247,7 +248,7 @@ describe('entity write ordering', () => {
 
 		requests[0].respond(new Response('{}', { status: 500 }));
 		await failure;
-		expect(fetch).toHaveBeenCalledTimes(2);
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
 		requests[1].respond(Response.json({ id: 9003, name: 'second' }));
 		await second;
 		expect(inventory.vendorById('9003')?.name).toBe('second');
@@ -261,7 +262,7 @@ describe('entity write ordering', () => {
 
 		requests[0].respond(Response.json({ id: 9004, lot_nr: 'updated' }));
 		await save;
-		expect(fetch).toHaveBeenCalledTimes(2);
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
 		expect(requests[1].init?.method).toBe('DELETE');
 		requests[1].respond(new Response(null, { status: 204 }));
 		await deletion;
@@ -295,7 +296,7 @@ describe('entity write ordering', () => {
 		requests[0].respond(Response.json({ id: 9005, lot_nr: 'updated' }));
 		await save;
 
-		expect(fetch).toHaveBeenCalledTimes(2);
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
 		expect(requests[1].url).toBe(`http://spoolman.test/api/v1/spool/9005${path}`);
 		expect(requests[1].init?.method).toBe('PUT');
 		expect(JSON.parse(requests[1].init?.body as string)).toEqual(body);
@@ -354,5 +355,108 @@ describe('entity write ordering', () => {
 		} finally {
 			vi.useRealTimers();
 		}
+	});
+
+	it('releases an expired bulk barrier without overtaking the same spool', async () => {
+		vi.useFakeTimers();
+		const { fetch, requests } = controlledFetch();
+		try {
+			const first = spoolSource.saveSpool(9010, { location: 'Shelf' });
+			const rename = spoolSource.renameFieldValue('location', 'Shelf', 'Office');
+			const failure = expect(rename).rejects.toThrow('An earlier write is still pending');
+			await vi.advanceTimersByTimeAsync(30_000);
+			await failure;
+
+			const other = spoolSource.saveSpool(9011, { location: 'Printer' });
+			const same = spoolSource.saveSpool(9010, { location: 'Printer' });
+			await vi.advanceTimersByTimeAsync(0);
+			expect(fetch).toHaveBeenCalledTimes(2);
+			expect(requests[1].url).toContain('/spool/9011');
+			requests[1].respond(Response.json({ id: 9011, location: 'Printer' }));
+			await other;
+
+			requests[0].respond(Response.json({ id: 9010, location: 'Shelf' }));
+			await first;
+			await vi.advanceTimersByTimeAsync(0);
+			expect(fetch).toHaveBeenCalledTimes(3);
+			expect(requests[2].url).toContain('/spool/9010');
+			requests[2].respond(Response.json({ id: 9010, location: 'Printer' }));
+			await same;
+			expect(requests.every(({ url }) => !url.includes('/spool/field/'))).toBe(true);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it('unblocks an unrelated write that was already waiting when a bulk rename expires', async () => {
+		vi.useFakeTimers();
+		const { fetch, requests } = controlledFetch();
+		try {
+			const first = spoolSource.saveSpool(9016, { location: 'Shelf' });
+			const rename = spoolSource.renameFieldValue('location', 'Shelf', 'Office');
+			const failure = expect(rename).rejects.toThrow('An earlier write is still pending');
+			await vi.advanceTimersByTimeAsync(10_000);
+			const other = spoolSource.saveSpool(9017, { location: 'Printer' });
+			await vi.advanceTimersByTimeAsync(20_000);
+			await failure;
+			expect(fetch).toHaveBeenCalledTimes(2);
+			expect(requests[1].url).toContain('/spool/9017');
+			requests[1].respond(Response.json({ id: 9017, location: 'Printer' }));
+			await other;
+			requests[0].respond(Response.json({ id: 9016, location: 'Shelf' }));
+			await first;
+			await vi.advanceTimersByTimeAsync(0);
+			expect(fetch).toHaveBeenCalledTimes(2);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it('orders spool creation on both sides of a bulk rename', async () => {
+		const { fetch, requests } = controlledFetch();
+		const before = spoolSource.createSpool({ filament_id: 1, location: 'Shelf' });
+		const rename = spoolSource.renameFieldValue('location', 'Shelf', 'Office');
+		const after = spoolSource.createSpool({ filament_id: 1, location: 'Shelf' });
+		expect(fetch).toHaveBeenCalledOnce();
+		requests[0].respond(Response.json({ id: 9012, location: 'Shelf' }));
+		await before;
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+		expect(requests[1].url).toContain('/spool/field/location');
+		requests[1].respond(Response.json({ spools_updated: 1 }));
+		await rename;
+		expect(inventory.spoolById(9012)?.location).toBe('Office');
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(3));
+		expect(requests[2].url).toMatch(/\/spool$/);
+		requests[2].respond(Response.json({ id: 9013, location: 'Shelf' }));
+		await after;
+		expect(inventory.spoolById(9013)?.location).toBe('Shelf');
+	});
+
+	it('updates every matching cached spool after an extra-field rename', async () => {
+		const { requests } = controlledFetch();
+		inventory.upsertSpool(mapSpool({ id: 9014, extra: { printer: '"Rack \\"A\\""' } }));
+		inventory.upsertSpool(mapSpool({ id: 9015, extra: { printer: '"Other"' } }));
+		inventory.upsertSpool(mapSpool({ id: 9020, extra: { printer: '"Rack \\"A\\""', note: '"keep"' } }));
+		const rename = spoolSource.renameFieldValue('extra.printer', 'Rack "A"', 'Office');
+		requests[0].respond(Response.json({ spools_updated: 2 }));
+		await rename;
+		expect(inventory.spoolById(9014)?.extra.printer).toBe('"Office"');
+		expect(inventory.spoolById(9015)?.extra.printer).toBe('"Other"');
+		expect(inventory.spoolById(9020)?.extra).toEqual({ printer: '"Office"', note: '"keep"' });
+	});
+
+	it('keeps a multi-spool creation together before a bulk rename', async () => {
+		const { fetch, requests } = controlledFetch();
+		const creating = spoolSource.createSpools({ filament_id: 1, location: 'Shelf' }, 2);
+		const rename = spoolSource.renameFieldValue('location', 'Shelf', 'Office');
+		requests[0].respond(Response.json({ id: 9018, location: 'Shelf' }));
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+		expect(requests[1].url).toMatch(/\/spool$/);
+		requests[1].respond(Response.json({ id: 9019, location: 'Shelf' }));
+		expect(await creating).toHaveLength(2);
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(3));
+		expect(requests[2].url).toContain('/spool/field/location');
+		requests[2].respond(Response.json({ spools_updated: 2 }));
+		await rename;
 	});
 });

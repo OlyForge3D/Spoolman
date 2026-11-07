@@ -396,3 +396,118 @@ test("a failed built-in numeric save remains editable until retried", async ({ p
     await entity.cleanup();
   }
 });
+
+for (const { kind, label, property, first, newer } of [
+  { kind: "spool", label: "Location", property: "location", first: "First shelf", newer: "Newer shelf" },
+  { kind: "filament", label: "Material", property: "material", first: "First material", newer: "Newer material" },
+] as const) {
+  test(`${label} combobox keeps a newer draft through a delayed save`, async ({ page, request }) => {
+    const entity = await createEntity(request, kind);
+    let held: Awaited<ReturnType<typeof holdFirstTwoWrites>> | undefined;
+    try {
+      await openInspector(page, kind, entity.id);
+      held = await holdFirstTwoWrites(page, kind, entity.id);
+      const input = page.locator(".insp").getByRole("combobox", { name: label, exact: true });
+
+      await input.fill(first);
+      await held.firstReady.wait;
+      await input.fill(newer);
+      await input.blur();
+      await page.waitForTimeout(650);
+      held.releaseFirst.release();
+      await held.secondReady.wait;
+      await expect(input).toHaveValue(newer);
+      const saved = finalPatch(page, kind, entity.id, (body) => body[property] === newer);
+      held.releaseSecond.release();
+      expect((await saved).ok()).toBeTruthy();
+      expect((await (await request.get(`${API_BASE}/${kind}/${entity.id}`)).json())[property]).toBe(newer);
+      await expect(input).toHaveValue(newer);
+    } finally {
+      held?.releaseFirst.release();
+      held?.releaseSecond.release();
+      if (!page.isClosed()) await page.unrouteAll({ behavior: "wait" });
+      await entity.cleanup();
+    }
+  });
+
+  test(`${label} combobox retains a failed draft until retry succeeds`, async ({ page, request }) => {
+    const entity = await createEntity(request, kind);
+    try {
+      await openInspector(page, kind, entity.id);
+      let failed = false;
+      await page.route(`**/api/v1/${kind}/${entity.id}`, async (route) => {
+        if (route.request().method() === "PATCH" && !failed) {
+          failed = true;
+          return route.fulfill({ status: 503, contentType: "application/json", body: "{}" });
+        }
+        return route.fallback();
+      });
+      const input = page.locator(".insp").getByRole("combobox", { name: label, exact: true });
+      await input.fill(first);
+      await input.blur();
+      await expect(page.locator(".toaster .error")).toContainText("503");
+
+      expect(
+        (
+          await request.patch(`${API_BASE}/${kind}/${entity.id}`, {
+            data: { [property]: "Remote value", comment: "external update arrived" },
+          })
+        ).ok(),
+      ).toBeTruthy();
+      await expect(page.locator(".insp").getByRole("textbox", { name: "Comment", exact: true })).toHaveValue(
+        "external update arrived",
+      );
+      await expect(input).toHaveValue(first);
+
+      await input.fill(newer);
+      const saved = finalPatch(page, kind, entity.id, (body) => body[property] === first);
+      await input.fill(first);
+      await input.blur();
+      expect((await saved).ok()).toBeTruthy();
+      expect((await (await request.get(`${API_BASE}/${kind}/${entity.id}`)).json())[property]).toBe(first);
+      expect(
+        (await request.patch(`${API_BASE}/${kind}/${entity.id}`, { data: { [property]: "After retry" } })).ok(),
+      ).toBeTruthy();
+      await expect(input).toHaveValue("After retry");
+    } finally {
+      if (!page.isClosed()) await page.unrouteAll({ behavior: "wait" });
+      await entity.cleanup();
+    }
+  });
+}
+
+test("a failed archive is reported, rolled back, and can be retried", async ({ page, request }) => {
+  const entity = await createEntity(request, "spool");
+  const started = gate();
+  const release = gate();
+  try {
+    await openInspector(page, "spool", entity.id);
+    let failed = false;
+    await page.route(`**/api/v1/spool/${entity.id}`, async (route) => {
+      if (route.request().method() === "PATCH" && !failed) {
+        failed = true;
+        started.release();
+        await release.wait;
+        return route.fulfill({ status: 503, contentType: "application/json", body: "{}" });
+      }
+      return route.fallback();
+    });
+
+    await page.locator(".insp").getByRole("button", { name: "Archive", exact: true }).click();
+    await started.wait;
+    await expect(page.locator(".insp").getByRole("button", { name: /^(Unarchive|Archive)$/ })).toBeDisabled();
+    release.release();
+    await expect(page.locator(".toaster .error")).toContainText("503");
+    const archive = page.locator(".insp").getByRole("button", { name: "Archive", exact: true });
+    await expect(archive).toBeEnabled();
+    expect((await (await request.get(`${API_BASE}/spool/${entity.id}`)).json()).archived).toBe(false);
+
+    await archive.click();
+    await expect(page.locator(".insp").getByRole("button", { name: "Unarchive", exact: true })).toBeEnabled();
+    expect((await (await request.get(`${API_BASE}/spool/${entity.id}`)).json()).archived).toBe(true);
+  } finally {
+    release.release();
+    if (!page.isClosed()) await page.unrouteAll({ behavior: "wait" });
+    await entity.cleanup();
+  }
+});
