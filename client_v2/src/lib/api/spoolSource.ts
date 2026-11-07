@@ -9,7 +9,16 @@ import type {
 	VendorPatch
 } from '$lib/types';
 import type { GroupField, GroupQuery, GroupSummary, Page, SpoolQuery } from './types';
-import { getList, getJson, patchJson, postJson, putJson, deleteResource, HttpError } from './http';
+import {
+	getList,
+	getJson,
+	patchJson,
+	postJson,
+	putJson,
+	deleteResource,
+	HttpError,
+	WriteQueueTimeoutError
+} from './http';
 import type { QueryParams } from './http';
 import {
 	mapFilament,
@@ -167,18 +176,65 @@ function cacheSpools(raw: unknown[]): Spool[] {
 	return spools;
 }
 
+const WRITE_WAIT_TIMEOUT_MS = 30_000;
+
 class HttpSpoolSource {
 	private readonly pendingWrites = new Map<string, Promise<unknown>>();
+	private pendingSpoolBulk: Promise<unknown> | undefined;
 
 	// Full write responses replace the cached entity, so writes to the same
 	// entity must land in order, even when they come from different controls.
 	private write<T>(key: string, action: () => Promise<T>): Promise<T> {
 		const previous = this.pendingWrites.get(key);
-		const current = previous ? previous.then(action, action) : action();
-		this.pendingWrites.set(key, current);
-		return current.finally(() => {
-			if (this.pendingWrites.get(key) === current) this.pendingWrites.delete(key);
+		const dependencies = [previous, key.startsWith('spool:') ? this.pendingSpoolBulk : undefined].filter(
+			(promise): promise is Promise<unknown> => promise !== undefined
+		);
+		const { result, tail } = this.schedule(dependencies, action);
+		this.pendingWrites.set(key, tail);
+		const clear = () => {
+			if (this.pendingWrites.get(key) === tail) this.pendingWrites.delete(key);
+		};
+		void tail.then(clear, clear);
+		return result;
+	}
+
+	// A bulk rename must follow every earlier spool write, and later spool writes
+	// must follow it, even when the renamed group has unloaded members.
+	private writeSpools<T>(action: () => Promise<T>): Promise<T> {
+		const dependencies = [...this.pendingWrites.entries()]
+			.filter(([key]) => key.startsWith('spool:'))
+			.map(([, promise]) => promise);
+		if (this.pendingSpoolBulk) dependencies.push(this.pendingSpoolBulk);
+		const { result, tail } = this.schedule(dependencies, action);
+		this.pendingSpoolBulk = tail;
+		const clear = () => {
+			if (this.pendingSpoolBulk === tail) this.pendingSpoolBulk = undefined;
+		};
+		void tail.then(clear, clear);
+		return result;
+	}
+
+	private schedule<T>(dependencies: Promise<unknown>[], action: () => Promise<T>) {
+		if (dependencies.length === 0) {
+			const result = action();
+			return { result, tail: result };
+		}
+
+		let expired = false;
+		let timer: ReturnType<typeof setTimeout>;
+		const timeout = new Promise<never>((_, reject) => {
+			timer = setTimeout(() => {
+				expired = true;
+				reject(new WriteQueueTimeoutError());
+			}, WRITE_WAIT_TIMEOUT_MS);
 		});
+		const tail = Promise.allSettled(dependencies).then(() => {
+			clearTimeout(timer);
+			// A caller already told its write failed must not have it run later.
+			if (expired) throw new WriteQueueTimeoutError();
+			return action();
+		});
+		return { result: Promise.race([tail, timeout]), tail };
 	}
 
 	async listGroups(query: GroupQuery): Promise<Page<GroupSummary>> {
@@ -598,11 +654,16 @@ class HttpSpoolSource {
 	 * the old value.
 	 */
 	async renameFieldValue(field: GroupField, value: string, newValue: string): Promise<number> {
-		const result = await patchJson<{ spools_updated: number }>(`/spool/field/${encodeURIComponent(field)}`, {
-			value,
-			new_value: newValue
+		return this.writeSpools(async () => {
+			const result = await patchJson<{ spools_updated: number }>(
+				`/spool/field/${encodeURIComponent(field)}`,
+				{
+					value,
+					new_value: newValue
+				}
+			);
+			return result.spools_updated;
 		});
-		return result.spools_updated;
 	}
 	async lotNumbers(): Promise<string[]> {
 		return getJson<string[]>('/lot-number');

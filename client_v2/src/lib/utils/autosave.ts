@@ -6,7 +6,7 @@
 // the HTTP status, when we have one) when it doesn't, instead of the change
 // silently reverting on the next refresh.
 
-import { HttpError } from '$lib/api/http';
+import { HttpError, WriteQueueTimeoutError } from '$lib/api/http';
 import { toasts } from '$lib/stores/toasts.svelte';
 import * as m from '$lib/paraglide/messages';
 
@@ -24,7 +24,11 @@ export function trackSave(promise: Promise<unknown>, context = 'Save failed'): P
 		},
 		(e: unknown) => {
 			console.error(context, e);
-			toasts.error(m['notifications.error']({ statusCode: e instanceof HttpError ? e.status : '?' }));
+			toasts.error(
+				e instanceof WriteQueueTimeoutError
+					? m['notifications.writePending']()
+					: m['notifications.error']({ statusCode: e instanceof HttpError ? e.status : '?' })
+			);
 			return false;
 		}
 	);

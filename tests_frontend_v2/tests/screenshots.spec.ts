@@ -3,6 +3,7 @@ import type { Page, Request } from "@playwright/test";
 import { test, expect } from "./fixtures";
 import { expectAppShell } from "./helpers";
 import { seedScreenshots } from "./screenshots-seed";
+import { reconcileComposeSequences } from "./screenshot-sequences";
 
 /**
  * Visual snapshots of the main pages, uploaded to Argos CI (argos-ci.com) which
@@ -42,7 +43,11 @@ async function snap(page: Page, name: string): Promise<void> {
 test.describe.configure({ mode: "serial" });
 
 test.beforeAll(async ({ request }) => {
-  await seedScreenshots(request);
+  const sequenceSource = process.env.SPOOLMAN_SCREENSHOT_SEQUENCES;
+  if (sequenceSource && sequenceSource !== "compose") {
+    throw new Error(`Unknown screenshot sequence source: ${sequenceSource}`);
+  }
+  await seedScreenshots(request, sequenceSource === "compose" ? reconcileComposeSequences : undefined);
 });
 
 const PAGES = [

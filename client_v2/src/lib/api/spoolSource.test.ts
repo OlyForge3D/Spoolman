@@ -302,4 +302,57 @@ describe('entity write ordering', () => {
 		requests[1].respond(Response.json({ id: 9005, lot_nr: 'updated' }));
 		expect((await adjustment).lot).toBe('updated');
 	});
+
+	it('orders bulk renames between earlier and later spool writes', async () => {
+		const { fetch, requests } = controlledFetch();
+		const first = spoolSource.saveSpool(9006, { location: 'Shelf' });
+		const move = spoolSource.saveSpool(9006, { location: 'Printer' });
+		const rename = spoolSource.renameFieldValue('location', 'Printer', 'Office');
+		const later = spoolSource.saveSpool(9007, { location: 'Office' });
+		const other = spoolSource.saveVendor('9008', { name: 'independent' });
+		expect(fetch).toHaveBeenCalledTimes(2);
+		expect(requests[1].url).toContain('/vendor/9008');
+		requests[1].respond(Response.json({ id: 9008, name: 'independent' }));
+		await other;
+
+		requests[0].respond(Response.json({ id: 9006, location: 'Shelf' }));
+		await first;
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(3));
+		expect(JSON.parse(requests[2].init?.body as string)).toEqual({ location: 'Printer' });
+		requests[2].respond(Response.json({ id: 9006, location: 'Printer' }));
+		await move;
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(4));
+		expect(requests[3].url).toContain('/spool/field/location');
+		requests[3].respond(Response.json({ spools_updated: 1 }));
+		expect(await rename).toBe(1);
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(5));
+		expect(requests[4].url).toContain('/spool/9007');
+		requests[4].respond(Response.json({ id: 9007, location: 'Office' }));
+		await later;
+	});
+
+	it('reports a blocked write without sending it after the wait expires', async () => {
+		vi.useFakeTimers();
+		const { fetch, requests } = controlledFetch();
+		try {
+			const first = spoolSource.saveSpool(9009, { location: 'Shelf' });
+			const blocked = spoolSource.saveSpool(9009, { location: 'Printer' });
+			const failure = expect(blocked).rejects.toThrow('An earlier write is still pending');
+			await vi.advanceTimersByTimeAsync(30_000);
+			await failure;
+			expect(fetch).toHaveBeenCalledOnce();
+
+			const retry = spoolSource.saveSpool(9009, { location: 'Printer' });
+			await vi.advanceTimersByTimeAsync(0);
+			expect(fetch).toHaveBeenCalledOnce();
+			requests[0].respond(Response.json({ id: 9009, location: 'Shelf' }));
+			await first;
+			await vi.advanceTimersByTimeAsync(0);
+			expect(fetch).toHaveBeenCalledTimes(2);
+			requests[1].respond(Response.json({ id: 9009, location: 'Printer' }));
+			await retry;
+		} finally {
+			vi.useRealTimers();
+		}
+	});
 });

@@ -407,6 +407,7 @@
     "no": "No",
     "notifications.error": "Error (status code: {{statusCode}})",
     "notifications.saveSuccessful": "Save successful!",
+    "notifications.writePending": "An earlier change is still pending. This change was not sent; retry when it finishes.",
     "pagination.empty": "No {{unit}}",
     "pagination.next": "Next page",
     "pagination.pageSize": "Page size",

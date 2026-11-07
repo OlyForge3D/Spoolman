@@ -61,6 +61,8 @@ client. Both complement the backend HTTP suite in
 - **`tests/screenshots.spec.ts`** — visual snapshots using a fixed dataset in a
   dedicated database. Seeding can resume an intact partial seed after a retry;
   it rejects unexpected or modified fixture rows instead of resetting them.
+  The Compose runner also reconciles ID sequences in its disposable PostgreSQL
+  database after a rolled-back insert, preserving the fixed screenshot IDs.
 
 The tests navigate purely through the UI — the top bar to reach each page, the
 "Add spools" button to reach the create modal. Only the initial "open the app"
@@ -114,6 +116,9 @@ SPOOLMAN_BASE_URL=http://localhost:8000 npx playwright test --project chromium
 The functional tests create uniquely named records, but leave test data behind.
 Start with a fresh database before running screenshots again after the functional
 suite; screenshot seeding will reject unrelated records rather than deleting them.
+For a manually managed PostgreSQL instance, reset the dedicated test database if
+a rolled-back insert advances an ID sequence; the Compose runner handles this
+automatically.
 
 ## CI
 

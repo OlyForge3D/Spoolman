@@ -51,6 +51,14 @@ export class HttpError extends Error {
 	}
 }
 
+/** A queued write expired before its request could be sent. */
+export class WriteQueueTimeoutError extends Error {
+	constructor() {
+		super('An earlier write is still pending; retry after it completes.');
+		this.name = 'WriteQueueTimeoutError';
+	}
+}
+
 // Methods we're willing to answer a 401 with a page reload. A reload throws away
 // whatever is on screen, which is a fine trade for a list that failed to load and
 // a bad one for a half-filled form: the user would lose what they typed to a

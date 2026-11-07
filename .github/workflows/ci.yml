@@ -408,6 +408,7 @@ jobs:
         env:
           ARGOS_UPLOAD: ${{ vars.ARGOS_UPLOAD_ENABLED == 'true' && !startsWith(github.ref, 'refs/tags/') && '1' || '' }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPOOLMAN_SCREENSHOT_SEQUENCES: compose
         run: |
           cd tests_frontend_v2
           npx playwright test --project screenshots

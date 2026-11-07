@@ -13,6 +13,7 @@ export interface SeedRequest {
 
 type Resource = "vendor" | "filament" | "spool";
 type RecordWithId = { id: number; [key: string]: unknown };
+export type SeedPrefixes = Record<Resource, number>;
 
 // Fixed timestamps so "last used" style fields never depend on when CI ran.
 const USED_AT = "2025-01-15T12:00:00Z";
@@ -103,7 +104,10 @@ async function list(request: SeedRequest, resource: Resource): Promise<RecordWit
  * Validate all existing rows first so an unrelated database is never reset or
  * silently mixed into the screenshot data.
  */
-export async function seedScreenshots(request: SeedRequest): Promise<void> {
+export async function seedScreenshots(
+  request: SeedRequest,
+  reconcileSequences?: (prefixes: SeedPrefixes) => Promise<void>,
+): Promise<void> {
   const existing = await Promise.all(plans.map(({ resource }) => list(request, resource)));
   for (const [planIndex, { resource, expected }] of plans.entries()) {
     const seen = new Set<number>();
@@ -122,6 +126,14 @@ export async function seedScreenshots(request: SeedRequest): Promise<void> {
     }
   }
 
+  if (reconcileSequences) {
+    await reconcileSequences({
+      vendor: existing[0].length,
+      filament: existing[1].length,
+      spool: existing[2].length,
+    });
+  }
+
   for (const [planIndex, { resource, data, expected }] of plans.entries()) {
     const ids = new Set(existing[planIndex].map(({ id }) => id));
     for (const [index, row] of data.entries()) {
@@ -130,7 +142,7 @@ export async function seedScreenshots(request: SeedRequest): Promise<void> {
       const response = await request.post(`/api/v1/${resource}`, { data: row });
       expect(response.ok(), `POST ${resource}: ${await response.text()}`).toBeTruthy();
       const created = (await response.json()) as RecordWithId;
-      expect(created.id, `Unexpected ${resource} ID after seeding`).toBe(id);
+      expect(created.id, `Unexpected ${resource} ID after seeding; reset the dedicated test database`).toBe(id);
       expectFixture(resource, created, expected[index]);
     }
   }
