@@ -64,7 +64,7 @@ def generate_docs() -> None:
         </head>
         <body>
             <div id="redoc-container"></div>
-            <script src="https://cdn.jsdelivr.net/npm/redoc/bundles/redoc.standalone.js"> </script>
+            <script src="https://cdn.jsdelivr.net/npm/redoc@2.5.4/bundles/redoc.standalone.js"> </script>
             <script>
                 var spec = {spec};
                 var isDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
