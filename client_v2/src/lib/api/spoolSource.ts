@@ -448,25 +448,31 @@ class HttpSpoolSource {
 		await this.saveSpool(id, { archived });
 	}
 	/** Consume (or, if negative, add back) filament by length. */
-	async useSpoolLength(id: number, length: number): Promise<Spool> {
-		const updated = await putJson<Json>(`/spool/${id}/use`, { use_length: length });
-		const spool = mapSpool(updated);
-		inventory.upsertSpool(spool);
-		return spool;
+	useSpoolLength(id: number, length: number): Promise<Spool> {
+		return this.serializeWrite(`spool:${id}`, async () => {
+			const updated = await putJson<Json>(`/spool/${id}/use`, { use_length: length });
+			const spool = mapSpool(updated);
+			inventory.upsertSpool(spool);
+			return spool;
+		});
 	}
 	/** Consume (or, if negative, add back) filament by weight. */
-	async useSpoolWeight(id: number, weight: number): Promise<Spool> {
-		const updated = await putJson<Json>(`/spool/${id}/use`, { use_weight: weight });
-		const spool = mapSpool(updated);
-		inventory.upsertSpool(spool);
-		return spool;
+	useSpoolWeight(id: number, weight: number): Promise<Spool> {
+		return this.serializeWrite(`spool:${id}`, async () => {
+			const updated = await putJson<Json>(`/spool/${id}/use`, { use_weight: weight });
+			const spool = mapSpool(updated);
+			inventory.upsertSpool(spool);
+			return spool;
+		});
 	}
 	/** Consume filament based on the current gross (spool + filament) weight measurement. */
-	async measureSpool(id: number, weight: number): Promise<Spool> {
-		const updated = await putJson<Json>(`/spool/${id}/measure`, { weight });
-		const spool = mapSpool(updated);
-		inventory.upsertSpool(spool);
-		return spool;
+	measureSpool(id: number, weight: number): Promise<Spool> {
+		return this.serializeWrite(`spool:${id}`, async () => {
+			const updated = await putJson<Json>(`/spool/${id}/measure`, { weight });
+			const spool = mapSpool(updated);
+			inventory.upsertSpool(spool);
+			return spool;
+		});
 	}
 	saveFilament(id: string, patch: FilamentPatch): Promise<void> {
 		return this.serializeWrite(`filament:${id}`, async () => {
@@ -513,24 +519,30 @@ class HttpSpoolSource {
 	 * also the only way to free a filament for deletion, since archiving is just a
 	 * flag and the foreign key still holds.
 	 */
-	async deleteSpool(id: number): Promise<void> {
-		await deleteResource(`/spool/${id}`);
-		inventory.removeSpool(id);
+	deleteSpool(id: number): Promise<void> {
+		return this.serializeWrite(`spool:${id}`, async () => {
+			await deleteResource(`/spool/${id}`);
+			inventory.removeSpool(id);
+		});
 	}
 
 	/** Delete a filament. Rejects with a 403 HttpError if it still has spools. */
-	async deleteFilament(id: string): Promise<void> {
-		await deleteResource(`/filament/${id}`);
-		inventory.removeFilament(id);
+	deleteFilament(id: string): Promise<void> {
+		return this.serializeWrite(`filament:${id}`, async () => {
+			await deleteResource(`/filament/${id}`);
+			inventory.removeFilament(id);
+		});
 	}
 
 	/**
 	 * Delete a manufacturer. Its filaments are NOT deleted — the server clears
 	 * their vendor and leaves them in the catalog, which `removeVendor` mirrors.
 	 */
-	async deleteVendor(id: string): Promise<void> {
-		await deleteResource(`/vendor/${id}`);
-		inventory.removeVendor(id);
+	deleteVendor(id: string): Promise<void> {
+		return this.serializeWrite(`vendor:${id}`, async () => {
+			await deleteResource(`/vendor/${id}`);
+			inventory.removeVendor(id);
+		});
 	}
 
 	// --- filter option lists -----------------------------------------------

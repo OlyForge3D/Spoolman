@@ -150,6 +150,35 @@ describe('saveSpool', () => {
 		expect(JSON.parse(requests[1].body as string)).toEqual({ comment: 'latest' });
 		expect(inventory.spoolById(id)).toMatchObject({ location: 'Shelf', comment: 'latest' });
 	});
+
+	it('serializes a spool usage update with inspector saves', async () => {
+		const id = 121213;
+		let resolveFirst!: (response: Response) => void;
+		const firstResponse = new Promise<Response>((resolve) => {
+			resolveFirst = resolve;
+		});
+		const requests: { url: string; init?: RequestInit }[] = [];
+		const fetch = vi.fn(async (url: string, init?: RequestInit) => {
+			requests.push({ url, init });
+			if (requests.length === 1) return firstResponse;
+			return Response.json({ id, location: 'Shelf', remaining_weight: 450 });
+		});
+		vi.stubGlobal('fetch', fetch);
+
+		const save = spoolSource.saveSpool(id, { location: 'Shelf' });
+		const use = spoolSource.useSpoolWeight(id, 50);
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledOnce());
+
+		resolveFirst(Response.json({ id, location: 'Shelf', remaining_weight: 500 }));
+		await Promise.all([save, use]);
+
+		expect(requests.map(({ init }) => init?.method)).toEqual(['PATCH', 'PUT']);
+		expect(requests.map(({ url }) => url)).toEqual([
+			`http://spoolman.test/api/v1/spool/${id}`,
+			`http://spoolman.test/api/v1/spool/${id}/use`
+		]);
+		expect(inventory.spoolById(id)).toMatchObject({ location: 'Shelf', remaining: 450 });
+	});
 });
 
 describe('createFilament', () => {
