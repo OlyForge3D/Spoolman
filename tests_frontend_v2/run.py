@@ -123,7 +123,7 @@ def main() -> None:
     exit_code = 1
     try:
         wait_for_health()
-        env = {**os.environ, "SPOOLMAN_BASE_URL": BASE_URL}
+        env = {**os.environ, "SPOOLMAN_BASE_URL": BASE_URL, "SPOOLMAN_SCREENSHOT_SEQUENCES": "compose"}
         exit_code = run(["npx", "playwright", "test"], cwd=FRONTEND_DIR, env=env)
     finally:
         if exit_code != 0:
