@@ -4,15 +4,18 @@
 
 import type { Extra, ExtraPatch } from '$lib/types';
 
+/** A synchronous edit, or the eventual outcome of an autosave. */
+export type SaveResult = void | Promise<boolean>;
+
 export interface Saver<Id, Patch> {
-	push(id: Id, patch: Patch): void;
+	push(id: Id, patch: Patch): Promise<boolean>;
 	flush(): void;
 	/**
 	 * Drop the pending patch without sending it. For when the entity being edited
 	 * is about to be deleted: flushing would PATCH a row that is on its way out,
 	 * and the unmount flush would then fail with a 404 the user can do nothing about.
 	 */
-	cancel(): void;
+	cancel(id: Id): void;
 }
 
 // Extra-field saver: optimistically applies each keystroke to the cache (so the
@@ -29,57 +32,36 @@ export interface Saver<Id, Patch> {
 export function makeExtraSaver<Id>(
 	getId: () => Id,
 	apply: (id: Id, extra: Extra) => void,
-	persist: (id: Id, patch: ExtraPatch) => void,
+	persist: (id: Id, patch: ExtraPatch) => SaveResult,
 	getCurrent: () => Extra,
 	delay = 500
-): { change: (key: string, json: string | undefined) => void; flush: () => void; cancel: () => void } {
-	let pending: { id: Id; patch: ExtraPatch } | null = null;
-	let timer: ReturnType<typeof setTimeout> | null = null;
-
-	function stop() {
-		if (timer) {
-			clearTimeout(timer);
-			timer = null;
-		}
-	}
-
-	function flush() {
-		stop();
-		if (!pending) return;
-		const { id, patch } = pending;
-		pending = null;
-		persist(id, patch);
-	}
-
-	/** See {@link Saver.cancel}. */
-	function cancel() {
-		stop();
-		pending = null;
-	}
+): {
+	change: (key: string, json: string | undefined) => Promise<boolean>;
+	flush: () => void;
+	cancel: (id: Id) => void;
+} {
+	const saver = makeSaver<Id, ExtraPatch>(persist, delay);
 
 	function change(key: string, json: string | undefined) {
 		const id = getId();
-		// A different entity than the pending edits belong to: those go out on their own.
-		if (pending && pending.id !== id) flush();
 		const extra = { ...getCurrent() };
 		if (json === undefined) delete extra[key];
 		else extra[key] = json;
 		apply(id, extra);
-		pending = { id, patch: { ...pending?.patch, [key]: json ?? null } };
-		if (timer) clearTimeout(timer);
-		timer = setTimeout(flush, delay);
+		return saver.push(id, { [key]: json ?? null });
 	}
 
-	return { change, flush, cancel };
+	return { change, flush: saver.flush, cancel: saver.cancel };
 }
 
 export function makeSaver<Id, Patch extends object>(
-	save: (id: Id, patch: Patch) => void,
+	save: (id: Id, patch: Patch) => SaveResult,
 	delay = 500
 ): Saver<Id, Patch> {
 	let currentId: Id | null = null;
 	let pending: Partial<Patch> = {};
 	let timer: ReturnType<typeof setTimeout> | null = null;
+	let waiters: ((success: boolean) => void)[] = [];
 
 	function stop() {
 		if (timer) {
@@ -88,27 +70,54 @@ export function makeSaver<Id, Patch extends object>(
 		}
 	}
 
-	function flush() {
-		stop();
-		if (currentId !== null && Object.keys(pending).length > 0) {
-			const patch = pending as Patch;
-			pending = {};
-			save(currentId, patch);
+	function enqueuePending() {
+		if (currentId === null || Object.keys(pending).length === 0) return;
+		const id = currentId;
+		const patch = pending as Patch;
+		const batchWaiters = waiters;
+		pending = {};
+		waiters = [];
+
+		const settle = (success: boolean) => {
+			batchWaiters.forEach((resolve) => resolve(success));
+		};
+		try {
+			const result = save(id, patch);
+			if (result === undefined) settle(true);
+			else
+				void result.then(settle, (error: unknown) => {
+					console.error('Unexpected autosave failure', error);
+					settle(false);
+				});
+		} catch (error) {
+			console.error('Unexpected autosave failure', error);
+			settle(false);
 		}
 	}
 
-	/** See {@link Saver.cancel}. */
-	function cancel() {
+	function flush() {
 		stop();
-		pending = {};
+		enqueuePending();
+	}
+
+	/** See {@link Saver.cancel}. */
+	function cancel(id: Id) {
+		if (currentId === id && Object.keys(pending).length > 0) {
+			stop();
+			pending = {};
+			for (const resolve of waiters) resolve(false);
+			waiters = [];
+		}
 	}
 
 	function push(id: Id, patch: Patch) {
 		if (currentId !== null && currentId !== id) flush();
 		currentId = id;
 		pending = { ...pending, ...patch };
+		const result = new Promise<boolean>((resolve) => waiters.push(resolve));
 		if (timer) clearTimeout(timer);
 		timer = setTimeout(flush, delay);
+		return result;
 	}
 
 	return { push, flush, cancel };

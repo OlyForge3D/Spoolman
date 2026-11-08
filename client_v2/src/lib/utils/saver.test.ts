@@ -15,7 +15,9 @@ function harness(initial: Extra, id = 1) {
 		(_id, extra) => {
 			current = extra;
 		},
-		(id, patch) => persisted.push({ id, patch }),
+		(id, patch) => {
+			persisted.push({ id, patch });
+		},
 		() => current,
 		10
 	);
@@ -105,7 +107,7 @@ describe('cancel', () => {
 	it('drops a pending extra-field patch, and the unmount flush finds nothing', () => {
 		const h = harness({ shelf: '"A"' });
 		h.saver.change('shelf', '"B"');
-		h.saver.cancel();
+		h.saver.cancel(1);
 		h.saver.flush();
 		expect(h.persisted).toEqual([]);
 	});
@@ -115,7 +117,7 @@ describe('cancel', () => {
 		try {
 			const h = harness({ shelf: '"A"' });
 			h.saver.change('shelf', '"B"');
-			h.saver.cancel();
+			h.saver.cancel(1);
 			vi.advanceTimersByTime(100);
 			expect(h.persisted).toEqual([]);
 		} finally {
@@ -127,9 +129,11 @@ describe('cancel', () => {
 		vi.useFakeTimers();
 		try {
 			const saved: { id: number; patch: { name?: string } }[] = [];
-			const saver = makeSaver<number, { name: string }>((id, patch) => saved.push({ id, patch }), 10);
+			const saver = makeSaver<number, { name: string }>((id, patch) => {
+				saved.push({ id, patch });
+			}, 10);
 			saver.push(1, { name: 'renamed' });
-			saver.cancel();
+			saver.cancel(1);
 			vi.advanceTimersByTime(100);
 			saver.flush();
 			expect(saved).toEqual([]);
@@ -140,11 +144,126 @@ describe('cancel', () => {
 
 	it('leaves the saver usable afterwards', () => {
 		const saved: { id: number; patch: { name?: string } }[] = [];
-		const saver = makeSaver<number, { name: string }>((id, patch) => saved.push({ id, patch }), 10);
+		const saver = makeSaver<number, { name: string }>((id, patch) => {
+			saved.push({ id, patch });
+		}, 10);
 		saver.push(1, { name: 'dropped' });
-		saver.cancel();
+		saver.cancel(1);
 		saver.push(2, { name: 'kept' });
 		saver.flush();
 		expect(saved).toEqual([{ id: 2, patch: { name: 'kept' } }]);
+	});
+});
+
+describe('save results', () => {
+	it('settles coalesced edits with the persistence result', async () => {
+		let resolveSave!: (success: boolean) => void;
+		const persist = vi.fn(
+			() =>
+				new Promise<boolean>((resolve) => {
+					resolveSave = resolve;
+				})
+		);
+		const saver = makeSaver<number, { name?: string }>(persist, 10);
+		const first = saver.push(1, { name: 'first' });
+		const latest = saver.push(1, { name: 'latest' });
+		saver.flush();
+
+		expect(persist).toHaveBeenCalledExactlyOnceWith(1, { name: 'latest' });
+		resolveSave(true);
+		await expect(first).resolves.toBe(true);
+		await expect(latest).resolves.toBe(true);
+	});
+
+	it('resolves false when persistence fails or the pending edit is cancelled', async () => {
+		const error = new Error('save failed');
+		const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+		try {
+			const saver = makeSaver<number, { name?: string }>(() => Promise.reject(error), 10);
+			const failed = saver.push(1, { name: 'failed' });
+			saver.flush();
+			await expect(failed).resolves.toBe(false);
+
+			const cancelled = saver.push(1, { name: 'cancelled' });
+			saver.cancel(1);
+			await expect(cancelled).resolves.toBe(false);
+		} finally {
+			log.mockRestore();
+		}
+	});
+
+	it('dispatches each flushed batch immediately and in order', async () => {
+		const pendingSaves: ((success: boolean) => void)[] = [];
+		const persisted: { id: number; patch: { name?: string } }[] = [];
+		const saver = makeSaver<number, { name?: string }>((id, patch) => {
+			persisted.push({ id, patch });
+			return new Promise<boolean>((resolve) => pendingSaves.push(resolve));
+		}, 10);
+
+		const first = saver.push(1, { name: 'first' });
+		saver.flush();
+		const latest = saver.push(1, { name: 'latest' });
+		saver.flush();
+		expect(persisted).toEqual([
+			{ id: 1, patch: { name: 'first' } },
+			{ id: 1, patch: { name: 'latest' } }
+		]);
+
+		pendingSaves[1](true);
+		await expect(latest).resolves.toBe(true);
+		pendingSaves[0](true);
+		await expect(first).resolves.toBe(true);
+	});
+
+	it('keeps queued patches attached to their entity when selection changes during a save', async () => {
+		const pendingSaves: ((success: boolean) => void)[] = [];
+		const persisted: { id: number; patch: { name?: string } }[] = [];
+		const saver = makeSaver<number, { name?: string }>((id, patch) => {
+			persisted.push({ id, patch });
+			return new Promise<boolean>((resolve) => pendingSaves.push(resolve));
+		}, 10);
+
+		const first = saver.push(1, { name: 'first' });
+		saver.flush();
+		const previousSelection = saver.push(1, { name: 'queued old' });
+		const nextSelection = saver.push(2, { name: 'new entity' });
+		saver.flush();
+		expect(persisted).toEqual([
+			{ id: 1, patch: { name: 'first' } },
+			{ id: 1, patch: { name: 'queued old' } },
+			{ id: 2, patch: { name: 'new entity' } }
+		]);
+
+		pendingSaves[0](true);
+		await expect(first).resolves.toBe(true);
+		pendingSaves[1](true);
+		await expect(previousSelection).resolves.toBe(true);
+		pendingSaves[2](true);
+		await expect(nextSelection).resolves.toBe(true);
+	});
+
+	it('cancels only the deleted entity and preserves queued edits for other entities', async () => {
+		const pendingSaves: ((success: boolean) => void)[] = [];
+		const persisted: { id: number; patch: { name?: string } }[] = [];
+		const saver = makeSaver<number, { name?: string }>((id, patch) => {
+			persisted.push({ id, patch });
+			return new Promise<boolean>((resolve) => pendingSaves.push(resolve));
+		}, 10);
+
+		const inFlight = saver.push(1, { name: 'first' });
+		saver.flush();
+		const previousEntity = saver.push(1, { name: 'queued old' });
+		const deletedEntity = saver.push(2, { name: 'not sent' });
+		saver.cancel(2);
+		await expect(deletedEntity).resolves.toBe(false);
+
+		pendingSaves[0](true);
+		await expect(inFlight).resolves.toBe(true);
+		expect(persisted).toEqual([
+			{ id: 1, patch: { name: 'first' } },
+			{ id: 1, patch: { name: 'queued old' } }
+		]);
+		pendingSaves[1](true);
+		await expect(previousEntity).resolves.toBe(true);
 	});
 });

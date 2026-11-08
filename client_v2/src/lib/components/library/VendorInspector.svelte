@@ -69,7 +69,7 @@
 
 	function set(patch: Partial<Vendor>) {
 		inventory.patchVendor(vendor.id, patch);
-		saver.push(vendor.id, patch);
+		return saver.push(vendor.id, patch);
 	}
 
 	const extraSaver = makeExtraSaver(
@@ -103,8 +103,8 @@
 	async function remove() {
 		deleting = true;
 		// The pending edit belongs to a vendor that is about to stop existing.
-		saver.cancel();
-		extraSaver.cancel();
+		saver.cancel(vendor.id);
+		extraSaver.cancel(vendor.id);
 		try {
 			await spoolSource.deleteVendor(vendor.id);
 			toasts.success(m['inspector.delete.vendorDone']());
