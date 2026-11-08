@@ -191,4 +191,56 @@ describe('save results', () => {
 			log.mockRestore();
 		}
 	});
+
+	it('serializes overlapping saves so an older response cannot land after a newer one', async () => {
+		const pendingSaves: ((success: boolean) => void)[] = [];
+		const persisted: { id: number; patch: { name?: string } }[] = [];
+		const saver = makeSaver<number, { name?: string }>((id, patch) => {
+			persisted.push({ id, patch });
+			return new Promise<boolean>((resolve) => pendingSaves.push(resolve));
+		}, 10);
+
+		const first = saver.push(1, { name: 'first' });
+		saver.flush();
+		const latest = saver.push(1, { name: 'latest' });
+		saver.flush();
+		expect(persisted).toEqual([{ id: 1, patch: { name: 'first' } }]);
+
+		pendingSaves[0](true);
+		await expect(first).resolves.toBe(true);
+		expect(persisted).toEqual([
+			{ id: 1, patch: { name: 'first' } },
+			{ id: 1, patch: { name: 'latest' } }
+		]);
+		pendingSaves[1](true);
+		await expect(latest).resolves.toBe(true);
+	});
+
+	it('keeps queued patches attached to their entity when selection changes during a save', async () => {
+		const pendingSaves: ((success: boolean) => void)[] = [];
+		const persisted: { id: number; patch: { name?: string } }[] = [];
+		const saver = makeSaver<number, { name?: string }>((id, patch) => {
+			persisted.push({ id, patch });
+			return new Promise<boolean>((resolve) => pendingSaves.push(resolve));
+		}, 10);
+
+		const first = saver.push(1, { name: 'first' });
+		saver.flush();
+		const previousSelection = saver.push(1, { name: 'queued old' });
+		const nextSelection = saver.push(2, { name: 'new entity' });
+		saver.flush();
+		expect(persisted).toEqual([{ id: 1, patch: { name: 'first' } }]);
+
+		pendingSaves[0](true);
+		await expect(first).resolves.toBe(true);
+		expect(persisted).toEqual([
+			{ id: 1, patch: { name: 'first' } },
+			{ id: 1, patch: { name: 'queued old' } }
+		]);
+		pendingSaves[1](true);
+		await expect(previousSelection).resolves.toBe(true);
+		expect(persisted.at(-1)).toEqual({ id: 2, patch: { name: 'new entity' } });
+		pendingSaves[2](true);
+		await expect(nextSelection).resolves.toBe(true);
+	});
 });

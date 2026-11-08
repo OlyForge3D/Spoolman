@@ -62,6 +62,8 @@ export function makeSaver<Id, Patch extends object>(
 	let pending: Partial<Patch> = {};
 	let timer: ReturnType<typeof setTimeout> | null = null;
 	let waiters: ((success: boolean) => void)[] = [];
+	let saving = false;
+	const queued: { id: Id; patch: Patch; waiters: ((success: boolean) => void)[] }[] = [];
 
 	function stop() {
 		if (timer) {
@@ -70,27 +72,41 @@ export function makeSaver<Id, Patch extends object>(
 		}
 	}
 
+	function enqueuePending() {
+		if (currentId === null || Object.keys(pending).length === 0) return;
+		queued.push({ id: currentId, patch: pending as Patch, waiters });
+		pending = {};
+		waiters = [];
+	}
+
+	function drain() {
+		if (saving) return;
+		const batch = queued.shift();
+		if (!batch) return;
+		saving = true;
+		const settle = (success: boolean) => {
+			batch.waiters.forEach((resolve) => resolve(success));
+			saving = false;
+			drain();
+		};
+		try {
+			const result = save(batch.id, batch.patch);
+			if (result === undefined) settle(true);
+			else
+				void result.then(settle, (error: unknown) => {
+					console.error('Unexpected autosave failure', error);
+					settle(false);
+				});
+		} catch (error) {
+			console.error('Unexpected autosave failure', error);
+			settle(false);
+		}
+	}
+
 	function flush() {
 		stop();
-		if (currentId !== null && Object.keys(pending).length > 0) {
-			const patch = pending as Patch;
-			pending = {};
-			const batch = waiters;
-			waiters = [];
-			const settle = (success: boolean) => batch.forEach((resolve) => resolve(success));
-			try {
-				const result = save(currentId, patch);
-				if (result === undefined) settle(true);
-				else
-					void result.then(settle, (error: unknown) => {
-						console.error('Unexpected autosave failure', error);
-						settle(false);
-					});
-			} catch (error) {
-				console.error('Unexpected autosave failure', error);
-				settle(false);
-			}
-		}
+		enqueuePending();
+		drain();
 	}
 
 	/** See {@link Saver.cancel}. */
@@ -99,6 +115,8 @@ export function makeSaver<Id, Patch extends object>(
 		pending = {};
 		for (const resolve of waiters) resolve(false);
 		waiters = [];
+		for (const batch of queued) batch.waiters.forEach((resolve) => resolve(false));
+		queued.length = 0;
 	}
 
 	function push(id: Id, patch: Patch) {

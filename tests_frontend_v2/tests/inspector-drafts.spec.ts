@@ -102,6 +102,11 @@ test("text draft survives an older response after blur and accepts later updates
     await comment.fill("draft first newer");
     await comment.blur();
     await page.waitForTimeout(650);
+    const secondStartedEarly = await Promise.race([
+      held.secondReady.wait.then(() => true),
+      page.waitForTimeout(100).then(() => false),
+    ]);
+    expect(secondStartedEarly).toBe(false);
     held.releaseFirst.release();
     await held.secondReady.wait;
     await expect(comment).toHaveValue("draft first newer");
@@ -162,6 +167,11 @@ test("numeric extra-field formatting survives delayed saves and later updates", 
     await number.fill("1,25");
     await number.blur();
     await page.waitForTimeout(650);
+    const secondStartedEarly = await Promise.race([
+      held.secondReady.wait.then(() => true),
+      page.waitForTimeout(100).then(() => false),
+    ]);
+    expect(secondStartedEarly).toBe(false);
     held.releaseFirst.release();
     await held.secondReady.wait;
     await expect(number).toHaveValue("1,25");
