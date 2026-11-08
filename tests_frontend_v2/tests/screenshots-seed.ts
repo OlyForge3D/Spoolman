@@ -95,7 +95,10 @@ async function list(request: SeedRequest, resource: Resource): Promise<RecordWit
   const response = await request.get(`/api/v1/${resource}${suffix}`);
   expect(response.ok(), `GET ${resource}: ${await response.text()}`).toBeTruthy();
   const result = await response.json();
-  if (!Array.isArray(result)) throw new Error(`GET ${resource} did not return a list`);
+  if (!Array.isArray(result)) {
+    const type = result === null ? "null" : typeof result;
+    throw new Error(`GET ${resource} did not return a list (received ${type})`);
+  }
   return result as RecordWithId[];
 }
 

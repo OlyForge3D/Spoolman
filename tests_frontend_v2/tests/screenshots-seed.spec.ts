@@ -105,6 +105,26 @@ test("screenshot seeding refuses unrelated data before making any writes", async
   expect(request.writes).toBe(0);
 });
 
+test("screenshot seeding reports malformed list responses before writing", async () => {
+  for (const [payload, type] of [[{ items: [] }, "object"], [null, "null"], ["unexpected", "string"]] as const) {
+    const request = new FakeRequest(0);
+    const malformed: SeedRequest = {
+      get: async () => new FakeResponse(payload),
+      post: request.post.bind(request),
+    };
+    await expect(seedScreenshots(malformed)).rejects.toThrow(`did not return a list (received ${type})`);
+    expect(request.writes).toBe(0);
+  }
+});
+
+test("screenshot seeding rejects omitted extra fields", async () => {
+  const request = new FakeRequest(0);
+  await seedScreenshots(request);
+  delete request.rows.vendor[0].extra;
+  await expect(seedScreenshots(request)).rejects.toThrow("Unexpected extra fields on vendor 1");
+  expect(request.writes).toBe(13);
+});
+
 test("screenshot seeding stops before writing if sequence reconciliation fails", async () => {
   const request = new FakeRequest(0);
   await expect(seedScreenshots(request, async () => { throw new Error("sequence repair failed"); })).rejects.toThrow(
