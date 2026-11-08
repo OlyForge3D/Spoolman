@@ -3,11 +3,12 @@
 from datetime import datetime, timezone
 
 import pytest
+from prometheus_client import CollectorRegistry, Gauge
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 from spoolman.database import models
-from spoolman.prometheus.metrics import filament_metrics, registry, spool_metrics
+from spoolman.prometheus.metrics import _publish, filament_metrics, registry, spool_metrics
 
 
 async def refresh(engine: AsyncEngine) -> None:
@@ -32,6 +33,62 @@ def info(filament_id: int, name: str) -> float | None:
     """Return a vendorless filament's exported info sample, or None if it is not exported."""
     labels = {"filament_id": str(filament_id), "vendor": "-", "name": name, "material": "None", "color": "None"}
     return registry.get_sample_value("spoolman_filament_info", labels)
+
+
+def test_publish_normalized_collisions_preserve_last_value() -> None:
+    local_registry = CollectorRegistry()
+    gauge = Gauge("test_label_normalization", "Test label normalization", ["name"], registry=local_registry)
+
+    _publish(gauge, {(None,): 1, ("None",): 2})
+    assert local_registry.get_sample_value("test_label_normalization", {"name": "None"}) == 2
+    _publish(gauge, {("None",): 3, (None,): 4})
+    assert local_registry.get_sample_value("test_label_normalization", {"name": "None"}) == 4
+
+    _publish(gauge, {})
+    assert local_registry.get_sample_value("test_label_normalization", {"name": "None"}) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("first", "second"), [(None, "None"), ("None", None)])
+async def test_filament_refresh_compares_labels_as_prometheus_strings(first: str | None, second: str | None) -> None:
+    engine = create_async_engine("sqlite+aiosqlite://", poolclass=StaticPool)
+    async with engine.begin() as conn:
+        await conn.run_sync(models.Base.metadata.create_all)
+
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc).replace(tzinfo=None)
+    async with AsyncSession(engine, expire_on_commit=False) as db:
+        filament = models.Filament(registered=now, name="Original", material=first, density=1.24, diameter=1.75)
+        db.add(filament)
+        await db.commit()
+        filament_id = filament.id
+
+    await refresh(engine)
+    assert info(filament_id, "Original") == 1
+
+    async with AsyncSession(engine) as db:
+        filament = await db.get(models.Filament, filament_id)
+        filament.material = second
+        await db.commit()
+
+    await refresh(engine)
+    assert info(filament_id, "Original") == 1
+
+    async with AsyncSession(engine) as db:
+        filament = await db.get(models.Filament, filament_id)
+        filament.name = "Renamed"
+        await db.commit()
+
+    await refresh(engine)
+    assert info(filament_id, "Original") is None
+    assert info(filament_id, "Renamed") == 1
+
+    async with AsyncSession(engine) as db:
+        await db.delete(await db.get(models.Filament, filament_id))
+        await db.commit()
+
+    await refresh(engine)
+    assert info(filament_id, "Renamed") is None
+    await engine.dispose()
 
 
 @pytest.mark.asyncio

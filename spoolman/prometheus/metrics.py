@@ -1,7 +1,7 @@
 """Prometheus metrics collectors."""
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 import sqlalchemy
 from prometheus_client import REGISTRY, Gauge, make_asgi_app
@@ -42,10 +42,10 @@ def make_metrics_app() -> Callable:
 metrics_app = make_asgi_app()
 
 # The label sets each gauge was last given, so the next refresh knows which ones are gone.
-_published: dict[Gauge, set[tuple]] = {}
+_published: dict[Gauge, set[tuple[str, ...]]] = {}
 
 
-def _publish(gauge: Gauge, values: dict[tuple, float]) -> None:
+def _publish(gauge: Gauge, values: Mapping[tuple[str | None, ...], float]) -> None:
     """Make a gauge hold exactly these label sets, dropping any left from an earlier refresh.
 
     Without the drop, an archived or deleted spool (or a deleted filament) kept being exported
@@ -53,11 +53,15 @@ def _publish(gauge: Gauge, values: dict[tuple, float]) -> None:
     clearing first: /metrics is served from a worker thread, so a scrape can land mid-refresh,
     and this way it never sees a series that is still live go missing.
     """
-    for labels, value in values.items():
+    # Match prometheus_client's string keys and preserve its last-value-wins behavior for collisions.
+    normalized: dict[tuple[str, ...], float] = {
+        tuple(str(label) for label in labels): value for labels, value in values.items()
+    }
+    for labels, value in normalized.items():
         gauge.labels(*labels).set(value)
-    for labels in _published.get(gauge, set()) - values.keys():
+    for labels in _published.get(gauge, set()) - normalized.keys():
         gauge.remove(*labels)
-    _published[gauge] = set(values)
+    _published[gauge] = set(normalized)
 
 
 async def spool_metrics(db: AsyncSession) -> None:
@@ -75,9 +79,9 @@ async def spool_metrics(db: AsyncSession) -> None:
     )
     rows = await db.execute(stmt)
     result = list(rows.unique().scalars().all())
-    price: dict[tuple, float] = {}
-    initial_weight: dict[tuple, float] = {}
-    used_weight: dict[tuple, float] = {}
+    price: dict[tuple[str | None, ...], float] = {}
+    initial_weight: dict[tuple[str | None, ...], float] = {}
+    used_weight: dict[tuple[str | None, ...], float] = {}
     for row in result:
         labels = (str(row.id), str(row.filament_id))
         if row.price is not None:
@@ -104,10 +108,10 @@ async def filament_metrics(db: AsyncSession) -> None:
     )
     rows = await db.execute(stmt)
     result = list(rows.unique().scalars().all())
-    info: dict[tuple, float] = {}
-    density: dict[tuple, float] = {}
-    diameter: dict[tuple, float] = {}
-    weight: dict[tuple, float] = {}
+    info: dict[tuple[str | None, ...], float] = {}
+    density: dict[tuple[str | None, ...], float] = {}
+    diameter: dict[tuple[str | None, ...], float] = {}
+    weight: dict[tuple[str | None, ...], float] = {}
     for row in result:
         vendor_name = "-"
         if row.vendor is not None:
