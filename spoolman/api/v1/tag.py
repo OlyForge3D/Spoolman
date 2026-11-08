@@ -191,9 +191,11 @@ async def scan(
             )
             created = True
         except TagConflictError:
-            # Lost a race with a concurrent scan of the same tag; report the winner as an
+            # Lost a race with a concurrent link of the same tag; report the winner as an
             # ordinary match rather than surfacing a conflict for a create nobody asked to see.
-            db_spool = await tag_db.find_spool_by_uid(db, uid)
+            target = await tag_db.find_by_uid(db, uid)
+            db_spool = target if isinstance(target, models.Spool) else None
+            db_filament = target if isinstance(target, models.Filament) else None
         except ItemCreateError:
             logger.warning("Refused to auto-create a spool from decoded tag %s", uid, exc_info=True)
             # Values we refused to store must not reach the client either: report the tag as undecodable.

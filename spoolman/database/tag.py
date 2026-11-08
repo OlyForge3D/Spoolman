@@ -372,9 +372,8 @@ async def create_spool_from_decoded_tag(
 ) -> models.Spool:
     """Create a spool from a decoded tag and link the tag to it, reusing the filament if it exists.
 
-    Only ever called for a UID that `find_spool_by_uid` just reported as unknown, from an
-    opt-in path (see spoolman/api/v1/tag.py) -- this function does not check that itself, so
-    a caller that skips the check can create a duplicate spool for an already-linked tag.
+    Called from an opt-in path (see spoolman/api/v1/tag.py) after `find_by_uid` reports the
+    UID as unknown. A concurrent link can still win before this function links the tag.
 
     The nominal weight belongs to the filament, the measured weight of this roll to the spool's
     initial weight, and the weight the tag says is already used is shown but never applied.
@@ -392,7 +391,7 @@ async def create_spool_from_decoded_tag(
         ItemCreateError: If the decoded values are not storable. Nothing is written in that case.
         TagConflictError: If another request linked this UID first. Vendor, filament, spool and
             tag are one transaction here, so the rollback alone undoes everything this call
-            flushed; callers should fall back to `find_spool_by_uid`.
+            flushed; callers should fall back to `find_by_uid`.
 
     """
     uid = normalize_uid(uid)
@@ -497,8 +496,7 @@ async def create_spool_from_decoded_tag(
 async def find_spool_by_uid(db: AsyncSession, uid: str) -> models.Spool | None:
     """Find the spool a tag UID is linked to, or None if it's unknown or linked to a filament instead.
 
-    A thin, correctly-typed wrapper over `find_by_uid` for callers that only ever deal in
-    spools -- the auto-create flow above, which never links a tag to a filament.
+    A thin, correctly-typed wrapper over `find_by_uid` for callers that only need spools.
 
     Args:
         db: Database session.
