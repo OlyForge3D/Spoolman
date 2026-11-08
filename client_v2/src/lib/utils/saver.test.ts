@@ -107,7 +107,7 @@ describe('cancel', () => {
 	it('drops a pending extra-field patch, and the unmount flush finds nothing', () => {
 		const h = harness({ shelf: '"A"' });
 		h.saver.change('shelf', '"B"');
-		h.saver.cancel();
+		h.saver.cancel(1);
 		h.saver.flush();
 		expect(h.persisted).toEqual([]);
 	});
@@ -117,7 +117,7 @@ describe('cancel', () => {
 		try {
 			const h = harness({ shelf: '"A"' });
 			h.saver.change('shelf', '"B"');
-			h.saver.cancel();
+			h.saver.cancel(1);
 			vi.advanceTimersByTime(100);
 			expect(h.persisted).toEqual([]);
 		} finally {
@@ -133,7 +133,7 @@ describe('cancel', () => {
 				saved.push({ id, patch });
 			}, 10);
 			saver.push(1, { name: 'renamed' });
-			saver.cancel();
+			saver.cancel(1);
 			vi.advanceTimersByTime(100);
 			saver.flush();
 			expect(saved).toEqual([]);
@@ -148,7 +148,7 @@ describe('cancel', () => {
 			saved.push({ id, patch });
 		}, 10);
 		saver.push(1, { name: 'dropped' });
-		saver.cancel();
+		saver.cancel(1);
 		saver.push(2, { name: 'kept' });
 		saver.flush();
 		expect(saved).toEqual([{ id: 2, patch: { name: 'kept' } }]);
@@ -185,7 +185,7 @@ describe('save results', () => {
 			await expect(failed).resolves.toBe(false);
 
 			const cancelled = saver.push(1, { name: 'cancelled' });
-			saver.cancel();
+			saver.cancel(1);
 			await expect(cancelled).resolves.toBe(false);
 		} finally {
 			log.mockRestore();
@@ -242,5 +242,31 @@ describe('save results', () => {
 		expect(persisted.at(-1)).toEqual({ id: 2, patch: { name: 'new entity' } });
 		pendingSaves[2](true);
 		await expect(nextSelection).resolves.toBe(true);
+	});
+
+	it('cancels only the deleted entity and preserves queued edits for other entities', async () => {
+		const pendingSaves: ((success: boolean) => void)[] = [];
+		const persisted: { id: number; patch: { name?: string } }[] = [];
+		const saver = makeSaver<number, { name?: string }>((id, patch) => {
+			persisted.push({ id, patch });
+			return new Promise<boolean>((resolve) => pendingSaves.push(resolve));
+		}, 10);
+
+		const inFlight = saver.push(1, { name: 'first' });
+		saver.flush();
+		const previousEntity = saver.push(1, { name: 'queued old' });
+		const deletedEntity = saver.push(2, { name: 'deleted' });
+		saver.flush();
+		saver.cancel(2);
+		await expect(deletedEntity).resolves.toBe(false);
+
+		pendingSaves[0](true);
+		await expect(inFlight).resolves.toBe(true);
+		expect(persisted).toEqual([
+			{ id: 1, patch: { name: 'first' } },
+			{ id: 1, patch: { name: 'queued old' } }
+		]);
+		pendingSaves[1](true);
+		await expect(previousEntity).resolves.toBe(true);
 	});
 });

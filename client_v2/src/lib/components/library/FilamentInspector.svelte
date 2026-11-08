@@ -207,8 +207,8 @@
 		deleting = true;
 		// The edit that is still in flight belongs to a filament that is about to
 		// stop existing — dropping it avoids a PATCH that can only 404.
-		saver.cancel();
-		extraSaver.cancel();
+		saver.cancel(filament.id);
+		extraSaver.cancel(filament.id);
 		try {
 			await spoolSource.deleteFilament(filament.id);
 			toasts.success(m['inspector.delete.filamentDone']());

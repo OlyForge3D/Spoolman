@@ -294,8 +294,8 @@
 	async function remove() {
 		deleting = true;
 		// The pending edit belongs to a spool that is about to stop existing.
-		saver.cancel();
-		extraSaver.cancel();
+		saver.cancel(spool.id);
+		extraSaver.cancel(spool.id);
 		try {
 			await spoolSource.deleteSpool(spool.id);
 			toasts.success(m['inspector.delete.spoolDone']());

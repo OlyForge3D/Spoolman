@@ -15,7 +15,7 @@ export interface Saver<Id, Patch> {
 	 * is about to be deleted: flushing would PATCH a row that is on its way out,
 	 * and the unmount flush would then fail with a 404 the user can do nothing about.
 	 */
-	cancel(): void;
+	cancel(id: Id): void;
 }
 
 // Extra-field saver: optimistically applies each keystroke to the cache (so the
@@ -38,7 +38,7 @@ export function makeExtraSaver<Id>(
 ): {
 	change: (key: string, json: string | undefined) => Promise<boolean>;
 	flush: () => void;
-	cancel: () => void;
+	cancel: (id: Id) => void;
 } {
 	const saver = makeSaver<Id, ExtraPatch>(persist, delay);
 
@@ -110,13 +110,21 @@ export function makeSaver<Id, Patch extends object>(
 	}
 
 	/** See {@link Saver.cancel}. */
-	function cancel() {
-		stop();
-		pending = {};
-		for (const resolve of waiters) resolve(false);
-		waiters = [];
-		for (const batch of queued) batch.waiters.forEach((resolve) => resolve(false));
-		queued.length = 0;
+	function cancel(id: Id) {
+		if (currentId === id && Object.keys(pending).length > 0) {
+			stop();
+			pending = {};
+			for (const resolve of waiters) resolve(false);
+			waiters = [];
+		}
+		for (let index = queued.length - 1; index >= 0; index--) {
+			const batch = queued[index];
+			if (batch.id === id) {
+				batch.waiters.forEach((resolve) => resolve(false));
+				queued.splice(index, 1);
+			}
+		}
+		drain();
 	}
 
 	function push(id: Id, patch: Patch) {
