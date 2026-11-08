@@ -124,7 +124,7 @@ describe('importExternalFilament', () => {
 });
 
 describe('saveSpool', () => {
-	it('serializes writes to the same spool across independent callers', async () => {
+	it('serializes and coalesces patches across independent inspector savers', async () => {
 		const id = 121212;
 		let resolveFirst!: (response: Response) => void;
 		const firstResponse = new Promise<Response>((resolve) => {
@@ -134,21 +134,40 @@ describe('saveSpool', () => {
 		const fetch = vi.fn(async (_url: string, init?: RequestInit) => {
 			requests.push(init ?? {});
 			if (requests.length === 1) return firstResponse;
-			return Response.json({ id, location: 'Shelf', comment: 'latest' });
+			return Response.json({
+				id,
+				location: 'Shelf',
+				comment: 'latest',
+				extra: { shelf: '"A"', dry: 'true' }
+			});
 		});
 		vi.stubGlobal('fetch', fetch);
 
 		const first = spoolSource.saveSpool(id, { location: 'Shelf' });
-		const second = spoolSource.saveSpool(id, { comment: 'latest' });
+		const previousInspector = spoolSource.saveSpool(id, {
+			comment: 'obsolete',
+			extra: { shelf: '"A"' }
+		});
+		const nextInspector = spoolSource.saveSpool(id, {
+			comment: 'latest',
+			extra: { dry: 'true' }
+		});
 		await vi.waitFor(() => expect(fetch).toHaveBeenCalledOnce());
 		expect(JSON.parse(requests[0].body as string)).toEqual({ location: 'Shelf' });
 
 		resolveFirst(Response.json({ id, location: 'Shelf', comment: '' }));
-		await Promise.all([first, second]);
+		await Promise.all([first, previousInspector, nextInspector]);
 
 		expect(fetch).toHaveBeenCalledTimes(2);
-		expect(JSON.parse(requests[1].body as string)).toEqual({ comment: 'latest' });
-		expect(inventory.spoolById(id)).toMatchObject({ location: 'Shelf', comment: 'latest' });
+		expect(JSON.parse(requests[1].body as string)).toEqual({
+			comment: 'latest',
+			extra: { shelf: '"A"', dry: 'true' }
+		});
+		expect(inventory.spoolById(id)).toMatchObject({
+			location: 'Shelf',
+			comment: 'latest',
+			extra: { shelf: '"A"', dry: 'true' }
+		});
 	});
 
 	it('serializes a spool usage update with inspector saves', async () => {
@@ -178,6 +197,33 @@ describe('saveSpool', () => {
 			`http://spoolman.test/api/v1/spool/${id}/use`
 		]);
 		expect(inventory.spoolById(id)).toMatchObject({ location: 'Shelf', remaining: 450 });
+	});
+
+	it('runs queued saves before deleting the same entity', async () => {
+		const id = 121214;
+		let resolveFirst!: (response: Response) => void;
+		const firstResponse = new Promise<Response>((resolve) => {
+			resolveFirst = resolve;
+		});
+		const requests: { url: string; init?: RequestInit }[] = [];
+		const fetch = vi.fn(async (url: string, init?: RequestInit) => {
+			requests.push({ url, init });
+			if (requests.length === 1) return firstResponse;
+			if (requests.length === 2) return Response.json({ id, location: 'Shelf', extra: { dry: 'true' } });
+			return new Response(null, { status: 204 });
+		});
+		vi.stubGlobal('fetch', fetch);
+
+		const save = spoolSource.saveSpool(id, { location: 'Shelf' });
+		const extraSave = spoolSource.saveSpool(id, { extra: { dry: 'true' } });
+		const deletion = spoolSource.deleteSpool(id);
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledOnce());
+
+		resolveFirst(Response.json({ id, location: 'Shelf' }));
+		await Promise.all([save, extraSave, deletion]);
+
+		expect(requests.map(({ init }) => init?.method)).toEqual(['PATCH', 'PATCH', 'DELETE']);
+		expect(inventory.spoolById(id)).toBeUndefined();
 	});
 });
 

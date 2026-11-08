@@ -192,7 +192,7 @@ describe('save results', () => {
 		}
 	});
 
-	it('serializes overlapping saves so an older response cannot land after a newer one', async () => {
+	it('dispatches each flushed batch immediately and in order', async () => {
 		const pendingSaves: ((success: boolean) => void)[] = [];
 		const persisted: { id: number; patch: { name?: string } }[] = [];
 		const saver = makeSaver<number, { name?: string }>((id, patch) => {
@@ -204,16 +204,15 @@ describe('save results', () => {
 		saver.flush();
 		const latest = saver.push(1, { name: 'latest' });
 		saver.flush();
-		expect(persisted).toEqual([{ id: 1, patch: { name: 'first' } }]);
-
-		pendingSaves[0](true);
-		await expect(first).resolves.toBe(true);
 		expect(persisted).toEqual([
 			{ id: 1, patch: { name: 'first' } },
 			{ id: 1, patch: { name: 'latest' } }
 		]);
+
 		pendingSaves[1](true);
 		await expect(latest).resolves.toBe(true);
+		pendingSaves[0](true);
+		await expect(first).resolves.toBe(true);
 	});
 
 	it('keeps queued patches attached to their entity when selection changes during a save', async () => {
@@ -229,17 +228,16 @@ describe('save results', () => {
 		const previousSelection = saver.push(1, { name: 'queued old' });
 		const nextSelection = saver.push(2, { name: 'new entity' });
 		saver.flush();
-		expect(persisted).toEqual([{ id: 1, patch: { name: 'first' } }]);
+		expect(persisted).toEqual([
+			{ id: 1, patch: { name: 'first' } },
+			{ id: 1, patch: { name: 'queued old' } },
+			{ id: 2, patch: { name: 'new entity' } }
+		]);
 
 		pendingSaves[0](true);
 		await expect(first).resolves.toBe(true);
-		expect(persisted).toEqual([
-			{ id: 1, patch: { name: 'first' } },
-			{ id: 1, patch: { name: 'queued old' } }
-		]);
 		pendingSaves[1](true);
 		await expect(previousSelection).resolves.toBe(true);
-		expect(persisted.at(-1)).toEqual({ id: 2, patch: { name: 'new entity' } });
 		pendingSaves[2](true);
 		await expect(nextSelection).resolves.toBe(true);
 	});
@@ -255,8 +253,7 @@ describe('save results', () => {
 		const inFlight = saver.push(1, { name: 'first' });
 		saver.flush();
 		const previousEntity = saver.push(1, { name: 'queued old' });
-		const deletedEntity = saver.push(2, { name: 'deleted' });
-		saver.flush();
+		const deletedEntity = saver.push(2, { name: 'not sent' });
 		saver.cancel(2);
 		await expect(deletedEntity).resolves.toBe(false);
 
@@ -268,32 +265,5 @@ describe('save results', () => {
 		]);
 		pendingSaves[1](true);
 		await expect(previousEntity).resolves.toBe(true);
-	});
-
-	it('coalesces queued patches for the same entity behind an in-flight save', async () => {
-		const pendingSaves: ((success: boolean) => void)[] = [];
-		const persisted: { id: number; patch: { name?: string; comment?: string } }[] = [];
-		const saver = makeSaver<number, { name?: string; comment?: string }>((id, patch) => {
-			persisted.push({ id, patch });
-			return new Promise<boolean>((resolve) => pendingSaves.push(resolve));
-		}, 10);
-
-		const first = saver.push(1, { name: 'first' });
-		saver.flush();
-		const middle = saver.push(1, { name: 'obsolete' });
-		saver.flush();
-		const latest = saver.push(1, { name: 'latest', comment: 'updated' });
-		saver.flush();
-		expect(persisted).toEqual([{ id: 1, patch: { name: 'first' } }]);
-
-		pendingSaves[0](true);
-		await expect(first).resolves.toBe(true);
-		expect(persisted).toEqual([
-			{ id: 1, patch: { name: 'first' } },
-			{ id: 1, patch: { name: 'latest', comment: 'updated' } }
-		]);
-		pendingSaves[1](true);
-		await expect(middle).resolves.toBe(true);
-		await expect(latest).resolves.toBe(true);
 	});
 });

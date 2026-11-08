@@ -62,8 +62,6 @@ export function makeSaver<Id, Patch extends object>(
 	let pending: Partial<Patch> = {};
 	let timer: ReturnType<typeof setTimeout> | null = null;
 	let waiters: ((success: boolean) => void)[] = [];
-	let saving = false;
-	const queued: { id: Id; patch: Patch; waiters: ((success: boolean) => void)[] }[] = [];
 
 	function stop() {
 		if (timer) {
@@ -74,29 +72,17 @@ export function makeSaver<Id, Patch extends object>(
 
 	function enqueuePending() {
 		if (currentId === null || Object.keys(pending).length === 0) return;
-		const last = queued.at(-1);
-		if (last?.id === currentId) {
-			last.patch = { ...last.patch, ...pending } as Patch;
-			last.waiters.push(...waiters);
-		} else {
-			queued.push({ id: currentId, patch: pending as Patch, waiters });
-		}
+		const id = currentId;
+		const patch = pending as Patch;
+		const batchWaiters = waiters;
 		pending = {};
 		waiters = [];
-	}
 
-	function drain() {
-		if (saving) return;
-		const batch = queued.shift();
-		if (!batch) return;
-		saving = true;
 		const settle = (success: boolean) => {
-			batch.waiters.forEach((resolve) => resolve(success));
-			saving = false;
-			drain();
+			batchWaiters.forEach((resolve) => resolve(success));
 		};
 		try {
-			const result = save(batch.id, batch.patch);
+			const result = save(id, patch);
 			if (result === undefined) settle(true);
 			else
 				void result.then(settle, (error: unknown) => {
@@ -112,7 +98,6 @@ export function makeSaver<Id, Patch extends object>(
 	function flush() {
 		stop();
 		enqueuePending();
-		drain();
 	}
 
 	/** See {@link Saver.cancel}. */
@@ -123,14 +108,6 @@ export function makeSaver<Id, Patch extends object>(
 			for (const resolve of waiters) resolve(false);
 			waiters = [];
 		}
-		for (let index = queued.length - 1; index >= 0; index--) {
-			const batch = queued[index];
-			if (batch.id === id) {
-				batch.waiters.forEach((resolve) => resolve(false));
-				queued.splice(index, 1);
-			}
-		}
-		drain();
 	}
 
 	function push(id: Id, patch: Patch) {

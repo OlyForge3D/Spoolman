@@ -1,5 +1,6 @@
 import type {
 	Extra,
+	ExtraPatch,
 	Filament,
 	FilamentPatch,
 	MultiColorDirection,
@@ -31,6 +32,35 @@ import { loadLayout } from '$lib/dashboard/layout';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 type Json = Record<string, any>;
+
+type EntityWriteWaiter = {
+	resolve(value: unknown): void;
+	reject(reason: unknown): void;
+};
+
+type CoalescedPatch = {
+	patch: unknown;
+	merge(patch: unknown): void;
+};
+
+type EntityWrite = {
+	run: () => Promise<unknown>;
+	waiters: EntityWriteWaiter[];
+	coalesced?: CoalescedPatch;
+};
+
+type EntityWriteQueue = {
+	running: boolean;
+	pending: EntityWrite[];
+};
+
+function mergeEntityPatch<P extends { extra?: ExtraPatch }>(current: P, next: P): P {
+	return {
+		...current,
+		...next,
+		...(current.extra || next.extra ? { extra: { ...current.extra, ...next.extra } } : {})
+	} as P;
+}
 
 // HTTP-backed data source against the real Spoolman API. It also populates the
 // reactive cache with every entity it fetches, so detail views (which read the
@@ -168,20 +198,61 @@ function cacheSpools(raw: unknown[]): Spool[] {
 }
 
 class HttpSpoolSource {
-	private readonly writeQueues = new Map<string, Promise<void>>();
+	private readonly writeQueues = new Map<string, EntityWriteQueue>();
 
-	private serializeWrite<T>(key: string, write: () => Promise<T>): Promise<T> {
-		const previous = this.writeQueues.get(key) ?? Promise.resolve();
-		const current = previous.then(write);
-		const tail = current.then(
-			() => {},
-			() => {}
-		);
-		this.writeQueues.set(key, tail);
-		void tail.then(() => {
-			if (this.writeQueues.get(key) === tail) this.writeQueues.delete(key);
+	private serializeWrite<T>(key: string, write: () => Promise<T>, coalesced?: CoalescedPatch): Promise<T> {
+		const queue = this.writeQueues.get(key) ?? { running: false, pending: [] };
+		this.writeQueues.set(key, queue);
+
+		return new Promise<T>((resolve, reject) => {
+			const waiter = {
+				resolve: (value: unknown) => resolve(value as T),
+				reject: (reason: unknown) => reject(reason)
+			};
+			const last = queue.pending.at(-1);
+			if (coalesced && last?.coalesced) {
+				last.coalesced.merge(coalesced.patch);
+				last.waiters.push(waiter);
+			} else {
+				queue.pending.push({ run: write, waiters: [waiter], coalesced });
+			}
+			this.drainWrites(key, queue);
 		});
-		return current;
+	}
+
+	private serializePatch<T, Patch extends { extra?: ExtraPatch }>(
+		key: string,
+		patch: Patch,
+		write: (patch: Patch) => Promise<T>
+	): Promise<T> {
+		let combinedPatch = patch;
+		return this.serializeWrite(key, () => write(combinedPatch), {
+			patch,
+			merge: (next) => {
+				combinedPatch = mergeEntityPatch(combinedPatch, next as Patch);
+			}
+		});
+	}
+
+	private drainWrites(key: string, queue: EntityWriteQueue) {
+		if (queue.running) return;
+		const task = queue.pending.shift();
+		if (!task) {
+			if (this.writeQueues.get(key) === queue) this.writeQueues.delete(key);
+			return;
+		}
+
+		queue.running = true;
+		void Promise.resolve()
+			.then(task.run)
+			.then(
+				(value) => task.waiters.forEach((waiter) => waiter.resolve(value)),
+				(error: unknown) => task.waiters.forEach((waiter) => waiter.reject(error))
+			)
+			.finally(() => {
+				queue.running = false;
+				this.drainWrites(key, queue);
+			});
 	}
 
 	async listGroups(query: GroupQuery): Promise<Page<GroupSummary>> {
@@ -439,8 +510,8 @@ class HttpSpoolSource {
 	// --- writes -------------------------------------------------------------
 
 	saveSpool(id: number, patch: SpoolPatch): Promise<void> {
-		return this.serializeWrite(`spool:${id}`, async () => {
-			const updated = await patchJson<Json>(`/spool/${id}`, spoolPatchToApi(patch));
+		return this.serializePatch(`spool:${id}`, patch, async (combinedPatch) => {
+			const updated = await patchJson<Json>(`/spool/${id}`, spoolPatchToApi(combinedPatch));
 			inventory.upsertSpool(mapSpool(updated));
 		});
 	}
@@ -475,8 +546,8 @@ class HttpSpoolSource {
 		});
 	}
 	saveFilament(id: string, patch: FilamentPatch): Promise<void> {
-		return this.serializeWrite(`filament:${id}`, async () => {
-			const updated = await patchJson<Json>(`/filament/${id}`, filamentPatchToApi(patch));
+		return this.serializePatch(`filament:${id}`, patch, async (combinedPatch) => {
+			const updated = await patchJson<Json>(`/filament/${id}`, filamentPatchToApi(combinedPatch));
 			// The response embeds the manufacturer, which this patch may just have
 			// changed — cache it too, so a filament re-filed under one the cache has
 			// never seen resolves to a name rather than to nothing.
@@ -485,8 +556,8 @@ class HttpSpoolSource {
 		});
 	}
 	saveVendor(id: string, patch: VendorPatch): Promise<void> {
-		return this.serializeWrite(`vendor:${id}`, async () => {
-			const updated = await patchJson<Json>(`/vendor/${id}`, vendorPatchToApi(patch));
+		return this.serializePatch(`vendor:${id}`, patch, async (combinedPatch) => {
+			const updated = await patchJson<Json>(`/vendor/${id}`, vendorPatchToApi(combinedPatch));
 			inventory.upsertVendor(mapVendor(updated));
 		});
 	}
