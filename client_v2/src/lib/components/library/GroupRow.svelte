@@ -3,6 +3,7 @@
 	import GroupHeader from './GroupHeader.svelte';
 	import Plus from '@lucide/svelte/icons/plus';
 	import SpoolRow from './SpoolRow.svelte';
+	import UncertainSpoolRow from './UncertainSpoolRow.svelte';
 	import UnusedRow from './UnusedRow.svelte';
 	import type { Spool } from '$lib/types';
 	import type { GroupSummary } from '$lib/api/types';
@@ -82,6 +83,7 @@
 		if (collapsed || noSpools) return;
 		const ctrl = new AbortController();
 		void revision; // refetch on live events
+		void inventory.spoolRenameRevision;
 		const want = untrack(() => spools.length) || PAGE;
 		const q = buildScopedSpoolQuery(libraryState, group, want, 0, ctrl.signal);
 		const mine = ++reqId;
@@ -124,14 +126,27 @@
 		}
 	}
 
+	let currentSpools = $derived(spools.map((s) => inventory.spoolById(s.id) ?? s));
+	function hasDetails(s: Spool): boolean {
+		return (
+			!inventory.isSpoolUncertain(s.id) &&
+			!!inventory.spoolById(s.id) &&
+			!!inventory.filamentById(s.filamentId)
+		);
+	}
+	let uncertainSpools = $derived(currentSpools.filter((s) => !hasDetails(s)));
 	let inUse = $derived(
-		spools.filter((s) => !s.unused).map((s) => spoolToVM(s, inventory, settings.lowThreshold))
+		currentSpools
+			.filter((s) => hasDetails(s) && !s.unused)
+			.map((s) => spoolToVM(s, inventory, settings.lowThreshold))
 	);
 	// One collapsed summary row per filament: the row speaks for its whole pile
 	// ("Jade White ×6, 1000 g each"), which only holds within a single filament.
 	let unusedByFilament = $derived(
 		groupUnusedByFilament(
-			spools.filter((s) => s.unused).map((s) => spoolToVM(s, inventory, settings.lowThreshold))
+			currentSpools
+				.filter((s) => hasDetails(s) && s.unused)
+				.map((s) => spoolToVM(s, inventory, settings.lowThreshold))
 		)
 	);
 	let moreCount = $derived(group.spoolCount - spools.length);
@@ -181,6 +196,9 @@
 		ontoggle={toggle}
 	/>
 	{#if !collapsed && !noSpools}
+		{#each uncertainSpools as spool (spool.id)}
+			<UncertainSpoolRow id={spool.id} indent={26} />
+		{/each}
 		{#each inUse as vm (vm.spool.id)}
 			<SpoolRow
 				showLotNumbers={libraryState.showLotNumbers}

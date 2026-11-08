@@ -100,6 +100,7 @@
 	});
 
 	function startAdd() {
+		if (!fields.isLoaded(entity)) return;
 		isNew = true;
 		editing = true;
 		error = '';
@@ -200,6 +201,10 @@
 	async function save() {
 		error = '';
 		errorField = null;
+		if (!fields.isLoaded(entity)) {
+			error = m['fields.loadFailed']();
+			return;
+		}
 		if (!/^[a-z0-9_]+$/.test(key)) {
 			fail('key', m['settings.extraFields.errors.keyFormat']());
 			return;
@@ -277,7 +282,11 @@
 </div>
 
 <Card>
-	{#if defs.length === 0}
+	{#if !fields.isLoaded(entity)}
+		<div class="empty">
+			{fields.failedEntities().includes(entity) ? m['fields.loadFailed']() : m.loading()}
+		</div>
+	{:else if defs.length === 0}
 		<div class="empty">{m['settings.extraFields.none']({ entity: entityLabel })}</div>
 	{:else}
 		<div class="table">
@@ -429,7 +438,13 @@
 					{#if isChoice && choices.length === 0}
 						<span class="hint">{m['settings.extraFields.addChoicesFirst']()}</span>
 					{:else}
-						<ExtraFieldInput field={draftField} value={defaultJson} onchange={(v) => (defaultJson = v)} />
+						<ExtraFieldInput
+							field={draftField}
+							value={defaultJson}
+							onchange={(v) => {
+								defaultJson = v;
+							}}
+						/>
 					{/if}
 				</div>
 			</div>
@@ -447,7 +462,7 @@
 		</div>
 	</div>
 {:else}
-	<button class="add-btn" onclick={startAdd}
+	<button class="add-btn" onclick={startAdd} disabled={!fields.isLoaded(entity)}
 		><Plus size={14} /> {m['settings.extraFields.addEntityField']({ entity: entityLabel })}</button
 	>
 {/if}

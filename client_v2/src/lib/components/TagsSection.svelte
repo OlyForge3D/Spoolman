@@ -19,6 +19,8 @@
 	import X from '@lucide/svelte/icons/x';
 	import type { Tag } from '$lib/types';
 	import { unlinkTag, type TagKind } from '$lib/api/tags';
+	import { spoolSource, SpoolRenameUncertainError } from '$lib/api/spoolSource';
+	import { inventory } from '$lib/stores/inventory.svelte';
 	import { toasts } from '$lib/stores/toasts.svelte';
 	import { formatShortDate } from '$lib/utils/datetime';
 	import * as m from '$lib/paraglide/messages';
@@ -40,13 +42,21 @@
 		if (!tag) return;
 		unlinking = true;
 		try {
-			await unlinkTag({ kind, id }, tag.uid);
+			const unlink = async () => {
+				if (kind === 'spool' && inventory.isSpoolUncertain(Number(id)))
+					throw new SpoolRenameUncertainError(undefined);
+				await unlinkTag({ kind, id }, tag.uid);
+			};
+			if (kind === 'spool') await spoolSource.withSpoolWriteBarrier(unlink);
+			else await unlink();
 			// No local edit: unlinking emits the holder's ordinary `updated` event, and
 			// the list below re-renders from the cache when it arrives.
 			toasts.success(m['tags.unlinked']());
 			pending = null;
-		} catch {
-			toasts.error(m['tags.unlinkFailed']());
+		} catch (error) {
+			toasts.error(
+				error instanceof SpoolRenameUncertainError ? m['spool.uncertainDetails']() : m['tags.unlinkFailed']()
+			);
 		} finally {
 			unlinking = false;
 		}

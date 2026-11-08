@@ -53,6 +53,7 @@ test("change which filament a spool holds, keeping the spool itself", async ({ p
 
     // The spool's current filament is listed but not selectable — changing to
     // what it already holds is not a change.
+    await dialog.locator("input.search-big").fill(oldFilament);
     await expect(dialog.getByText("current", { exact: true })).toBeVisible();
 
     await dialog.locator("input.search-big").fill(newFilament);

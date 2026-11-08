@@ -1,5 +1,6 @@
 import type { Filament, Spool, Vendor } from '$lib/types';
 import type { LiveEvent } from '$lib/api/live';
+import type { GroupField } from '$lib/api/types';
 import { mapFilament, mapSpool, mapVendor } from '$lib/api/map';
 
 // Reactive, normalized client cache. Populated by HTTP responses (the data
@@ -12,6 +13,18 @@ class Inventory {
 	vendors = $state<Vendor[]>([]);
 	filaments = $state<Filament[]>([]);
 	spools = $state<Spool[]>([]);
+	spoolRenameRevision = $state(0);
+	spoolRenamesInFlight = $state(0);
+	private uncertainSpools = $state<
+		Record<number, { field: GroupField; revision: number; pendingValue?: string }[]>
+	>({});
+	private nextUncertainty = 0;
+	private readonly spoolUpsertObservers = new Set<(spool: Spool) => void>();
+	private readonly spoolUncertaintyObservers = new Set<(id: number) => void>();
+	private readonly relationDraftObservers = new Set<() => void>();
+	private readonly relationRevisions = new Map<string, number>();
+	private readonly pendingRelationWrites = new Map<string, number>();
+	private relationRevision = 0;
 
 	filamentById(id: string): Filament | undefined {
 		return this.filaments.find((f) => f.id === id);
@@ -21,6 +34,65 @@ class Inventory {
 	}
 	spoolById(id: number): Spool | undefined {
 		return this.spools.find((s) => s.id === id);
+	}
+	isSpoolUncertain(id: number): boolean {
+		return (this.uncertainSpools[id]?.length ?? 0) > 0;
+	}
+	uncertainSpoolIds(): number[] {
+		return Object.keys(this.uncertainSpools).map(Number);
+	}
+	uncertainSpoolFields(id: number): GroupField[] {
+		return [...new Set((this.uncertainSpools[id] ?? []).map(({ field }) => field))];
+	}
+	spoolUncertainty(id: number, field: GroupField): number | undefined {
+		return this.uncertainSpools[id]?.filter((entry) => entry.field === field).at(-1)?.revision;
+	}
+	markSpoolUncertain(id: number, field: GroupField): number {
+		const revision = ++this.nextUncertainty;
+		const entries = this.uncertainSpools[id] ?? [];
+		this.uncertainSpools = {
+			...this.uncertainSpools,
+			[id]: [...entries, { field, revision }]
+		};
+		for (const observer of this.spoolUncertaintyObservers) observer(id);
+		return revision;
+	}
+	holdSpoolUncertainty(id: number, field: GroupField, revision: number, pendingValue: string) {
+		const entries = this.uncertainSpools[id];
+		if (!entries?.some((entry) => entry.field === field && entry.revision === revision)) return;
+		this.uncertainSpools = {
+			...this.uncertainSpools,
+			[id]: entries.map((entry) =>
+				entry.field === field && entry.revision === revision ? { ...entry, pendingValue } : entry
+			)
+		};
+	}
+	hasPendingSpoolRename(id: number, field: GroupField, value: string): boolean {
+		return (this.uncertainSpools[id] ?? []).some(
+			(entry) => entry.field === field && entry.pendingValue === value
+		);
+	}
+	pendingSpoolRenameValues(id: number, field: GroupField, revision: number): string[] {
+		return (this.uncertainSpools[id] ?? [])
+			.filter((entry) => entry.field === field && entry.revision <= revision)
+			.flatMap((entry) => (entry.pendingValue === undefined ? [] : [entry.pendingValue]));
+	}
+	resolveSpoolUncertainty(id: number, field: GroupField, revision: number) {
+		if (this.spoolUncertainty(id, field) !== revision) return;
+		this.removeSpoolUncertainties(id, (entry) => entry.field === field && entry.revision <= revision);
+	}
+	cancelSpoolUncertainty(id: number, field: GroupField, revision: number) {
+		this.removeSpoolUncertainties(id, (entry) => entry.field === field && entry.revision === revision);
+	}
+	private removeSpoolUncertainties(
+		id: number,
+		remove: (entry: { field: GroupField; revision: number; pendingValue?: string }) => boolean
+	) {
+		const entries = (this.uncertainSpools[id] ?? []).filter((entry) => !remove(entry));
+		const next = { ...this.uncertainSpools };
+		if (entries.length) next[id] = entries;
+		else delete next[id];
+		this.uncertainSpools = next;
 	}
 	vendorOf(f: Filament): Vendor {
 		return (
@@ -43,17 +115,83 @@ class Inventory {
 
 	// --- upserts (new array refs so $state/$derived recompute) --------------
 
+	observeSpoolUpserts(observer: (spool: Spool) => void): () => void {
+		this.spoolUpsertObservers.add(observer);
+		return () => this.spoolUpsertObservers.delete(observer);
+	}
+
+	observeSpoolUncertainty(observer: (id: number) => void): () => void {
+		this.spoolUncertaintyObservers.add(observer);
+		return () => this.spoolUncertaintyObservers.delete(observer);
+	}
+
+	observeRelationDrafts(observer: () => void): () => void {
+		this.relationDraftObservers.add(observer);
+		return () => this.relationDraftObservers.delete(observer);
+	}
+
+	flushRelationDrafts() {
+		for (const observer of this.relationDraftObservers) observer();
+	}
+
+	trackRelationWrite(kind: 'filament' | 'vendor', id: string, pending: Promise<unknown>) {
+		const key = `${kind}:${id}`;
+		this.pendingRelationWrites.set(key, (this.pendingRelationWrites.get(key) ?? 0) + 1);
+		const finish = () => {
+			const remaining = (this.pendingRelationWrites.get(key) ?? 1) - 1;
+			if (remaining) this.pendingRelationWrites.set(key, remaining);
+			else this.pendingRelationWrites.delete(key);
+		};
+		void pending.then(finish, finish);
+	}
+
+	relationReadRevision(): number {
+		return this.relationRevision;
+	}
+
+	canCacheRelation(kind: 'filament' | 'vendor', id: string, revision: number): boolean {
+		const key = `${kind}:${id}`;
+		return !this.pendingRelationWrites.has(key) && (this.relationRevisions.get(key) ?? 0) <= revision;
+	}
+
+	cacheFilamentRead(filament: Filament, revision: number): Filament {
+		if (this.canCacheRelation('filament', filament.id, revision)) this.upsertFilament(filament);
+		const cached = this.filamentById(filament.id);
+		if (!cached) throw new Error(`Filament ${filament.id} changed while it was being loaded`);
+		return cached;
+	}
+
+	cacheVendorRead(vendor: Vendor, revision: number): Vendor {
+		if (this.canCacheRelation('vendor', vendor.id, revision)) this.upsertVendor(vendor);
+		const cached = this.vendorById(vendor.id);
+		if (!cached) throw new Error(`Vendor ${vendor.id} changed while it was being loaded`);
+		return cached;
+	}
+
+	private noteRelationChange(kind: 'filament' | 'vendor', id: string) {
+		this.relationRevisions.set(`${kind}:${id}`, ++this.relationRevision);
+	}
+
+	/** Register rename candidates before deciding whether a remote snapshot is safe to cache. */
+	considerSpool(s: Spool): boolean {
+		for (const observer of this.spoolUpsertObservers) observer(s);
+		return !this.isSpoolUncertain(s.id);
+	}
+
 	upsertSpool(s: Spool) {
+		this.considerSpool(s);
 		this.spools = this.spools.some((x) => x.id === s.id)
 			? this.spools.map((x) => (x.id === s.id ? s : x))
 			: [...this.spools, s];
 	}
 	upsertFilament(f: Filament) {
+		this.noteRelationChange('filament', f.id);
 		this.filaments = this.filaments.some((x) => x.id === f.id)
 			? this.filaments.map((x) => (x.id === f.id ? f : x))
 			: [...this.filaments, f];
 	}
 	upsertVendor(v: Vendor) {
+		this.noteRelationChange('vendor', v.id);
 		this.vendors = this.vendors.some((x) => x.id === v.id)
 			? this.vendors.map((x) => (x.id === v.id ? v : x))
 			: [...this.vendors, v];
@@ -76,8 +214,14 @@ class Inventory {
 
 	removeSpool(id: number) {
 		this.spools = this.spools.filter((s) => s.id !== id);
+		if (this.uncertainSpools[id]) {
+			const next = { ...this.uncertainSpools };
+			delete next[id];
+			this.uncertainSpools = next;
+		}
 	}
 	removeFilament(id: string) {
+		this.noteRelationChange('filament', id);
 		this.filaments = this.filaments.filter((f) => f.id !== id);
 	}
 	/**
@@ -89,8 +233,11 @@ class Inventory {
 	 * This is the cache's only chance to stop pointing at a vendor that is gone.
 	 */
 	removeVendor(id: string) {
+		this.noteRelationChange('vendor', id);
 		this.vendors = this.vendors.filter((v) => v.id !== id);
 		if (this.filaments.some((f) => f.vendorId === id)) {
+			for (const filament of this.filaments)
+				if (filament.vendorId === id) this.noteRelationChange('filament', filament.id);
 			this.filaments = this.filaments.map((f) => (f.vendorId === id ? { ...f, vendorId: '' } : f));
 		}
 	}
@@ -142,6 +289,7 @@ class Inventory {
 
 	ingest(event: LiveEvent) {
 		const payload = event.payload;
+		const revision = this.relationReadRevision();
 		if (event.resource === 'spool') {
 			const id = Number(event.id);
 			if (event.type === 'deleted') this.removeSpool(id);
@@ -150,9 +298,13 @@ class Inventory {
 				// Spool payloads embed their filament (+ vendor); keep those fresh too.
 				const f = payload.filament as Record<string, unknown> | undefined;
 				if (f) {
-					this.upsertFilament(mapFilament(f));
+					const filament = mapFilament(f);
+					if (this.canCacheRelation('filament', filament.id, revision)) this.upsertFilament(filament);
 					const v = f.vendor as Record<string, unknown> | undefined;
-					if (v) this.upsertVendor(mapVendor(v));
+					if (v) {
+						const vendor = mapVendor(v);
+						if (this.canCacheRelation('vendor', vendor.id, revision)) this.upsertVendor(vendor);
+					}
 				}
 			}
 		} else if (event.resource === 'filament') {
@@ -160,15 +312,23 @@ class Inventory {
 			if (event.type === 'deleted') this.removeFilament(id);
 			else if (payload) {
 				const f = mapFilament(payload);
-				this.upsertFilament(f);
-				this.reweighSpoolsOfFilament(f);
+				if (this.canCacheRelation('filament', f.id, revision)) {
+					this.upsertFilament(f);
+					this.reweighSpoolsOfFilament(f);
+				}
 				const v = payload.vendor as Record<string, unknown> | undefined;
-				if (v) this.upsertVendor(mapVendor(v));
+				if (v) {
+					const vendor = mapVendor(v);
+					if (this.canCacheRelation('vendor', vendor.id, revision)) this.upsertVendor(vendor);
+				}
 			}
 		} else if (event.resource === 'vendor') {
 			const id = String(event.id);
 			if (event.type === 'deleted') this.removeVendor(id);
-			else if (payload) this.upsertVendor(mapVendor(payload));
+			else if (payload) {
+				const vendor = mapVendor(payload);
+				if (this.canCacheRelation('vendor', vendor.id, revision)) this.upsertVendor(vendor);
+			}
 		}
 	}
 }

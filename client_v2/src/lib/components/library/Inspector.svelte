@@ -2,6 +2,7 @@
 	import { untrack } from 'svelte';
 	import { asset } from '$app/paths';
 	import SpoolInspector from './SpoolInspector.svelte';
+	import UncertainSpools from '../UncertainSpools.svelte';
 	import FilamentInspector from './FilamentInspector.svelte';
 	import VendorInspector from './VendorInspector.svelte';
 	import type { Selection } from '$lib/types';
@@ -16,6 +17,7 @@
 	let filament = $derived(sel?.kind === 'filament' ? inventory.filamentById(sel.id) : undefined);
 	let vendor = $derived(sel?.kind === 'vendor' ? inventory.vendorById(sel.id) : undefined);
 	let found = $derived(spool ?? filament ?? vendor);
+	let selectedSpoolUncertain = $derived(sel?.kind === 'spool' && inventory.isSpoolUncertain(Number(sel.id)));
 
 	// Deep-link resolution: the cache is only filled by the list, search and live
 	// events, so a selection reached by bookmark/QR/shared link (e.g. ?sel=spool:2)
@@ -37,7 +39,7 @@
 	let key = $derived(sel ? `${sel.kind}:${sel.id}` : '');
 	$effect(() => {
 		const k = key;
-		if (!k || found) return;
+		if (!k || found || selectedSpoolUncertain) return;
 		if (attempted === k) return;
 		attempted = k;
 		loading = true;
@@ -70,11 +72,20 @@
 
 <!-- Keyed by entity so a new selection never inherits an unsaved field draft. -->
 {#if spool}
-	{#key spool.id}<SpoolInspector {spool} />{/key}
+	{#key spool.id}
+		<div class="inspector-content" class:unavailable={inventory.isSpoolUncertain(spool.id)}>
+			<SpoolInspector {spool} />
+		</div>
+		{#if inventory.isSpoolUncertain(spool.id)}
+			<div class="empty"><UncertainSpools ids={[spool.id]} /></div>
+		{/if}
+	{/key}
 {:else if filament}
 	{#key filament.id}<FilamentInspector {filament} />{/key}
 {:else if vendor}
 	{#key vendor.id}<VendorInspector {vendor} />{/key}
+{:else if sel?.kind === 'spool' && selectedSpoolUncertain}
+	<div class="empty"><UncertainSpools ids={[Number(sel.id)]} /></div>
 {:else if sel && loading}
 	<div class="empty">
 		<p>{m['inspector.loading']()}</p>
@@ -92,6 +103,12 @@
 {/if}
 
 <style>
+	.inspector-content {
+		display: contents;
+	}
+	.inspector-content.unavailable {
+		display: none;
+	}
 	.empty {
 		display: flex;
 		flex-direction: column;

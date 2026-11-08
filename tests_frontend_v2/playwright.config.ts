@@ -38,8 +38,8 @@ export default defineConfig({
     screenshot: "only-on-failure",
     video: "on-first-retry",
   },
-  // The screenshots project seeds a fixed dataset and needs an empty database,
-  // so CI runs it first on its own; see tests/screenshots.spec.ts.
+  // Screenshots need a dedicated database with a fresh or intact fixed seed,
+  // so CI runs them first on their own; see tests/screenshots.spec.ts.
   projects: [
     {
       name: "screenshots",

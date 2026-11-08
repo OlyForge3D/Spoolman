@@ -2,6 +2,7 @@
 	import ListToolbar from './ListToolbar.svelte';
 	import GroupRow from './GroupRow.svelte';
 	import SpoolRow from './SpoolRow.svelte';
+	import UncertainSpoolRow from './UncertainSpoolRow.svelte';
 	import Pagination from '../Pagination.svelte';
 	import type { Spool } from '$lib/types';
 	import type { GroupSummary } from '$lib/api/types';
@@ -48,6 +49,7 @@
 		const gq = isGrouped ? buildGroupQuery(libraryState, ctrl.signal) : null;
 		const sq = isGrouped ? null : buildFlatSpoolQuery(libraryState, ctrl.signal);
 		void revision; // refetch on live events
+		void inventory.spoolRenameRevision;
 		const mine = ++reqId;
 		loading = true;
 		errored = false;
@@ -108,6 +110,12 @@
 			}
 		}, COALESCE_MS);
 	}
+	let previousUncertainIds: number[] = [];
+	$effect(() => {
+		const current = inventory.uncertainSpoolIds();
+		if (previousUncertainIds.some((id) => !current.includes(id))) bumpRevision();
+		previousUncertainIds = current;
+	});
 	$effect(() => {
 		const offs = (['spool', 'filament', 'vendor'] as const).map((resource) =>
 			live.subscribe(resource, {}, bumpRevision)
@@ -120,7 +128,6 @@
 		};
 	});
 
-	let flatVMs = $derived(flatSpools.map((s) => spoolToVM(s, inventory, settings.lowThreshold)));
 	let totalLabel = $derived(grouped ? m['library.unitGroups']() : m['library.unitSpools']());
 
 	// An empty result with no active filters means the library is genuinely empty
@@ -137,8 +144,14 @@
 				<GroupRow {group} {libraryState} {revision} />
 			{/each}
 		{:else}
-			{#each flatVMs as vm (vm.spool.id)}
-				<SpoolRow showLotNumbers={libraryState.showLotNumbers} {vm} showSwatch indent={14} />
+			{#each flatSpools as spool (spool.id)}
+				{@const current = inventory.spoolById(spool.id)}
+				{#if inventory.isSpoolUncertain(spool.id) || !current || !inventory.filamentById(current.filamentId)}
+					<UncertainSpoolRow id={spool.id} />
+				{:else}
+					{@const vm = spoolToVM(current, inventory, settings.lowThreshold)}
+					<SpoolRow showLotNumbers={libraryState.showLotNumbers} {vm} showSwatch indent={14} />
+				{/if}
 			{/each}
 		{/if}
 

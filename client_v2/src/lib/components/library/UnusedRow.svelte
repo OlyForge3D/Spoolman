@@ -6,6 +6,7 @@
 	import { isSelected } from '$lib/library/params';
 	import { truncTitle } from '$lib/actions/truncated';
 	import { page } from '$app/state';
+	import { inventory } from '$lib/stores/inventory.svelte';
 	import * as m from '$lib/paraglide/messages';
 
 	interface Props {
@@ -47,7 +48,11 @@
 	let sameWeight = $derived(
 		first.spool.initial > 0 && unused.every((vm) => vm.spool.initial === first.spool.initial)
 	);
-	let location = $derived(first.spool.location || m['library.unassigned']());
+	let location = $derived(
+		unused.some((vm) => inventory.isSpoolUncertain(vm.spool.id))
+			? m['spool.uncertainShort']()
+			: (inventory.spoolById(first.spool.id)?.location ?? first.spool.location) || m['library.unassigned']()
+	);
 	let sub = $derived(
 		sameWeight
 			? m['library.unusedSub']({ weight: first.spool.initial, location })

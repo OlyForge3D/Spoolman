@@ -3,6 +3,8 @@ import type { Spool, Vendor } from '$lib/types';
 import { getJson } from './http';
 import { mapFilament, mapSpool, mapVendor } from './map';
 import { inventory } from '$lib/stores/inventory.svelte';
+import { readSpoolSnapshot } from './spoolReadFence';
+import { cacheSpoolRead } from './cacheSpoolRead';
 
 // Cross-entity search against GET /api/v1/search. Like the spool source, every
 // entity it fetches is upserted into the reactive cache so that clicking a result
@@ -18,15 +20,10 @@ type Json = Record<string, any>;
 
 const EMPTY: SearchResults = { spools: [], filaments: [], vendors: [], isColorQuery: false };
 
-function mapSpoolHit(m: Json): SearchMatch<Spool> {
+function mapSpoolHit(m: Json, revision: number): SearchMatch<Spool> {
 	const raw: Json = m.spool ?? {};
-	if (raw.filament) {
-		inventory.upsertFilament(mapFilament(raw.filament));
-		if (raw.filament.vendor) inventory.upsertVendor(mapVendor(raw.filament.vendor));
-	}
 	const spool = mapSpool(raw);
-	inventory.upsertSpool(spool);
-	return { entity: spool, matchField: m.match_field };
+	return { entity: cacheSpoolRead(raw, spool, revision), matchField: m.match_field };
 }
 
 function mapFilamentSpool(s: Json): FilamentSpoolHit {
@@ -38,11 +35,10 @@ function mapFilamentSpool(s: Json): FilamentSpoolHit {
 	};
 }
 
-function mapFilamentHit(m: Json): FilamentSearchMatch {
+function mapFilamentHit(m: Json, revision: number): FilamentSearchMatch {
 	const raw: Json = m.filament ?? {};
-	if (raw.vendor) inventory.upsertVendor(mapVendor(raw.vendor));
-	const filament = mapFilament(raw);
-	inventory.upsertFilament(filament);
+	if (raw.vendor) inventory.cacheVendorRead(mapVendor(raw.vendor), revision);
+	const filament = inventory.cacheFilamentRead(mapFilament(raw), revision);
 	// These are too partial to upsert into the inventory cache; opening one fetches
 	// the full spool (see Inspector.svelte), which is what a plain deep link does too.
 	const spools = (m.spools ?? []).map(mapFilamentSpool);
@@ -54,9 +50,8 @@ function mapFilamentHit(m: Json): FilamentSearchMatch {
 	};
 }
 
-function mapVendorHit(m: Json): SearchMatch<Vendor> {
-	const vendor = mapVendor(m.vendor ?? {});
-	inventory.upsertVendor(vendor);
+function mapVendorHit(m: Json, revision: number): SearchMatch<Vendor> {
+	const vendor = inventory.cacheVendorRead(mapVendor(m.vendor ?? {}), revision);
 	return { entity: vendor, matchField: m.match_field };
 }
 
@@ -72,20 +67,26 @@ export async function searchAll(
 	const q = query.trim();
 	if (!q) return EMPTY;
 
-	const data = await getJson<Json>(
-		'/search',
-		{
-			q,
-			color_similarity_threshold: threshold,
-			spools_per_filament: SPOOLS_PER_FILAMENT
+	let relationRevision = 0;
+	return readSpoolSnapshot(
+		() => {
+			relationRevision = inventory.relationReadRevision();
+			return getJson<Json>(
+				'/search',
+				{
+					q,
+					color_similarity_threshold: threshold,
+					spools_per_filament: SPOOLS_PER_FILAMENT
+				},
+				signal
+			);
 		},
+		(data) => ({
+			spools: (data.spools ?? []).map((spool: Json) => mapSpoolHit(spool, relationRevision)),
+			filaments: (data.filaments ?? []).map((filament: Json) => mapFilamentHit(filament, relationRevision)),
+			vendors: (data.vendors ?? []).map((vendor: Json) => mapVendorHit(vendor, relationRevision)),
+			isColorQuery: !!data.is_color_query
+		}),
 		signal
 	);
-
-	return {
-		spools: (data.spools ?? []).map(mapSpoolHit),
-		filaments: (data.filaments ?? []).map(mapFilamentHit),
-		vendors: (data.vendors ?? []).map(mapVendorHit),
-		isColorQuery: !!data.is_color_query
-	};
 }

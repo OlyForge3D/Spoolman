@@ -34,6 +34,7 @@
 	import { pct, weightAuto } from '$lib/utils/format';
 	import { usageLabel } from '$lib/utils/library';
 	import { spoolSource } from '$lib/api/spoolSource';
+	import { readSpoolSnapshot } from '$lib/api/spoolReadFence';
 	import { allPages } from '$lib/api/query';
 	import { isAbortError } from '$lib/api/http';
 	import { classifyDeleteFailure, planFilamentDelete } from '$lib/library/deletion';
@@ -84,6 +85,7 @@
 	let filamentId = $derived(filament.id);
 	const SPOOL_PAGE = 100;
 	let spools = $state<Spool[]>([]);
+	let spoolsRevision = $state(-1);
 	// Bumped by live spool events so adding/removing/editing a spool refetches
 	// this filament's list (the fetch below is server-ordered, not read from the
 	// cache, so it needs an explicit nudge to stay in sync).
@@ -91,36 +93,53 @@
 	// Archived spools are hidden by default here, same as in the library list.
 	let showArchived = $state(false);
 	$effect(() => live.subscribe('spool', {}, () => revision++));
+	let previousUncertainIds: number[] = [];
+	$effect(() => {
+		const current = inventory.uncertainSpoolIds();
+		if (previousUncertainIds.some((id) => !current.includes(id))) revision++;
+		previousUncertainIds = current;
+	});
 	// Aggregate remaining weight across the currently-listed spools, so the header
 	// answers "how much of this filament do I actually have?" (#572, #347, #265).
 	// Follows the same `spools` list, so it respects the showArchived toggle for free.
-	let totalRemaining = $derived(spools.reduce((sum, s) => sum + (s.remaining ?? 0), 0));
+	let totalRemaining = $derived(
+		spools.reduce((sum, s) => sum + (inventory.spoolById(s.id)?.remaining ?? s.remaining ?? 0), 0)
+	);
 	$effect(() => {
 		const id = filamentId;
 		const archived = showArchived;
+		const renameRevision = inventory.spoolRenameRevision;
 		void revision; // refetch on live spool events
 		const ctrl = new AbortController();
 		// Every spool, not the first page: the count and total above are read off
 		// this list. That renders all of them; a filament with thousands of spools
 		// would want a "show more" here and the group endpoint's totals for the header.
-		allPages(SPOOL_PAGE, (offset) =>
-			spoolSource.listSpools({
-				filters: {},
-				sort: [
-					{ field: 'last_used', dir: 'desc' },
-					{ field: 'id', dir: 'asc' }
-				],
-				groupScope: { field: 'filament', key: id },
-				allowArchived: archived,
-				limit: SPOOL_PAGE,
-				offset,
-				lowThreshold: settings.lowThreshold,
-				signal: ctrl.signal
-			})
+		readSpoolSnapshot(
+			() =>
+				allPages(SPOOL_PAGE, (offset) =>
+					spoolSource.listSpools({
+						filters: {},
+						sort: [
+							{ field: 'last_used', dir: 'desc' },
+							{ field: 'id', dir: 'asc' }
+						],
+						groupScope: { field: 'filament', key: id },
+						allowArchived: archived,
+						limit: SPOOL_PAGE,
+						offset,
+						lowThreshold: settings.lowThreshold,
+						signal: ctrl.signal
+					})
+				),
+			(items) => items,
+			ctrl.signal
 		)
 			.then((items) => {
 				// A spool used mid-load moves up the sort and can turn up on two pages.
-				if (!ctrl.signal.aborted) spools = [...new Map(items.map((s) => [s.id, s])).values()];
+				if (!ctrl.signal.aborted && renameRevision === inventory.spoolRenameRevision) {
+					spools = [...new Map(items.map((s) => [s.id, s])).values()];
+					spoolsRevision = renameRevision;
+				}
 			})
 			.catch((e) => {
 				if (!isAbortError(e, ctrl.signal)) console.error('Failed to load filament spools', e);
@@ -135,7 +154,9 @@
 
 	function set(patch: Partial<Filament>) {
 		inventory.patchFilament(filament.id, patch);
-		saver.push(filament.id, patch);
+		const pending = saver.push(filament.id, patch);
+		inventory.trackRelationWrite('filament', filament.id, pending);
+		return pending;
 	}
 
 	// A GTIN is stored normalized and the API refuses anything that isn't a whole, valid
@@ -147,12 +168,11 @@
 	function setGtin(value: string) {
 		if (!value.trim()) {
 			gtinInvalid = false;
-			set({ gtin: '' });
-			return;
+			return set({ gtin: '' });
 		}
 		const normalized = normalizeGtin(value);
 		gtinInvalid = normalized === null;
-		if (normalized !== null && normalized !== filament.gtin) set({ gtin: normalized });
+		if (normalized !== null) return set({ gtin: normalized });
 	}
 
 	const extraSaver = makeExtraSaver(
@@ -162,6 +182,18 @@
 		() => filament.extra
 	);
 	$effect(() => () => extraSaver.flush());
+	$effect(() =>
+		inventory.observeRelationDrafts(() => {
+			saver.flush();
+			extraSaver.flush();
+		})
+	);
+
+	function setExtra(key: string, value: string | undefined) {
+		const pending = extraSaver.change(key, value);
+		inventory.trackRelationWrite('filament', filament.id, pending);
+		return pending;
+	}
 
 	// --- delete -------------------------------------------------------------
 
@@ -310,8 +342,10 @@
 
 	<SectionLabel>
 		<span style="padding-left:20px"
-			>{m['inspector.spoolsCount']({ count: spools.length })}{#if spools.length}<span class="total"
-					>{m['inspector.spoolsTotalRemaining']({ weight: weightAuto(totalRemaining) })}</span
+			>{m['inspector.spoolsCount']({
+				count: spools.length
+			})}{#if spools.length && !spools.some((s) => inventory.isSpoolUncertain(s.id) || !inventory.spoolById(s.id))}<span
+					class="total">{m['inspector.spoolsTotalRemaining']({ weight: weightAuto(totalRemaining) })}</span
 				>{/if}</span
 		>
 		{#snippet right()}
@@ -336,16 +370,25 @@
 				data-sveltekit-noscroll
 			>
 				<span class="id mono">#{s.id}</span>
-				<span class="state">{s.archived ? m['spool.fields.archived']() : usageLabel(s)}</span>
-				<span class="barwrap">
-					<ProgressBar
-						value={pct(s.remaining, s.initial)}
-						width="100%"
-						danger={settings.isLow(s.remaining, s.unused)}
-					/>
-				</span>
-				<span class="rem mono">{weightAuto(s.remaining)}</span>
-				<span class="loc">{s.location ?? ''}</span>
+				{#if inventory.isSpoolUncertain(s.id) || !inventory.spoolById(s.id)}
+					<span class="state">{m['spool.uncertainShort']()}</span>
+				{:else}
+					{@const current = inventory.spoolById(s.id) ?? s}
+					<span class="state">{current.archived ? m['spool.fields.archived']() : usageLabel(current)}</span>
+					<span class="barwrap">
+						<ProgressBar
+							value={pct(current.remaining, current.initial)}
+							width="100%"
+							danger={settings.isLow(current.remaining, current.unused)}
+						/>
+					</span>
+					<span class="rem mono">{weightAuto(current.remaining)}</span>
+					<span class="loc">
+						{spoolsRevision === inventory.spoolRenameRevision && !inventory.spoolRenamesInFlight
+							? (current.location ?? '')
+							: ''}
+					</span>
+				{/if}
 			</a>
 		{/each}
 	</div>
@@ -362,6 +405,7 @@
 						value={filament.material}
 						options={materialNames}
 						underline
+						protectDraft
 						oninput={(v) => set({ material: v })}
 					/>
 				</Field>
@@ -377,6 +421,7 @@
 				<Field label={m['filament.fields.diameter']()}>
 					<NumberInput
 						dense
+						protectDraft
 						width="200px"
 						unit="mm"
 						step={0.05}
@@ -388,6 +433,7 @@
 				<Field label={m['filament.fields.density']()}>
 					<NumberInput
 						dense
+						protectDraft
 						width="200px"
 						unit="g/cm³"
 						step={0.01}
@@ -399,6 +445,7 @@
 				<Field label={m['filament.fields.weight']()} help={m['filament.fieldsHelp.weight']()}>
 					<NumberInput
 						dense
+						protectDraft
 						width="200px"
 						unit="g"
 						step={50}
@@ -413,6 +460,7 @@
 				<Field label={m['filament.fields.spoolWeight']()} help={m['filament.fieldsHelp.spoolWeight']()}>
 					<NumberInput
 						dense
+						protectDraft
 						width="200px"
 						unit="g"
 						step={10}
@@ -429,6 +477,7 @@
 				<Field label={m['filament.fields.settingsExtruderTemp']()}>
 					<NumberInput
 						dense
+						protectDraft
 						width="200px"
 						unit="°C"
 						step={5}
@@ -440,6 +489,7 @@
 				<Field label={m['filament.fields.settingsBedTemp']()}>
 					<NumberInput
 						dense
+						protectDraft
 						width="200px"
 						unit="°C"
 						step={5}
@@ -451,6 +501,7 @@
 				<Field label={m['filament.fields.price']()}>
 					<NumberInput
 						dense
+						protectDraft
 						width="200px"
 						unit={settings.currency}
 						step={1}
@@ -478,7 +529,7 @@
 				</Field>
 			</FieldGrid>
 
-			<ExtraFieldsSection entity="filament" extra={filament.extra} onchange={extraSaver.change} manage />
+			<ExtraFieldsSection entity="filament" extra={filament.extra} onchange={setExtra} manage />
 
 			<TagsSection kind="filament" id={filament.id} tags={filament.tags} />
 		</div>

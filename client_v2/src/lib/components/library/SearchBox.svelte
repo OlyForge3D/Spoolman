@@ -42,6 +42,8 @@
 	let query = $state('');
 	let threshold = $state(loadThreshold());
 	let results = $state<SearchResults | null>(null);
+	let resultsRevision = $state(0);
+	let recoveryRevision = $state(0);
 	let loading = $state(false);
 	let errored = $state(false);
 	let open = $state(false);
@@ -59,9 +61,17 @@
 	// slider re-queries so colour results update live).
 	let reqId = 0;
 	let controller: AbortController | undefined;
+	let previousUncertainIds: number[] = [];
+	$effect(() => {
+		const current = inventory.uncertainSpoolIds();
+		if (previousUncertainIds.some((id) => !current.includes(id))) recoveryRevision++;
+		previousUncertainIds = current;
+	});
 	$effect(() => {
 		const q = query.trim();
 		const thr = threshold;
+		void inventory.spoolRenameRevision;
+		void recoveryRevision;
 		if (!q) {
 			results = null;
 			loading = false;
@@ -74,10 +84,12 @@
 		const timer = setTimeout(() => {
 			controller?.abort();
 			controller = new AbortController();
+			const readRevision = inventory.spoolRenameRevision;
 			searchAll(q, thr, controller.signal)
 				.then((r) => {
 					if (mine !== reqId) return;
 					results = r;
+					resultsRevision = readRevision;
 					loading = false;
 					errored = false;
 					activeIndex = -1;
@@ -322,7 +334,10 @@
 				{#if results && results.spools.length}
 					<div class="section-label">{m['search.section.spools']()}</div>
 					{#each results.spools as spool (spool.entity.id)}
-						{@const filament = inventory.filamentById(spool.entity.filamentId)}
+						{@const currentSpool = inventory.spoolById(spool.entity.id)}
+						{@const uncertain = inventory.isSpoolUncertain(spool.entity.id)}
+						{@const unavailable = uncertain || !currentSpool}
+						{@const filament = !unavailable ? inventory.filamentById(currentSpool.filamentId) : undefined}
 						<a
 							class="result"
 							class:active={activeIndex === indexOf(`spool:${spool.entity.id}`)}
@@ -338,11 +353,17 @@
 							<span class="id mono">#{spool.entity.id}</span>
 							<Swatch colors={filament?.colors ?? []} direction={filament?.multiColorDirection} size={20} />
 							<span class="text">
-								<span class="title" use:truncTitle>{filament?.name || m['search.unknownFilament']()}</span>
-								{#if spool.entity.location}<span class="sub" use:truncTitle>{spool.entity.location}</span
+								<span class="title" use:truncTitle
+									>{unavailable
+										? m['spool.uncertainShort']()
+										: filament?.name || m['search.unknownFilament']()}</span
+								>
+								{#if resultsRevision === inventory.spoolRenameRevision && !inventory.spoolRenamesInFlight && !uncertain && currentSpool?.location}<span
+										class="sub"
+										use:truncTitle>{currentSpool.location}</span
 									>{/if}
 							</span>
-							<span class="match">{matchLabel('spool', spool.matchField)}</span>
+							{#if !unavailable}<span class="match">{matchLabel('spool', spool.matchField)}</span>{/if}
 						</a>
 					{/each}
 				{/if}
@@ -392,13 +413,18 @@
 										class:active={activeIndex === indexOf(`filament:${filament.entity.id}/spool:${s.id}`)}
 										class:archived={s.archived}
 										href={searchResultHref(page.url.searchParams, page.url.pathname, 'spool', String(s.id))}
-										title={s.location ?? undefined}
+										title={resultsRevision === inventory.spoolRenameRevision &&
+										!inventory.spoolRenamesInFlight &&
+										!inventory.isSpoolUncertain(s.id)
+											? (inventory.spoolById(s.id)?.location ??
+												(inventory.spoolRenameRevision ? undefined : s.location))
+											: undefined}
 										data-sveltekit-noscroll
 										onclick={onResultClick}
 									>
 										<span class="mono">#{s.id}</span>
-										{#if s.remainingWeight !== undefined}<span class="pill-weight"
-												>{weightAuto(s.remainingWeight)}</span
+										{#if !inventory.isSpoolUncertain(s.id) && s.remainingWeight !== undefined}<span
+												class="pill-weight">{weightAuto(s.remainingWeight)}</span
 											>{/if}
 									</a>
 								{/each}

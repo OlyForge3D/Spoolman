@@ -69,7 +69,9 @@
 
 	function set(patch: Partial<Vendor>) {
 		inventory.patchVendor(vendor.id, patch);
-		saver.push(vendor.id, patch);
+		const pending = saver.push(vendor.id, patch);
+		inventory.trackRelationWrite('vendor', vendor.id, pending);
+		return pending;
 	}
 
 	const extraSaver = makeExtraSaver(
@@ -79,6 +81,18 @@
 		() => vendor.extra
 	);
 	$effect(() => () => extraSaver.flush());
+	$effect(() =>
+		inventory.observeRelationDrafts(() => {
+			saver.flush();
+			extraSaver.flush();
+		})
+	);
+
+	function setExtra(key: string, value: string | undefined) {
+		const pending = extraSaver.change(key, value);
+		inventory.trackRelationWrite('vendor', vendor.id, pending);
+		return pending;
+	}
 
 	// --- delete -------------------------------------------------------------
 
@@ -174,6 +188,7 @@
 				<Field label={m['vendor.fields.emptySpoolWeight']()} help={m['vendor.fieldsHelp.emptySpoolWeight']()}>
 					<NumberInput
 						dense
+						protectDraft
 						unit="g"
 						step={10}
 						min={0}
@@ -191,7 +206,7 @@
 				</Field>
 			</FieldGrid>
 
-			<ExtraFieldsSection entity="vendor" extra={vendor.extra} onchange={extraSaver.change} manage />
+			<ExtraFieldsSection entity="vendor" extra={vendor.extra} onchange={setExtra} manage />
 		</div>
 		<div class="col">
 			<SectionLabel right={filaments.length ? showAsList : undefined}>{m['filament.filament']()}</SectionLabel

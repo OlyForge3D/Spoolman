@@ -3,6 +3,7 @@
 	   Every href below comes from a src/lib/library/params.ts helper, which already
 	   resolves against the deploy base path; resolving again would double-apply it. */
 	import Swatch from '../Swatch.svelte';
+	import { setContext } from 'svelte';
 	import Button from '../Button.svelte';
 	import ConfirmDialog from '../ConfirmDialog.svelte';
 	import NumberInput from '../NumberInput.svelte';
@@ -34,15 +35,24 @@
 	import { usageLabel } from '$lib/utils/library';
 	import { formatGtin } from '$lib/filament/gtin';
 	import { spoolSource } from '$lib/api/spoolSource';
+	import { observeLayoutRenames } from '$lib/dashboard/layout';
 	import { classifyDeleteFailure } from '$lib/library/deletion';
+	import { SPOOL_EDIT_UNAVAILABLE } from '$lib/library/spoolEditContext';
 	import { toasts } from '$lib/stores/toasts.svelte';
 	import { makeSaver, makeExtraSaver } from '$lib/utils/saver';
-	import { trackSave } from '$lib/utils/autosave';
+	import { reportSaveError, trackSave } from '$lib/utils/autosave';
 	import { page } from '$app/state';
 	import { resolve } from '$app/paths';
 	import * as m from '$lib/paraglide/messages';
 
 	let { spool }: { spool: Spool } = $props();
+	setContext(SPOOL_EDIT_UNAVAILABLE, () => inventory.isSpoolUncertain(spool.id));
+
+	function canEdit(): boolean {
+		if (!inventory.isSpoolUncertain(spool.id)) return true;
+		toasts.error(m['spool.uncertainDetails']());
+		return false;
+	}
 
 	const MISSING_FIL: Filament = {
 		id: '',
@@ -123,11 +133,24 @@
 	// dropdown or type a new one. Merge the server's configured locations with the
 	// spool's current value so it's never absent from the list.
 	let serverLocations = $state<string[]>([]);
+	let locationsRevision = $state(0);
+	$effect(() =>
+		observeLayoutRenames((field) => {
+			if (field === 'location') locationsRevision++;
+		})
+	);
 	$effect(() => {
+		void locationsRevision;
+		let active = true;
 		spoolSource
 			.locationChoices()
-			.then((l) => (serverLocations = l))
-			.catch(() => {});
+			.then((l) => {
+				if (active) serverLocations = l;
+			})
+			.catch((error: unknown) => console.error('Failed to load locations', error));
+		return () => {
+			active = false;
+		};
 	});
 	let locationOptions = $derived(
 		[...new Set([...serverLocations, spool.location].filter((l): l is string => !!l))].sort()
@@ -200,6 +223,7 @@
 		if (typeof localStorage !== 'undefined') localStorage.setItem(ADJUST_MODE_KEY, mode);
 	}
 	async function applyAdjust() {
+		if (!canEdit()) return;
 		const v = parseFloat(adjustVal);
 		if (isNaN(v) || (adjustMode === 'measured_weight' && v < 0)) {
 			adjustError =
@@ -226,18 +250,32 @@
 	}
 	// Optimistic flip, then persist. The list filters archived spools out by
 	// default, so unarchiving from here is the only way back once one is hidden.
-	function toggleArchived() {
+	let archiving = $state(false);
+	async function toggleArchived() {
+		if (archiving || !canEdit()) return;
+		const id = spool.id;
 		const next = !spool.archived;
-		inventory.patchSpool(spool.id, { archived: next });
-		spoolSource.setSpoolArchived(spool.id, next).catch((e) => {
-			inventory.patchSpool(spool.id, { archived: !next });
-			console.error('Archive toggle failed', e);
-		});
+		archiving = true;
+		inventory.patchSpool(id, { archived: next });
+		try {
+			await spoolSource.setSpoolArchived(id, next);
+		} catch (e) {
+			inventory.patchSpool(id, { archived: !next });
+			reportSaveError(e, 'Archive toggle failed', m['inspector.archiveFailed']());
+		} finally {
+			archiving = false;
+		}
 	}
 
 	function set(patch: Partial<Spool>) {
+		if (!canEdit()) return Promise.resolve(false);
+		if (spoolSource.isAmbiguousSpoolAssignment(patch)) {
+			toasts.error(m['spool.ambiguousAssignment']());
+			return Promise.resolve(false);
+		}
+		const result = saver.push(spool.id, patch);
 		inventory.patchSpool(spool.id, patch);
-		saver.push(spool.id, patch);
+		return result;
 	}
 
 	/**
@@ -250,13 +288,15 @@
 	 * `remaining` maps to `remaining_weight`, which would rewrite the used weight.
 	 */
 	function setFullWeight(v: number | undefined) {
+		if (!canEdit()) return Promise.resolve(false);
 		const effective = v ?? filament.weight;
+		const result = saver.push(spool.id, { initial: v });
 		inventory.patchSpool(spool.id, {
 			initialOverride: v,
 			initial: effective,
 			remaining: Math.max(effective - spool.usedWeight, 0)
 		});
-		saver.push(spool.id, { initial: v });
+		return result;
 	}
 
 	const extraSaver = makeExtraSaver(
@@ -266,6 +306,22 @@
 		() => spool.extra
 	);
 	$effect(() => () => extraSaver.flush());
+	$effect(() =>
+		inventory.observeSpoolUncertainty((id) => {
+			if (id !== spool.id) return;
+			saver.flush();
+			extraSaver.flush();
+		})
+	);
+
+	function setExtra(key: string, value: string | undefined) {
+		if (!canEdit()) return Promise.resolve(false);
+		if (spoolSource.isAmbiguousSpoolAssignment({ extra: { [key]: value ?? null } })) {
+			toasts.error(m['spool.ambiguousAssignment']());
+			return Promise.resolve(false);
+		}
+		return extraSaver.change(key, value);
+	}
 
 	// --- delete -------------------------------------------------------------
 
@@ -292,6 +348,7 @@
 	);
 
 	async function remove() {
+		if (!canEdit()) return;
 		deleting = true;
 		// The pending edit belongs to a spool that is about to stop existing.
 		saver.cancel();
@@ -355,6 +412,7 @@
 			>
 			<Button
 				variant="outline"
+				disabled={archiving}
 				onclick={toggleArchived}
 				title={spool.archived ? m['buttons.unArchive']() : m['buttons.archive']()}
 			>
@@ -450,6 +508,7 @@
 						placeholder={m['library.noLocation']()}
 						options={locationOptions}
 						underline
+						protectDraft
 						oninput={(v) => set({ location: v })}
 					/>
 				</Field>
@@ -461,6 +520,7 @@
 				<Field label={m['spool.fields.weight']()} help={m['spool.fieldsHelp.weight']()}>
 					<NumberInput
 						dense
+						protectDraft
 						width="285px"
 						unit="g"
 						step={50}
@@ -475,6 +535,7 @@
 				<Field label={m['spool.fields.spoolWeight']()} help={m['spool.fieldsHelp.spoolWeight']()}>
 					<NumberInput
 						dense
+						protectDraft
 						width="285px"
 						unit="g"
 						step={10}
@@ -491,6 +552,7 @@
 				<Field label={m['spool.fields.price']()} help={m['spool.fieldsHelp.price']()}>
 					<NumberInput
 						dense
+						protectDraft
 						width="285px"
 						unit={settings.currencySymbol}
 						min={0}
@@ -515,7 +577,7 @@
 				</Field>
 			</FieldGrid>
 
-			<ExtraFieldsSection entity="spool" extra={spool.extra} onchange={extraSaver.change} manage />
+			<ExtraFieldsSection entity="spool" extra={spool.extra} onchange={setExtra} manage />
 
 			<TagsSection kind="spool" id={spool.id} tags={spool.tags} />
 		</div>

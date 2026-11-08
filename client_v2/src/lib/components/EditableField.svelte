@@ -5,13 +5,15 @@
 	import ExternalLink from '@lucide/svelte/icons/external-link';
 	import { getFieldLabelId } from './fieldLabel';
 	import { extractUrls } from '$lib/utils/links';
+	import { makeDraftTracker } from '$lib/utils/draftTracker';
+	import type { SaveResult } from '$lib/utils/saver';
 	import * as m from '$lib/paraglide/messages';
 
 	interface Props {
 		value: string | number;
 		placeholder?: string;
 		mono?: boolean;
-		oninput?: (value: string) => void;
+		oninput?: (value: string) => SaveResult;
 		/** Accessible name, for use outside a <Field> that supplies one. */
 		ariaLabel?: string;
 		/**
@@ -37,15 +39,18 @@
 	// Named by the enclosing <Field>'s label cell when there is one; see fieldLabel.ts.
 	const labelId = getFieldLabelId();
 
-	// What the user typed is kept as a draft until they leave the box; an invalid
-	// draft stays visible so it can be corrected. Autosave responses, live updates
-	// and refetched lists can otherwise overwrite newer typing (#1307). The
-	// inspector is keyed by entity, so a different selection gets a fresh field.
+	// Autosave responses and live updates must not overwrite newer typing, even
+	// after blur. Invalid or failed drafts stay visible so they can be corrected.
 	let draft = $state<string | null>(null);
 	const external = $derived(String(value ?? ''));
+	const tracker = makeDraftTracker(
+		() => (draft = null),
+		() => !invalid
+	);
+	$effect(() => () => tracker.dispose());
 	function onInput(v: string) {
 		draft = v;
-		oninput?.(v);
+		tracker.change('value', oninput?.(v));
 	}
 
 	let urls = $derived(linkify ? extractUrls(draft ?? external) : []);
@@ -61,10 +66,9 @@
 		aria-label={ariaLabel}
 		aria-labelledby={ariaLabel ? undefined : labelId}
 		aria-invalid={invalid}
+		onfocus={() => tracker.focus('value')}
 		oninput={(e) => onInput(e.currentTarget.value)}
-		onblur={() => {
-			if (!invalid) draft = null;
-		}}
+		onblur={() => tracker.blur('value')}
 	/>
 	{#each urls as url (url)}
 		<a

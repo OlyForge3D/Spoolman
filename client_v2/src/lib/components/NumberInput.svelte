@@ -2,6 +2,8 @@
 	import { untrack } from 'svelte';
 	import * as m from '$lib/paraglide/messages';
 	import { getFieldLabelId } from './fieldLabel';
+	import { makeDraftTracker } from '$lib/utils/draftTracker';
+	import type { SaveResult } from '$lib/utils/saver';
 	import { normalizeDecimal, numericInput, parseDecimal } from '$lib/utils/numeric';
 	// A themed numeric input. It is a text input rather than `type="number"`: that
 	// lets it accept a decimal comma ("1,75") as well as a point, and lets it refuse
@@ -13,7 +15,7 @@
 	//   2. Numeric/commit: pass `onchange` (and a number/string `value`); the value is
 	//      controlled and `onchange` fires with the parsed number on blur/step. Handy for
 	//      callers that keep numbers in an immutable object and commit on change.
-	interface Props {
+	interface CommonProps {
 		value: string | number;
 		min?: number;
 		max?: number;
@@ -33,14 +35,24 @@
 		dense?: boolean;
 		/** Disable the input and steppers. */
 		disabled?: boolean;
-		/** Commit callback. When set, the component runs in numeric/commit mode. */
-		onchange?: (value: number) => void;
-		/** Commit-mode only: called instead of `onchange` when the field is left empty,
-		    for fields where blank means "unset" (e.g. a price that falls back to a default). */
-		onclear?: () => void;
 		/** Accessible name, for use outside a <Field> or <label> that supplies one. */
 		ariaLabel?: string;
 	}
+	// Inspector commits report whether their autosave succeeded. Other numeric
+	// fields retain their existing synchronous/bindable behavior.
+	type Props = CommonProps &
+		(
+			| {
+					protectDraft: true;
+					onchange: (value: number) => Promise<boolean>;
+					onclear?: () => Promise<boolean>;
+			  }
+			| {
+					protectDraft?: false;
+					onchange?: (value: number) => void;
+					onclear?: () => void;
+			  }
+		);
 	let {
 		value = $bindable(),
 		min,
@@ -56,6 +68,7 @@
 		disabled = false,
 		onchange,
 		onclear,
+		protectDraft = false,
 		ariaLabel
 	}: Props = $props();
 
@@ -65,17 +78,23 @@
 	// What the parent sees is always canonical (a dot, or a number). What the user
 	// sees is the text they typed, kept here as a draft — that's how a decimal comma,
 	// and a half-finished "1," or "", survive a round trip through the parent.
-	// The draft is dropped as soon as the parent moves the value somewhere the draft
-	// doesn't mean (a clamp, a preset button, another element selected); a value that
-	// merely echoes back what was typed leaves it alone. In commit mode the draft is
-	// also what defers `onchange` until blur or a step.
+	// Ordinarily a different parent value (a clamp, preset or selection) drops the
+	// draft. Inspectors opt into retaining it during editing and pending/failed saves.
+	// In commit mode the draft also defers `onchange` until blur or a step.
 	let draft = $state<string | null>(null);
 	const external = $derived(value == null ? '' : String(value));
 	const shown = $derived(draft ?? external);
+	const tracker = makeDraftTracker(() => (draft = null));
+	$effect(() => () => tracker.dispose());
 	$effect(() => {
 		const incoming = external;
 		untrack(() => {
-			if (draft !== null && parseDecimal(draft) !== parseDecimal(incoming)) draft = null;
+			if (
+				draft !== null &&
+				parseDecimal(draft) !== parseDecimal(incoming) &&
+				(!protectDraft || !tracker.isProtected('value'))
+			)
+				draft = null;
 		});
 	});
 	// A minus sign is only offered where a negative value is actually allowed.
@@ -90,19 +109,23 @@
 		draft = v;
 		if (!onchange) value = normalizeDecimal(v);
 	}
+	function track(result: SaveResult) {
+		if (protectDraft && result && typeof result.then === 'function') tracker.change('value', result);
+	}
 	function commit() {
 		if (!onchange) return;
 		const raw = (draft ?? external).trim();
-		if (onclear && raw === '') onclear();
-		else onchange(clamp(parseDecimal(raw) ?? 0));
+		const result = onclear && raw === '' ? onclear() : onchange(clamp(parseDecimal(raw) ?? 0));
+		track(result);
 	}
 	function bump(dir: 1 | -1) {
 		const base = parseDecimal(shown) ?? min ?? 0;
 		let next = clamp(base + dir * step);
 		next = Math.round(next * 1e6) / 1e6; // trim float noise
 		draft = String(next);
-		if (onchange) onchange(next);
-		else value = String(next);
+		if (onchange) {
+			track(onchange(next));
+		} else value = String(next);
 	}
 	// A text input has no native stepping, so keep the arrow keys a number input gave us.
 	function onKeydown(e: KeyboardEvent) {
@@ -125,8 +148,14 @@
 		type="text"
 		use:numericInput={{ negative }}
 		value={shown}
+		onfocus={() => {
+			if (protectDraft) tracker.focus('value');
+		}}
 		oninput={(e) => onInput(e.currentTarget.value)}
 		onchange={commit}
+		onblur={() => {
+			if (protectDraft) tracker.blur('value');
+		}}
 		onkeydown={onKeydown}
 		{placeholder}
 		{disabled}

@@ -14,6 +14,7 @@
 	// pressing a second one. A 409 on submit is still handled: the lookup can be
 	// stale, and the server is the authority.
 	import Button from './Button.svelte';
+	import UncertainSpools from './UncertainSpools.svelte';
 	import X from '@lucide/svelte/icons/x';
 	import Nfc from '@lucide/svelte/icons/nfc';
 	import Smartphone from '@lucide/svelte/icons/smartphone';
@@ -34,7 +35,7 @@
 	import { scanRelay } from '$lib/api/scanRelay';
 	import { scanner } from '$lib/stores/scanner.svelte';
 	import { inventory } from '$lib/stores/inventory.svelte';
-	import { spoolSource } from '$lib/api/spoolSource';
+	import { spoolSource, SpoolRenameUncertainError } from '$lib/api/spoolSource';
 	import { toasts } from '$lib/stores/toasts.svelte';
 	import { isAbortError } from '$lib/api/http';
 	import { nfcSupported, readTagUid, NfcError, type NfcErrorReason } from '$lib/utils/nfc';
@@ -67,6 +68,18 @@
 		| { state: 'bad' }
 		| { state: 'unknown' };
 	let lookup = $state<Lookup>({ state: 'empty' });
+	let uncertainIds = $derived.by(() => {
+		const ids: number[] = [];
+		if (target.kind === 'spool' && inventory.isSpoolUncertain(Number(target.id))) ids.push(Number(target.id));
+		if (
+			lookup.state === 'taken' &&
+			lookup.holder.kind === 'spool' &&
+			inventory.isSpoolUncertain(lookup.holder.spool.id) &&
+			!ids.includes(lookup.holder.spool.id)
+		)
+			ids.push(lookup.holder.spool.id);
+		return ids;
+	});
 
 	let nfcReading = $state(false);
 	let nfcError = $state<NfcErrorReason | null>(null);
@@ -200,7 +213,9 @@
 		if (holder.kind === 'filament') {
 			return m['tags.modal.filamentNamed']({ name: nameOf(holder.filament) });
 		}
-		const other: Spool = holder.spool;
+		const other: Spool | undefined = inventory.spoolById(holder.spool.id);
+		if (!other || inventory.isSpoolUncertain(other.id))
+			return m['tags.modal.spoolShort']({ id: holder.spool.id });
 		const filament = inventory.filamentById(other.filamentId);
 		if (!filament) return m['tags.modal.spoolShort']({ id: other.id });
 		return m['tags.modal.spoolNamed']({ id: other.id, name: nameOf(filament) });
@@ -219,10 +234,21 @@
 	async function submit() {
 		const value = uid.trim();
 		if (!value || busy) return;
+		if (uncertainIds.length) {
+			error = m['spool.uncertainDetails']();
+			return;
+		}
 		busy = true;
 		error = null;
+		const destination = { ...target };
 		try {
-			await linkTag(target, value, format);
+			const link = () => {
+				if (destination.kind === 'spool' && inventory.isSpoolUncertain(Number(destination.id)))
+					throw new SpoolRenameUncertainError(undefined);
+				return linkTag(destination, value, format);
+			};
+			if (destination.kind === 'spool') await spoolSource.withSpoolWriteBarrier(async () => link());
+			else await link();
 			toasts.success(m['tags.added']());
 			close();
 		} catch (err) {
@@ -234,6 +260,8 @@
 				const holder = await fetchHolder(conflict.holder).catch(() => undefined);
 				lookup = holder ? { state: 'taken', holder } : { state: 'unknown' };
 				error = holder ? null : conflict.message;
+			} else if (err instanceof SpoolRenameUncertainError) {
+				error = m['spool.uncertainDetails']();
 			} else if (isBadUid(err)) {
 				lookup = { state: 'bad' };
 			} else {
@@ -255,23 +283,53 @@
 	async function move(from: TagHolder) {
 		const value = uid.trim();
 		if (!value || busy) return;
+		if (uncertainIds.length) {
+			error = m['spool.uncertainDetails']();
+			return;
+		}
 		busy = true;
 		error = null;
+		const destination = { ...target };
+		const source = holderTarget(from);
 		try {
-			await unlinkTag(holderTarget(from), value);
-			await linkTag(target, value, format);
+			const uncertain = () =>
+				(source.kind === 'spool' && inventory.isSpoolUncertain(Number(source.id))) ||
+				(destination.kind === 'spool' && inventory.isSpoolUncertain(Number(destination.id)));
+			const transfer = async () => {
+				if (uncertain()) throw new SpoolRenameUncertainError(undefined);
+				await unlinkTag(source, value);
+				if (uncertain()) {
+					lookup = { state: 'free' };
+					return false;
+				}
+				await linkTag(destination, value, format);
+				return true;
+			};
+			const moved =
+				source.kind === 'spool' || destination.kind === 'spool'
+					? await spoolSource.withSpoolWriteBarrier(transfer)
+					: await transfer();
+			if (!moved) {
+				error =
+					source.kind === 'spool' && destination.kind === 'spool'
+						? m['tags.modal.moveFailed']()
+						: m['tags.modal.moveFailedFilament']();
+				return;
+			}
 			toasts.success(
 				from.kind === 'spool'
 					? m['tags.moved']({ id: from.spool.id })
 					: m['tags.movedFromFilament']({ name: nameOf(from.filament) })
 			);
 			close();
-		} catch {
+		} catch (err) {
 			// "neither spool" is only the truth when both ends are spools.
 			error =
-				from.kind === 'spool' && target.kind === 'spool'
-					? m['tags.modal.moveFailed']()
-					: m['tags.modal.moveFailedFilament']();
+				err instanceof SpoolRenameUncertainError
+					? m['spool.uncertainDetails']()
+					: source.kind === 'spool' && destination.kind === 'spool'
+						? m['tags.modal.moveFailed']()
+						: m['tags.modal.moveFailedFilament']();
 		} finally {
 			busy = false;
 		}
@@ -346,6 +404,10 @@
 					{/if}
 				</div>
 
+				{#if uncertainIds.length}
+					<UncertainSpools ids={uncertainIds} />
+				{/if}
+
 				<div class="ways">
 					<div class="way">
 						<Radio size={14} class="way-ico" />
@@ -392,7 +454,7 @@
 				<Button variant="ghost" onclick={close}>{m['buttons.cancel']()}</Button>
 				{#if lookup.state === 'taken'}
 					{@const other = lookup.holder}
-					<Button variant="primary" disabled={busy} onclick={() => move(other)}>
+					<Button variant="primary" disabled={busy || uncertainIds.length > 0} onclick={() => move(other)}>
 						<Nfc size={15} />
 						{#if busy}
 							{m['tags.modal.moving']()}
@@ -405,7 +467,11 @@
 				{:else}
 					<Button
 						variant="primary"
-						disabled={busy || !uid.trim() || lookup.state === 'here' || lookup.state === 'bad'}
+						disabled={busy ||
+							uncertainIds.length > 0 ||
+							!uid.trim() ||
+							lookup.state === 'here' ||
+							lookup.state === 'bad'}
 						onclick={submit}
 					>
 						<Nfc size={15} />

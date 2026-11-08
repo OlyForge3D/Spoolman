@@ -16,6 +16,7 @@
 	import { scanner, isBrowsableRoute } from '$lib/stores/scanner.svelte';
 	import { toasts } from '$lib/stores/toasts.svelte';
 	import { inventory } from '$lib/stores/inventory.svelte';
+	import { fields } from '$lib/stores/fields.svelte';
 	import { getLocale, getTextDirection } from '$lib/paraglide/runtime';
 	import { openSearchResult } from '$lib/library/params';
 	import { filamentLabel } from '$lib/utils/library';
@@ -24,6 +25,17 @@
 	import type { Snippet } from 'svelte';
 
 	let { children }: { children: Snippet } = $props();
+	let retryingFields = $state(false);
+
+	async function retryFields() {
+		if (retryingFields) return;
+		retryingFields = true;
+		try {
+			await Promise.all(fields.failedEntities().map((entity) => fields.load(entity)));
+		} finally {
+			retryingFields = false;
+		}
+	}
 
 	// Keep <html data-theme> in sync with the preference (and OS changes when set
 	// to "system"). The initial paint is already themed by the inline script in
@@ -144,8 +156,16 @@
 		// Say what the tap did. The reader is often in another room from the screen,
 		// and a page that changes by itself with no word why reads as a glitch. The
 		// relay already cached the spool's filament and vendor, so naming is local.
-		const filament = scan.filament ?? inventory.filamentById(scan.spool?.filamentId ?? '');
-		const name = filament ? filamentLabel(filament, inventory.vendorById(filament.vendorId)) : '';
+		const cachedSpool = scan.spool ? inventory.spoolById(scan.spool.id) : undefined;
+		const uncertain = scan.spool && inventory.isSpoolUncertain(scan.spool.id);
+		const filament = uncertain
+			? undefined
+			: (scan.filament ?? inventory.filamentById(cachedSpool?.filamentId ?? ''));
+		const name = uncertain
+			? m['spool.uncertainShort']()
+			: filament
+				? filamentLabel(filament, inventory.vendorById(filament.vendorId))
+				: '';
 		toasts.info(
 			scan.spool
 				? m['tags.scan.openedSpool']({ id: scan.spool.id, name })
@@ -156,6 +176,13 @@
 
 <div class="app">
 	<TopBar onadd={() => ui.openAddModal()} onscan={() => ui.openScanner()} />
+
+	{#if fields.failedEntities().length}
+		<div class="field-error" role="alert">
+			<span>{m['fields.loadFailed']()}</span>
+			<button type="button" disabled={retryingFields} onclick={retryFields}>{m['buttons.retry']()}</button>
+		</div>
+	{/if}
 
 	<main>{@render children()}</main>
 	<Footer />
@@ -186,5 +213,27 @@
 		display: flex;
 		flex: 1;
 		min-height: 0;
+	}
+	.field-error {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		gap: 12px;
+		padding: 8px;
+		color: var(--text);
+		background: var(--surface-2);
+		font-size: 13px;
+	}
+	.field-error button {
+		border: 1px solid var(--border-strong);
+		border-radius: 6px;
+		background: var(--surface);
+		color: var(--text);
+		padding: 4px 10px;
+		cursor: pointer;
+	}
+	.field-error button:disabled {
+		cursor: wait;
+		opacity: 0.6;
 	}
 </style>

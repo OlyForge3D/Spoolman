@@ -2,6 +2,7 @@ import { wsUrl } from './config';
 import { getJson } from './http';
 import { mapSpool, mapFilament, mapVendor } from './map';
 import { inventory } from '$lib/stores/inventory.svelte';
+import { spoolSource } from './spoolSource';
 import type { Filament, Spool } from '$lib/types';
 
 // The NFC/RFID scan relay: a reader taps a tag, POSTs it to /api/v1/tag/scan,
@@ -87,22 +88,32 @@ function pathFor(pool: ReaderPool): string {
  * not a record.
  */
 function toScan(payload: Json): TagScan {
+	const revision = inventory.relationReadRevision();
 	const raw = payload.spool as Json | undefined;
 	let spool: Spool | undefined;
 	if (raw) {
-		if (raw.filament) {
-			inventory.upsertFilament(mapFilament(raw.filament));
-			if (raw.filament.vendor) inventory.upsertVendor(mapVendor(raw.filament.vendor));
-		}
 		spool = mapSpool(raw);
-		inventory.upsertSpool(spool);
+		const accepted = spoolSource.ingestScannedSpool(spool);
+		if (accepted && raw.filament) {
+			const embedded = mapFilament(raw.filament);
+			if (inventory.canCacheRelation('filament', embedded.id, revision)) inventory.upsertFilament(embedded);
+			if (raw.filament.vendor) {
+				const vendor = mapVendor(raw.filament.vendor);
+				if (inventory.canCacheRelation('vendor', vendor.id, revision)) inventory.upsertVendor(vendor);
+			}
+		}
 	}
 	const rawFilament = payload.filament as Json | undefined;
 	let filament: Filament | undefined;
 	if (rawFilament) {
-		if (rawFilament.vendor) inventory.upsertVendor(mapVendor(rawFilament.vendor));
-		filament = mapFilament(rawFilament);
-		inventory.upsertFilament(filament);
+		if (rawFilament.vendor) {
+			const vendor = mapVendor(rawFilament.vendor);
+			if (inventory.canCacheRelation('vendor', vendor.id, revision)) inventory.upsertVendor(vendor);
+		}
+		const incoming = mapFilament(rawFilament);
+		filament = inventory.canCacheRelation('filament', incoming.id, revision)
+			? inventory.cacheFilamentRead(incoming, revision)
+			: inventory.filamentById(incoming.id);
 	}
 	return {
 		uid: payload.uid,

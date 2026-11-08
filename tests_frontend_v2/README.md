@@ -58,6 +58,11 @@ client. Both complement the backend HTTP suite in
   `/sw.js` back in and asserts the new UI returns on its own with the
   registration and every cache gone. The fix it covers is
   `client_v2/static/sw.js`.
+- **`tests/screenshots.spec.ts`** — visual snapshots using a fixed dataset in a
+  dedicated database. Seeding can resume an intact partial seed after a retry;
+  it rejects unexpected or modified fixture rows instead of resetting them.
+  The Compose runner also reconciles ID sequences in its disposable PostgreSQL
+  database after a rolled-back insert, preserving the fixed screenshot IDs.
 
 The tests navigate purely through the UI — the top bar to reach each page, the
 "Add spools" button to reach the create modal. Only the initial "open the app"
@@ -94,19 +99,26 @@ Useful environment variables:
 
 ### Running the tests against an already-running instance
 
-If you already have Spoolman running somewhere, you can skip the orchestration
-and point Playwright straight at it:
+If you already have an **isolated test instance** of Spoolman running, you can
+skip the orchestration and point Playwright straight at it. Do not run these
+tests against a production database: they create records and change settings.
+Run screenshots first on a fresh database (or one containing only an intact
+screenshot seed), then run the functional suite:
 
 ```bash
 cd tests_frontend_v2
 npm ci
 npx playwright install --with-deps chromium
-SPOOLMAN_BASE_URL=http://localhost:8000 npx playwright test
+SPOOLMAN_BASE_URL=http://localhost:8000 npx playwright test --project screenshots
+SPOOLMAN_BASE_URL=http://localhost:8000 npx playwright test --project chromium
 ```
 
-The tests create data with unique, non-ASCII-tagged names, so they are safe to
-run repeatedly against a persistent instance (though a fresh database is what CI
-uses).
+The functional tests create uniquely named records, but leave test data behind.
+Start with a fresh database before running screenshots again after the functional
+suite; screenshot seeding will reject unrelated records rather than deleting them.
+For a manually managed PostgreSQL instance, reset the dedicated test database if
+a rolled-back insert advances an ID sequence; the Compose runner handles this
+automatically.
 
 ## CI
 

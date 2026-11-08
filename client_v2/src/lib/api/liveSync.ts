@@ -1,5 +1,5 @@
 import { live } from './live';
-import { inventory } from '$lib/stores/inventory.svelte';
+import { spoolSource } from './spoolSource';
 
 // Central live-sync: one subscription per resource that funnels remote events
 // into the reactive cache. Because every detail view (inspectors, locations)
@@ -10,7 +10,7 @@ import { inventory } from '$lib/stores/inventory.svelte';
 // Call once from the root layout.
 export function startLiveSync(): () => void {
 	const offs = (['spool', 'filament', 'vendor'] as const).map((resource) =>
-		live.subscribe(resource, {}, (event) => inventory.ingest(event))
+		live.subscribe(resource, {}, (event) => spoolSource.ingestLiveEvent(event))
 	);
 	return () => offs.forEach((off) => off());
 }

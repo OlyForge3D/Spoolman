@@ -7,6 +7,7 @@
 	import { fields } from '$lib/stores/fields.svelte';
 	import { settings } from '$lib/stores/settings.svelte';
 	import { spoolSource } from '$lib/api/spoolSource';
+	import UncertainSpools from '../UncertainSpools.svelte';
 	import { inventory } from '$lib/stores/inventory.svelte';
 	import type { Spool, Filament } from '$lib/types';
 	import * as m from '$lib/paraglide/messages';
@@ -52,9 +53,17 @@
 				.catch((e) => console.error('Failed to load spools for preview', e));
 		}
 	});
-	const previewSpools = $derived(inventory.spools.filter((s) => !s.archived).sort((a, b) => a.id - b.id));
+	const previewSpoolIds = $derived(
+		[
+			...new Set([
+				...inventory.spools.filter((s) => !s.archived).map((s) => s.id),
+				...inventory.uncertainSpoolIds()
+			])
+		].sort((a, b) => a - b)
+	);
 	const previewFilaments = $derived([...inventory.filaments].sort((a, b) => a.name.localeCompare(b.name)));
 	function spoolLabel(s: Spool): string {
+		if (inventory.isSpoolUncertain(s.id)) return `#${s.id} · ${m['spool.uncertainShort']()}`;
 		const f = inventory.filamentById(s.filamentId);
 		const v = f ? inventory.vendorById(f.vendorId) : undefined;
 		return `#${s.id} · ${f ? `${v ? v.name + ' ' : ''}${f.name}` : m.unknown()}`;
@@ -76,6 +85,9 @@
 		const vendor = filament ? inventory.vendorById(filament.vendorId) : undefined;
 		return { spool: s, filament, vendor };
 	});
+	const previewUncertain = $derived(
+		kind === 'spool' && previewId !== '' && inventory.isSpoolUncertain(Number(previewId))
+	);
 
 	// Fit the label into the canvas viewport (with sensible min/max zoom). The viewport is
 	// at most VIEW_W wide, but on a narrow screen it is only as wide as the stage actually
@@ -218,8 +230,11 @@
 						<option value={f.id}>{filamentLabel(f)}</option>
 					{/each}
 				{:else}
-					{#each previewSpools as s (s.id)}
-						<option value={String(s.id)}>{spoolLabel(s)}</option>
+					{#each previewSpoolIds as id (id)}
+						{@const spool = inventory.spoolById(id)}
+						<option value={String(id)}
+							>{spool ? spoolLabel(spool) : `#${id} · ${m['spool.uncertainShort']()}`}</option
+						>
 					{/each}
 				{/if}
 			</select>
@@ -227,20 +242,26 @@
 		<!-- Full-width measuring box: its width comes from the layout (never from the canvas
 		     inside it), so feeding it back into `pxPerMm` can't loop. -->
 		<div class="stage" bind:clientWidth={stageW}>
-			<LabelCanvas
-				{design}
-				binding={previewBinding}
-				baseUrl={settings.baseUrl}
-				{pxPerMm}
-				interactive
-				bind:selectedId
-				onchange={updateElement}
-			/>
+			{#if previewUncertain}
+				<UncertainSpools ids={[Number(previewId)]} />
+			{:else}
+				<LabelCanvas
+					{design}
+					binding={previewBinding}
+					baseUrl={settings.baseUrl}
+					{pxPerMm}
+					interactive
+					bind:selectedId
+					onchange={updateElement}
+				/>
+			{/if}
 		</div>
-		<div class="hint">
-			{m['labels.canvasHint']()}
-			{previewBinding ? m['labels.showingReal']() : m['labels.showingTags']()}
-		</div>
+		{#if !previewUncertain}
+			<div class="hint">
+				{m['labels.canvasHint']()}
+				{previewBinding ? m['labels.showingReal']() : m['labels.showingTags']()}
+			</div>
+		{/if}
 	</div>
 
 	<div class="inspector-area">

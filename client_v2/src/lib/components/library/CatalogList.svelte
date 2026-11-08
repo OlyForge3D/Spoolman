@@ -15,6 +15,7 @@
 	import { spoolSource } from '$lib/api/spoolSource';
 	import { isAbortError } from '$lib/api/http';
 	import { live } from '$lib/api/live';
+	import { inventory } from '$lib/stores/inventory.svelte';
 	import { weightAuto } from '$lib/utils/format';
 	import * as m from '$lib/paraglide/messages';
 
@@ -50,6 +51,7 @@
 		const q = buildCatalogQuery(s, ctrl.signal);
 		const withSections = s.view === 'filaments' && s.group === 'vendor';
 		void revision; // refetch on live events
+		void inventory.spoolRenameRevision;
 		const mine = ++reqId;
 		loading = true;
 		errored = false;

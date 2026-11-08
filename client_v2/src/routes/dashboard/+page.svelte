@@ -3,11 +3,14 @@
 	   Every href below comes from a src/lib/library/params.ts helper, which already
 	   resolves against the deploy base path; resolving again would double-apply it. */
 	import Swatch from '$components/Swatch.svelte';
+	import UncertainSpools from '$components/UncertainSpools.svelte';
 	import type { Spool } from '$lib/types';
 	import { inventory } from '$lib/stores/inventory.svelte';
 	import { settings } from '$lib/stores/settings.svelte';
 	import { fields } from '$lib/stores/fields.svelte';
-	import { spoolSource } from '$lib/api/spoolSource';
+	import { toasts } from '$lib/stores/toasts.svelte';
+	import { SpoolRenameUncertainError, spoolSource } from '$lib/api/spoolSource';
+	import { isCurrentSpoolRead, readSpoolSnapshot } from '$lib/api/spoolReadFence';
 	import { allPages } from '$lib/api/query';
 	import { live, type LiveEvent } from '$lib/api/live';
 	import { isAbortError } from '$lib/api/http';
@@ -16,9 +19,18 @@
 	import { truncTitle } from '$lib/actions/truncated';
 	import { extraFieldsHref } from '$lib/settings/params';
 	import { weightAuto } from '$lib/utils/format';
+	import { reportSaveError } from '$lib/utils/autosave';
 	import * as m from '$lib/paraglide/messages';
 	import { dashboardFields, DEFAULT_FIELD_KEY, type DashboardField } from '$lib/dashboard/fields';
-	import { loadLayout, saveGroups, saveSpoolOrders, type DashboardLayout } from '$lib/dashboard/layout';
+	import {
+		loadCurrentLayout,
+		observeLayoutRenames,
+		renameLayoutGroup,
+		renameSavedGroup,
+		saveGroups,
+		saveSpoolOrders,
+		type DashboardLayout
+	} from '$lib/dashboard/layout';
 	import { fieldKeyFromUrl, gotoField, rememberFieldKey, rememberedFieldKey } from '$lib/dashboard/params';
 	import { page } from '$app/state';
 	import { dndzone, type DndEvent } from 'svelte-dnd-action';
@@ -115,12 +127,14 @@
 	// re-reading it on each switch would race with an order this page had only just saved.
 	let layout = $state<DashboardLayout>({ groups: {}, spoolOrders: {} });
 	let layoutLoaded = $state(false);
+	let layoutError = $state(false);
+	let layoutRetry = $state(0);
 	let groupOrder = $derived(layout.groups[field.key] ?? []);
 	let spoolOrders = $derived(layout.spoolOrders[field.key] ?? {});
 
 	function saveOrder(order: string[]) {
 		layout.groups = { ...layout.groups, [field.key]: order };
-		saveGroups(layout.groups);
+		saveGroups(field.key, order);
 	}
 
 	// --- loaded data --------------------------------------------------------
@@ -151,7 +165,14 @@
 	let cards = $state<Card[]>([]);
 	let dragging = $state(false);
 	let cardsDragDisabled = $state(true);
+	let reloadAfterMoveFailure = $state(false);
+	let pendingMoves = $state(0);
+	let recoveryError = $state(false);
+	let recovering = $state(false);
+	let recoveryLoads: Record<string, number> = {};
+	let spoolStateVersion = 0;
 	let displayKeys = $derived(cards.map((c) => c.key));
+	let uncertainSpoolIds = $derived(inventory.uncertainSpoolIds());
 	// Nothing at all to show: no saved cards and no spools. Only decided once both loads have
 	// settled, so the help text doesn't flash on the way in.
 	let isEmpty = $derived(layoutLoaded && groupsLoaded && cards.length === 0);
@@ -168,30 +189,68 @@
 	// the page stacks a fresh set on top of each abandoned one.
 	let pageAbort = new AbortController();
 
-	async function loadGroups(fieldKey: DashboardField['key']) {
+	async function loadGroups(fieldKey: DashboardField['key'], replace = false) {
 		// Captured up front: by the time this settles, `pageAbort` may already be a fresh
 		// controller for a later view.
 		const signal = pageAbort.signal;
+		const version = spoolStateVersion;
 		try {
 			// Every group gets a card, so page through all of them rather than stopping at
 			// the first page; a group past it would never show up at all.
-			const groups = await allPages(GROUP_PAGE, (offset) =>
-				spoolSource.listGroups({
-					field: fieldKey,
-					filters: {},
-					sort: [{ field: 'group.title', dir: 'asc' }],
-					limit: GROUP_PAGE,
-					offset,
-					lowThreshold: settings.lowThreshold,
-					signal
-				})
+			const { groups, revision } = await readSpoolSnapshot(
+				() =>
+					allPages(GROUP_PAGE, (offset) =>
+						spoolSource.listGroups({
+							field: fieldKey,
+							filters: {},
+							sort: [{ field: 'group.title', dir: 'asc' }],
+							limit: GROUP_PAGE,
+							offset,
+							lowThreshold: settings.lowThreshold,
+							signal
+						})
+					),
+				(groups, revision) => ({ groups, revision }),
+				signal
 			);
+			if (signal.aborted) return;
+			if (replace && (dragging || pendingMoves || spoolStateVersion !== version)) {
+				reloadAfterMoveFailure = true;
+				return;
+			}
 			// A NULL value and an empty-string one are distinct rows to the database but the
 			// same "unassigned" card here, so counts are summed by key.
 			// eslint-disable-next-line svelte/prefer-svelte-reactivity -- transient local, not reactive state
 			const totals = new Map<string, number>();
 			for (const g of groups) totals.set(g.key, (totals.get(g.key) ?? 0) + g.spoolCount);
 
+			const refreshedPages = replace
+				? await Promise.all(
+						Object.entries(recoveryLoads)
+							.filter(([key]) => totals.has(key))
+							.map(async ([key, limit]) => {
+								if (!(await acquire(signal))) return null;
+								try {
+									return { key, page: await stagePage(fieldKey, key, limit, signal) };
+								} finally {
+									release();
+								}
+							})
+					)
+				: [];
+			if (signal.aborted) return;
+			if (replace && (dragging || pendingMoves || spoolStateVersion !== version)) {
+				reloadAfterMoveFailure = true;
+				return;
+			}
+			if (
+				!isCurrentSpoolRead(revision) ||
+				(replace && refreshedPages.some((result) => result && !result.page.isCurrent()))
+			) {
+				reloadAfterMoveFailure = true;
+				return;
+			}
+			if (replace) buckets = {};
 			for (const [key, total] of totals) {
 				const b = bucket(key);
 				b.total = total;
@@ -206,13 +265,56 @@
 				b.spools = [];
 				b.done = true;
 			}
+			if (replace) {
+				for (const result of refreshedPages) {
+					if (!result) continue;
+					result.page.commit();
+					const b = bucket(result.key);
+					b.spools = result.page.items;
+					b.total = result.page.total;
+					b.started = true;
+					b.done = result.page.items.length === 0 || result.page.items.length >= result.page.total;
+				}
+				recoveryError = false;
+				recovering = false;
+				recoveryLoads = {};
+			}
 		} catch (e) {
 			if (isAbortError(e, signal)) return;
 			console.error('Failed to load dashboard groups', e);
+			if (replace) recoveryError = true;
 		} finally {
-			groupsLoaded = true;
+			if (!signal.aborted) groupsLoaded = true;
 		}
 	}
+
+	function refreshBoard(extraKey?: string, extraLoaded = 0) {
+		for (const [key, b] of Object.entries(buckets)) {
+			if (b.started || b.spools.length > 0) {
+				const extent = Math.max(PAGE, b.spools.length + (b.loading ? PAGE : 0));
+				recoveryLoads[key] = Math.max(recoveryLoads[key] ?? 0, extent);
+			}
+		}
+		if (extraKey) recoveryLoads[extraKey] = Math.max(recoveryLoads[extraKey] ?? 0, PAGE, extraLoaded);
+		recovering = true;
+		pageAbort.abort();
+		pageAbort = new AbortController();
+		void loadGroups(field.key, true);
+	}
+
+	$effect(() => {
+		if (!reloadAfterMoveFailure || dragging || pendingMoves) return;
+		reloadAfterMoveFailure = false;
+		if (pageAbort.signal.aborted) return;
+		refreshBoard();
+	});
+
+	let previousUncertainIds: number[] = [];
+	$effect(() => {
+		const current = uncertainSpoolIds;
+		if (previousUncertainIds.some((id) => !current.includes(id))) reloadAfterMoveFailure = true;
+		previousUncertainIds = [...current];
+	});
 
 	// A screenful can be a dozen cards, and firing that many requests at once both queues
 	// behind the browser's per-host connection limit (which the live-update sockets already
@@ -242,6 +344,30 @@
 		waiting.shift()?.();
 	}
 
+	function fetchPage(fieldKey: DashboardField['key'], key: string, offset: number, signal: AbortSignal) {
+		return spoolSource.listSpools({
+			filters: {},
+			sort: [{ field: 'id', dir: 'asc' }],
+			groupScope: { field: fieldKey, key },
+			limit: PAGE,
+			offset,
+			lowThreshold: settings.lowThreshold,
+			signal
+		});
+	}
+
+	function stagePage(fieldKey: DashboardField['key'], key: string, limit: number, signal: AbortSignal) {
+		return spoolSource.stageSpools({
+			filters: {},
+			sort: [{ field: 'id', dir: 'asc' }],
+			groupScope: { field: fieldKey, key },
+			limit,
+			offset: 0,
+			lowThreshold: settings.lowThreshold,
+			signal
+		});
+	}
+
 	// Fetch one more page of a group's spools. Ordering is by id so paging is stable; the
 	// card's custom order is applied to what has been loaded (see `orderSpools`). Callers may
 	// fire this freely — it is a no-op while a request is in flight or once everything is
@@ -250,7 +376,8 @@
 		const b = bucket(key);
 		if (b.loading || b.done) return;
 		const signal = pageAbort.signal;
-		const scope = { field: field.key, key };
+		const fieldKey = field.key;
+		spoolStateVersion++;
 		b.started = true;
 		b.loading = true;
 		if (!(await acquire(signal))) {
@@ -259,21 +386,15 @@
 			return;
 		}
 		try {
-			const page = await spoolSource.listSpools({
-				filters: {},
-				sort: [{ field: 'id', dir: 'asc' }],
-				groupScope: scope,
-				limit: PAGE,
-				offset: b.spools.length,
-				lowThreshold: settings.lowThreshold,
-				signal
-			});
+			const page = await fetchPage(fieldKey, key, b.spools.length, signal);
+			if (signal.aborted) return;
 			// A spool moved in by a drag or a live event may already be held here.
 			const seen = new Set(page.items.map((s) => s.id));
 			const kept = b.spools.filter((s) => !seen.has(s.id));
 			b.spools = [...kept, ...page.items];
 			b.total = page.total;
 			b.done = page.items.length === 0 || b.spools.length >= page.total;
+			spoolStateVersion++;
 		} catch (e) {
 			// Leave the card unstarted so scrolling it back into view retries, rather than
 			// stranding it empty for the rest of the session. A cancelled request is the same
@@ -316,19 +437,31 @@
 
 	// Loaded once for the page, on its own controller — it outlives any single view mode.
 	$effect(() => {
+		void layoutRetry;
 		const abort = new AbortController();
+		layoutError = false;
 		(async () => {
 			try {
-				layout = await loadLayout(abort.signal);
+				layout = await loadCurrentLayout(abort.signal);
+				layoutLoaded = true;
 			} catch (e) {
 				if (isAbortError(e, abort.signal)) return;
 				console.error('Failed to load dashboard layout', e);
-			} finally {
-				layoutLoaded = true;
+				layoutError = true;
 			}
 		})();
 		return () => abort.abort();
 	});
+
+	$effect(() =>
+		observeLayoutRenames((renamedField, oldKey, newKey) => {
+			const renamed = renameLayoutGroup(layout, renamedField, oldKey, newKey);
+			const changed = renamed.groups !== layout.groups || renamed.spoolOrders !== layout.spoolOrders;
+			layout = renamed;
+			if (changed && field.key === renamedField && !pageAbort.signal.aborted)
+				refreshBoard(newKey, buckets[oldKey]?.spools.length ?? 0);
+		})
+	);
 
 	// A remote spool change is applied to the loaded cards directly — reloading them all would
 	// undo the point of paging. Counts (and any group that just came into or out of existence)
@@ -344,10 +477,15 @@
 	}
 
 	function applySpoolEvent(event: LiveEvent) {
+		spoolStateVersion++;
 		// Keep the shared cache fresh first: the chips read their filament from it.
-		inventory.ingest(event);
+		spoolSource.ingestLiveEvent(event);
 
 		const id = Number(event.id);
+		if (inventory.isSpoolUncertain(id)) {
+			reloadAfterMoveFailure = true;
+			return;
+		}
 		const spool = event.type !== 'deleted' && event.payload ? mapSpool(event.payload) : null;
 		// Archived spools are not shown here, so they leave their card like a deletion.
 		const newKey = spool && !spool.archived ? field.valueOf(spool) : null;
@@ -386,6 +524,9 @@
 		groupsLoaded = false;
 		cards = [];
 		editingKey = null;
+		recoveryError = false;
+		recovering = false;
+		recoveryLoads = {};
 		pageAbort = new AbortController();
 
 		loadGroups(fieldKey);
@@ -455,7 +596,7 @@
 		const desired = buildCards();
 		cards = desired;
 		const keys = desired.map((c) => c.key);
-		if (JSON.stringify(keys) !== JSON.stringify(groupOrder)) saveOrder(keys);
+		if (!recovering && JSON.stringify(keys) !== JSON.stringify(groupOrder)) saveOrder(keys);
 	});
 
 	// Arming the grid's drag zone from the grip has to happen BEFORE the press reaches the
@@ -497,6 +638,15 @@
 	// order. Diff-based, so the duplicate finalize fired on the other zone of a cross-card
 	// move is a harmless no-op.
 	function commitSpoolLayout() {
+		if (
+			cards.some((card) =>
+				card.spools.some((spool) => inventory.isSpoolUncertain(spool.id) && field.valueOf(spool) !== card.key)
+			)
+		) {
+			cards = buildCards();
+			toasts.error(m['spool.uncertainDetails']());
+			return;
+		}
 		const changed: { spool: Spool; key: string }[] = [];
 		for (const card of cards) {
 			const b = bucket(card.key);
@@ -510,8 +660,34 @@
 			// moved rather than recomputed from the list.
 			b.total += b.spools.length - before;
 		}
+		const changedField = field;
+		if (changed.length) spoolStateVersion++;
 		for (const { spool, key } of changed) {
-			field.assign(spool, key).catch((e) => console.error('Move failed', e));
+			pendingMoves++;
+			changedField
+				.assign(spool, key)
+				.catch((e) => {
+					const cached = inventory.spoolById(spool.id);
+					if (cached && changedField.valueOf(cached) === key) {
+						const restored = changedField.withValue(cached, changedField.valueOf(spool));
+						inventory.upsertSpool(restored);
+						if (field.key === changedField.key) {
+							const destination = buckets[key];
+							if (destination?.spools.some((item) => item.id === spool.id)) {
+								destination.spools = destination.spools.filter((item) => item.id !== spool.id);
+								destination.total = Math.max(0, destination.total - 1);
+								const original = bucket(changedField.valueOf(spool));
+								if (!original.spools.some((item) => item.id === spool.id)) {
+									original.spools = [...original.spools, restored];
+									original.total++;
+								}
+							}
+						}
+					}
+					reportSaveError(e, 'Move failed', m['dashboard.moveFailed']());
+					if (field.key === changedField.key && !pageAbort.signal.aborted) reloadAfterMoveFailure = true;
+				})
+				.finally(() => pendingMoves--);
 		}
 
 		// A card's saved order can only speak for the spools it has loaded. Ids from the
@@ -528,7 +704,7 @@
 		}
 		if (JSON.stringify(next) !== JSON.stringify(spoolOrders)) {
 			layout.spoolOrders = { ...layout.spoolOrders, [field.key]: next };
-			saveSpoolOrders(layout.spoolOrders);
+			saveSpoolOrders(field.key, next);
 		}
 	}
 
@@ -591,29 +767,30 @@
 		}
 
 		const old = buckets[oldKey];
+		const renamedField = field;
+		let renamedServer = false;
 		try {
 			if (old && old.total > 0) {
 				// One request moves the whole group, including the pages this card never loaded.
-				await field.rename(oldKey, newKey);
-				// Carry the loaded page over so the card doesn't have to refetch, and keep the
-				// shared cache in step so an inspector opened next shows the new value.
-				const moved = old.spools.map((s) => field.withValue(s, newKey));
-				for (const spool of moved) inventory.upsertSpool(spool);
-				buckets[newKey] = { ...old, spools: moved };
-				delete buckets[oldKey];
+				const result = await renamedField.rename(oldKey, newKey);
+				renamedServer = true;
+				if (!result.cacheRefreshed) toasts.error(m['dashboard.renameRefreshFailed']());
 			}
-			// Carry the card's custom spool order over to the new key.
-			if (spoolOrders[oldKey]) {
-				const { [oldKey]: carried, ...rest } = spoolOrders;
-				layout.spoolOrders = { ...layout.spoolOrders, [field.key]: { ...rest, [newKey]: carried } };
-				saveSpoolOrders(layout.spoolOrders);
-			}
-			// Rename in place in the saved order so the card keeps its position.
-			saveOrder(groupOrder.map((k) => (k === oldKey ? newKey : k)));
+			await renameSavedGroup(renamedField.key, oldKey, newKey);
+			if (pageAbort.signal.aborted || field.key !== renamedField.key) return;
 			editingKey = null;
 			renameError = '';
 		} catch (e) {
-			renameError = e instanceof Error ? e.message : m['dashboard.errorRename']();
+			if (renamedServer) {
+				reportSaveError(e, 'Failed to save renamed dashboard layout', m['dashboard.renameLayoutFailed']());
+				if (!pageAbort.signal.aborted && field.key === renamedField.key)
+					refreshBoard(newKey, old?.spools.length ?? 0);
+			} else if (e instanceof SpoolRenameUncertainError) {
+				console.error('The dashboard group rename outcome is unknown', e);
+				renameError = m['dashboard.renameOutcomeUnknown']();
+				if (!pageAbort.signal.aborted && field.key === renamedField.key) refreshBoard();
+				else toasts.error(m['dashboard.renameOutcomeUnknown']());
+			} else renameError = e instanceof Error ? e.message : m['dashboard.errorRename']();
 		}
 	}
 </script>
@@ -664,13 +841,33 @@
 			{/if}
 		</div>
 
-		{#if !isEmpty}
+		{#if layoutLoaded && !isEmpty}
 			<span class="hint">{m['dashboard.dragHint']({ field: field.label })}</span>
 		{/if}
 		{#if !field.choices}
-			<button class="add" onclick={addGroup}><Plus size={14} /> {m['dashboard.newGroup']()}</button>
+			<button class="add" onclick={addGroup} disabled={!layoutLoaded}
+				><Plus size={14} /> {m['dashboard.newGroup']()}</button
+			>
 		{/if}
 	</div>
+
+	{#if recoveryError}
+		<div class="recovery-error" role="alert">
+			<span>{m['dashboard.refreshFailed']()}</span>
+			<button onclick={() => refreshBoard()}>{m['buttons.retry']()}</button>
+		</div>
+	{/if}
+
+	{#if layoutError}
+		<div class="recovery-error" role="alert">
+			<span>{m['dashboard.layoutLoadFailed']()}</span>
+			<button onclick={() => layoutRetry++}>{m['buttons.retry']()}</button>
+		</div>
+	{/if}
+
+	{#if uncertainSpoolIds.length}
+		<div class="spool-recovery"><UncertainSpools ids={uncertainSpoolIds} /></div>
+	{/if}
 
 	<div
 		class="grid"
@@ -748,13 +945,20 @@
 						class="card-body"
 						style="min-height: min({bodyReserve(card.total)}px, var(--card-body-cap))"
 						onscroll={(e) => onBodyScroll(card.key, e)}
-						use:dndzone={{ items: card.spools, type: 'spool', flipDurationMs: FLIP, dropTargetStyle: {} }}
+						use:dndzone={{
+							items: card.spools,
+							type: 'spool',
+							flipDurationMs: FLIP,
+							dragDisabled: card.spools.some((spool) => inventory.isSpoolUncertain(spool.id)),
+							dropTargetStyle: {}
+						}}
 						onconsider={(e) => spoolConsider(idx, e as CustomEvent<DndEvent<Spool>>)}
 						onfinalize={(e) => spoolFinalize(idx, e as CustomEvent<DndEvent<Spool>>)}
 					>
 						{#each card.spools as s (s.id)}
-							{@const f = inventory.filamentById(s.filamentId)!}
-							{@const v = inventory.vendorOf(f)}
+							{@const current = inventory.spoolById(s.id) ?? s}
+							{@const f = inventory.filamentById(current.filamentId)}
+							{@const v = f ? inventory.vendorOf(f) : undefined}
 							<!-- A real link to the spool's inspector (open-in-new-tab, copy-link), but also
 							     a svelte-dnd-action drag item. `draggable=false` keeps the browser's native
 							     link drag from fighting the pointer-based dnd; a genuine drag never fires a
@@ -765,24 +969,38 @@
 								draggable="false"
 								animate:flip={{ duration: FLIP }}
 							>
-								<Swatch colors={f.colors} direction={f.multiColorDirection} size={22} radius={5} />
-								<div class="chip-info">
-									<!-- The optional parts are built as one expression rather than wrapped in
-									     an {#if}: at a block edge Svelte trims the adjacent whitespace, which ran
-									     the separator into the neighbouring word ("Bambu Lab -Bambu Green",
-									     "1 kg- Last used 2 days ago"). -->
-									<div class="chip-title" use:truncTitle>
+								{#if inventory.isSpoolUncertain(s.id)}
+									<div class="chip-title">
 										<span class="chip-id mono">#{s.id}</span>
-										{v.name === '?' ? f.name : `${v.name} - ${f.name}`}
+										{m['spool.uncertainShort']()}
 									</div>
-									<div class="chip-subtitle" use:truncTitle>
-										{f.material} -
-										<span class:low={settings.isLow(s.remaining, s.unused)}>{weightAuto(s.remaining)}</span>
-										/ {weightAuto(s.initial)}{s.lastUsedLabel
-											? ` - ${m['dashboard.lastUsed']({ time: s.lastUsedLabel })}`
-											: ''}
+								{:else if f}
+									<Swatch colors={f.colors} direction={f.multiColorDirection} size={22} radius={5} />
+									<div class="chip-info">
+										<!-- The optional parts are built as one expression rather than wrapped in
+										     an {#if}: at a block edge Svelte trims the adjacent whitespace, which ran
+										     the separator into the neighbouring word ("Bambu Lab -Bambu Green",
+										     "1 kg- Last used 2 days ago"). -->
+										<div class="chip-title" use:truncTitle>
+											<span class="chip-id mono">#{s.id}</span>
+											{v?.name === '?' ? f.name : `${v?.name} - ${f.name}`}
+										</div>
+										<div class="chip-subtitle" use:truncTitle>
+											{f.material} -
+											<span class:low={settings.isLow(current.remaining, current.unused)}
+												>{weightAuto(current.remaining)}</span
+											>
+											/ {weightAuto(current.initial)}{current.lastUsedLabel
+												? ` - ${m['dashboard.lastUsed']({ time: current.lastUsedLabel })}`
+												: ''}
+										</div>
 									</div>
-								</div>
+								{:else}
+									<div class="chip-title">
+										<span class="chip-id mono">#{s.id}</span>
+										{m['search.unknownFilament']()}
+									</div>
+								{/if}
 							</a>
 						{/each}
 					</div>
@@ -816,6 +1034,25 @@
 		align-items: center;
 		flex-wrap: wrap;
 		gap: 8px 12px;
+		margin-bottom: 16px;
+	}
+	.recovery-error {
+		display: flex;
+		align-items: center;
+		gap: 12px;
+		margin-bottom: 16px;
+		color: var(--danger-soft);
+		font-size: 13px;
+	}
+	.recovery-error button {
+		color: inherit;
+		background: transparent;
+		border: 1px solid currentColor;
+		border-radius: var(--radius);
+		padding: 4px 8px;
+		cursor: pointer;
+	}
+	.spool-recovery {
 		margin-bottom: 16px;
 	}
 	.title {

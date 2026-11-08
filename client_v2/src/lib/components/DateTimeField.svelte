@@ -15,6 +15,8 @@
 	import ChevronLeft from '@lucide/svelte/icons/chevron-left';
 	import ChevronRight from '@lucide/svelte/icons/chevron-right';
 	import { portal } from '$lib/actions/portal';
+	import { getContext } from 'svelte';
+	import { SPOOL_EDIT_UNAVAILABLE } from '$lib/library/spoolEditContext';
 
 	interface Props {
 		/** Current value as an ISO timestamp, or undefined if unset. */
@@ -23,6 +25,8 @@
 		oninput: (iso: string | undefined) => void;
 	}
 	let { value, oninput }: Props = $props();
+	const unavailable = getContext<(() => boolean) | undefined>(SPOOL_EDIT_UNAVAILABLE);
+	const isUnavailable = () => unavailable?.() ?? false;
 
 	const pad = (n: number) => String(n).padStart(2, '0');
 	// Month and weekday names come from Intl in the active locale; months use a
@@ -155,7 +159,7 @@
 
 	// --- emit ----------------------------------------------------------------
 	function commit() {
-		if (selYear === null || selMonth === null || selDay === null) return;
+		if (isUnavailable() || selYear === null || selMonth === null || selDay === null) return;
 		const d = new Date(selYear, selMonth, selDay, hour, minute, 0, 0);
 		oninput(d.toISOString());
 	}
@@ -208,6 +212,7 @@
 		commit();
 	}
 	function clear() {
+		if (isUnavailable()) return;
 		oninput(undefined);
 		close();
 	}
@@ -226,6 +231,7 @@
 		popStyle = `top:${top}px; left:${left}px;`;
 	}
 	function toggle() {
+		if (isUnavailable()) return;
 		if (open) close();
 		else {
 			syncFromValue();
@@ -235,6 +241,10 @@
 	function close() {
 		open = false;
 	}
+
+	$effect(() => {
+		if (isUnavailable()) close();
+	});
 
 	$effect(() => {
 		if (!open) return;
@@ -274,6 +284,7 @@
 		type="button"
 		class="trigger"
 		class:empty={!value}
+		disabled={isUnavailable()}
 		onclick={toggle}
 		aria-haspopup="dialog"
 		aria-expanded={open}
