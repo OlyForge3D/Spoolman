@@ -170,9 +170,6 @@ async def scan(
         return JSONResponse(status_code=400, content=Message(message=str(e)).dict())
 
     target = await tag_db.find_by_uid(db, uid)
-    db_spool = target if isinstance(target, models.Spool) else None
-    db_filament = target if isinstance(target, models.Filament) else None
-
     decoded = _decode_payload(body.format, body.payload_b64, uid)
 
     created = False
@@ -181,9 +178,9 @@ async def scan(
     # Only FFF tags create: an SLA tag describes a resin bottle, and the filament model has no
     # place for one. Validation of the decoded values happens inside create, before any write.
     creatable = decoded is not None and decoded.material_class == "FFF"
-    if db_spool is None and db_filament is None and body.create and creatable:
+    if target is None and body.create and creatable:
         try:
-            db_spool = await tag_db.create_spool_from_decoded_tag(
+            target = await tag_db.create_spool_from_decoded_tag(
                 db=db,
                 uid=uid,
                 tag_format=body.format,
@@ -194,13 +191,13 @@ async def scan(
             # Lost a race with a concurrent link of the same tag; report the winner as an
             # ordinary match rather than surfacing a conflict for a create nobody asked to see.
             target = await tag_db.find_by_uid(db, uid)
-            db_spool = target if isinstance(target, models.Spool) else None
-            db_filament = target if isinstance(target, models.Filament) else None
         except ItemCreateError:
             logger.warning("Refused to auto-create a spool from decoded tag %s", uid, exc_info=True)
             # Values we refused to store must not reach the client either: report the tag as undecodable.
             decoded = None
 
+    db_spool = target if isinstance(target, models.Spool) else None
+    db_filament = target if isinstance(target, models.Filament) else None
     scan_relay.register(reader_id, body.name, uid)
 
     result = TagScan(
