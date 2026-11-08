@@ -69,7 +69,7 @@
 
 	function set(patch: Partial<Vendor>) {
 		inventory.patchVendor(vendor.id, patch);
-		saver.push(vendor.id, patch);
+		return saver.push(vendor.id, patch);
 	}
 
 	const extraSaver = makeExtraSaver(

@@ -135,7 +135,7 @@
 
 	function set(patch: Partial<Filament>) {
 		inventory.patchFilament(filament.id, patch);
-		saver.push(filament.id, patch);
+		return saver.push(filament.id, patch);
 	}
 
 	// A GTIN is stored normalized and the API refuses anything that isn't a whole, valid
@@ -147,12 +147,11 @@
 	function setGtin(value: string) {
 		if (!value.trim()) {
 			gtinInvalid = false;
-			set({ gtin: '' });
-			return;
+			return set({ gtin: '' });
 		}
 		const normalized = normalizeGtin(value);
 		gtinInvalid = normalized === null;
-		if (normalized !== null && normalized !== filament.gtin) set({ gtin: normalized });
+		if (normalized !== null && normalized !== filament.gtin) return set({ gtin: normalized });
 	}
 
 	const extraSaver = makeExtraSaver(

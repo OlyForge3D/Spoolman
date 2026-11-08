@@ -16,14 +16,14 @@ import * as m from '$lib/paraglide/messages';
  *
  * @param context Short label for the console log when the save fails.
  */
-export function trackSave(promise: Promise<unknown>, context = 'Save failed'): Promise<void> {
-	return promise.then(
-		() => {
-			toasts.success(m['notifications.saveSuccessful']());
-		},
-		(e: unknown) => {
-			console.error(context, e);
-			toasts.error(m['notifications.error']({ statusCode: e instanceof HttpError ? e.status : '?' }));
-		}
-	);
+export async function trackSave(promise: Promise<unknown>, context = 'Save failed'): Promise<boolean> {
+	try {
+		await promise;
+		toasts.success(m['notifications.saveSuccessful']());
+		return true;
+	} catch (e: unknown) {
+		console.error(context, e);
+		toasts.error(m['notifications.error']({ statusCode: e instanceof HttpError ? e.status : '?' }));
+		return false;
+	}
 }

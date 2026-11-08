@@ -15,7 +15,9 @@ function harness(initial: Extra, id = 1) {
 		(_id, extra) => {
 			current = extra;
 		},
-		(id, patch) => persisted.push({ id, patch }),
+		(id, patch) => {
+			persisted.push({ id, patch });
+		},
 		() => current,
 		10
 	);
@@ -127,7 +129,9 @@ describe('cancel', () => {
 		vi.useFakeTimers();
 		try {
 			const saved: { id: number; patch: { name?: string } }[] = [];
-			const saver = makeSaver<number, { name: string }>((id, patch) => saved.push({ id, patch }), 10);
+			const saver = makeSaver<number, { name: string }>((id, patch) => {
+				saved.push({ id, patch });
+			}, 10);
 			saver.push(1, { name: 'renamed' });
 			saver.cancel();
 			vi.advanceTimersByTime(100);
@@ -140,11 +144,51 @@ describe('cancel', () => {
 
 	it('leaves the saver usable afterwards', () => {
 		const saved: { id: number; patch: { name?: string } }[] = [];
-		const saver = makeSaver<number, { name: string }>((id, patch) => saved.push({ id, patch }), 10);
+		const saver = makeSaver<number, { name: string }>((id, patch) => {
+			saved.push({ id, patch });
+		}, 10);
 		saver.push(1, { name: 'dropped' });
 		saver.cancel();
 		saver.push(2, { name: 'kept' });
 		saver.flush();
 		expect(saved).toEqual([{ id: 2, patch: { name: 'kept' } }]);
+	});
+});
+
+describe('save results', () => {
+	it('settles coalesced edits with the persistence result', async () => {
+		let resolveSave!: (success: boolean) => void;
+		const persist = vi.fn(
+			() =>
+				new Promise<boolean>((resolve) => {
+					resolveSave = resolve;
+				})
+		);
+		const saver = makeSaver<number, { name?: string }>(persist, 10);
+		const first = saver.push(1, { name: 'first' });
+		const latest = saver.push(1, { name: 'latest' });
+		saver.flush();
+
+		expect(persist).toHaveBeenCalledExactlyOnceWith(1, { name: 'latest' });
+		resolveSave(true);
+		await expect(first).resolves.toBe(true);
+		await expect(latest).resolves.toBe(true);
+	});
+
+	it('resolves false when persistence fails or the pending edit is cancelled', async () => {
+		const error = new Error('save failed');
+		const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+		try {
+			const saver = makeSaver<number, { name?: string }>(() => Promise.reject(error), 10);
+			const failed = saver.push(1, { name: 'failed' });
+			saver.flush();
+			await expect(failed).resolves.toBe(false);
+
+			const cancelled = saver.push(1, { name: 'cancelled' });
+			saver.cancel();
+			await expect(cancelled).resolves.toBe(false);
+		} finally {
+			log.mockRestore();
+		}
 	});
 });

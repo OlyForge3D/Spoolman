@@ -237,7 +237,7 @@
 
 	function set(patch: Partial<Spool>) {
 		inventory.patchSpool(spool.id, patch);
-		saver.push(spool.id, patch);
+		return saver.push(spool.id, patch);
 	}
 
 	/**
