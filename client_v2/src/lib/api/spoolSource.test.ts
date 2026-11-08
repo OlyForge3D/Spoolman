@@ -123,6 +123,35 @@ describe('importExternalFilament', () => {
 	});
 });
 
+describe('saveSpool', () => {
+	it('serializes writes to the same spool across independent callers', async () => {
+		const id = 121212;
+		let resolveFirst!: (response: Response) => void;
+		const firstResponse = new Promise<Response>((resolve) => {
+			resolveFirst = resolve;
+		});
+		const requests: RequestInit[] = [];
+		const fetch = vi.fn(async (_url: string, init?: RequestInit) => {
+			requests.push(init ?? {});
+			if (requests.length === 1) return firstResponse;
+			return Response.json({ id, location: 'Shelf', comment: 'latest' });
+		});
+		vi.stubGlobal('fetch', fetch);
+
+		const first = spoolSource.saveSpool(id, { location: 'Shelf' });
+		const second = spoolSource.saveSpool(id, { comment: 'latest' });
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalledOnce());
+		expect(JSON.parse(requests[0].body as string)).toEqual({ location: 'Shelf' });
+
+		resolveFirst(Response.json({ id, location: 'Shelf', comment: '' }));
+		await Promise.all([first, second]);
+
+		expect(fetch).toHaveBeenCalledTimes(2);
+		expect(JSON.parse(requests[1].body as string)).toEqual({ comment: 'latest' });
+		expect(inventory.spoolById(id)).toMatchObject({ location: 'Shelf', comment: 'latest' });
+	});
+});
+
 describe('createFilament', () => {
 	it.each([undefined, 0, 0.5])('sends optional numeric values unchanged: %s', async (value) => {
 		const fetch = vi.fn(async (_url: string, init: RequestInit) => {

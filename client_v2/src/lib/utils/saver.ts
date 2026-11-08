@@ -74,7 +74,13 @@ export function makeSaver<Id, Patch extends object>(
 
 	function enqueuePending() {
 		if (currentId === null || Object.keys(pending).length === 0) return;
-		queued.push({ id: currentId, patch: pending as Patch, waiters });
+		const last = queued.at(-1);
+		if (last?.id === currentId) {
+			last.patch = { ...last.patch, ...pending } as Patch;
+			last.waiters.push(...waiters);
+		} else {
+			queued.push({ id: currentId, patch: pending as Patch, waiters });
+		}
 		pending = {};
 		waiters = [];
 	}

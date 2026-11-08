@@ -269,4 +269,31 @@ describe('save results', () => {
 		pendingSaves[1](true);
 		await expect(previousEntity).resolves.toBe(true);
 	});
+
+	it('coalesces queued patches for the same entity behind an in-flight save', async () => {
+		const pendingSaves: ((success: boolean) => void)[] = [];
+		const persisted: { id: number; patch: { name?: string; comment?: string } }[] = [];
+		const saver = makeSaver<number, { name?: string; comment?: string }>((id, patch) => {
+			persisted.push({ id, patch });
+			return new Promise<boolean>((resolve) => pendingSaves.push(resolve));
+		}, 10);
+
+		const first = saver.push(1, { name: 'first' });
+		saver.flush();
+		const middle = saver.push(1, { name: 'obsolete' });
+		saver.flush();
+		const latest = saver.push(1, { name: 'latest', comment: 'updated' });
+		saver.flush();
+		expect(persisted).toEqual([{ id: 1, patch: { name: 'first' } }]);
+
+		pendingSaves[0](true);
+		await expect(first).resolves.toBe(true);
+		expect(persisted).toEqual([
+			{ id: 1, patch: { name: 'first' } },
+			{ id: 1, patch: { name: 'latest', comment: 'updated' } }
+		]);
+		pendingSaves[1](true);
+		await expect(middle).resolves.toBe(true);
+		await expect(latest).resolves.toBe(true);
+	});
 });

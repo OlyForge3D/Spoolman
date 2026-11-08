@@ -168,6 +168,22 @@ function cacheSpools(raw: unknown[]): Spool[] {
 }
 
 class HttpSpoolSource {
+	private readonly writeQueues = new Map<string, Promise<void>>();
+
+	private serializeWrite<T>(key: string, write: () => Promise<T>): Promise<T> {
+		const previous = this.writeQueues.get(key) ?? Promise.resolve();
+		const current = previous.then(write);
+		const tail = current.then(
+			() => {},
+			() => {}
+		);
+		this.writeQueues.set(key, tail);
+		void tail.then(() => {
+			if (this.writeQueues.get(key) === tail) this.writeQueues.delete(key);
+		});
+		return current;
+	}
+
 	async listGroups(query: GroupQuery): Promise<Page<GroupSummary>> {
 		const params: QueryParams = {
 			group_by: query.field,
@@ -422,9 +438,11 @@ class HttpSpoolSource {
 
 	// --- writes -------------------------------------------------------------
 
-	async saveSpool(id: number, patch: SpoolPatch): Promise<void> {
-		const updated = await patchJson<Json>(`/spool/${id}`, spoolPatchToApi(patch));
-		inventory.upsertSpool(mapSpool(updated));
+	saveSpool(id: number, patch: SpoolPatch): Promise<void> {
+		return this.serializeWrite(`spool:${id}`, async () => {
+			const updated = await patchJson<Json>(`/spool/${id}`, spoolPatchToApi(patch));
+			inventory.upsertSpool(mapSpool(updated));
+		});
 	}
 	async setSpoolArchived(id: number, archived: boolean): Promise<void> {
 		await this.saveSpool(id, { archived });
@@ -450,17 +468,21 @@ class HttpSpoolSource {
 		inventory.upsertSpool(spool);
 		return spool;
 	}
-	async saveFilament(id: string, patch: FilamentPatch): Promise<void> {
-		const updated = await patchJson<Json>(`/filament/${id}`, filamentPatchToApi(patch));
-		// The response embeds the manufacturer, which this patch may just have
-		// changed — cache it too, so a filament re-filed under one the cache has
-		// never seen resolves to a name rather than to nothing.
-		if (updated.vendor) inventory.upsertVendor(mapVendor(updated.vendor));
-		inventory.upsertFilament(mapFilament(updated));
+	saveFilament(id: string, patch: FilamentPatch): Promise<void> {
+		return this.serializeWrite(`filament:${id}`, async () => {
+			const updated = await patchJson<Json>(`/filament/${id}`, filamentPatchToApi(patch));
+			// The response embeds the manufacturer, which this patch may just have
+			// changed — cache it too, so a filament re-filed under one the cache has
+			// never seen resolves to a name rather than to nothing.
+			if (updated.vendor) inventory.upsertVendor(mapVendor(updated.vendor));
+			inventory.upsertFilament(mapFilament(updated));
+		});
 	}
-	async saveVendor(id: string, patch: VendorPatch): Promise<void> {
-		const updated = await patchJson<Json>(`/vendor/${id}`, vendorPatchToApi(patch));
-		inventory.upsertVendor(mapVendor(updated));
+	saveVendor(id: string, patch: VendorPatch): Promise<void> {
+		return this.serializeWrite(`vendor:${id}`, async () => {
+			const updated = await patchJson<Json>(`/vendor/${id}`, vendorPatchToApi(patch));
+			inventory.upsertVendor(mapVendor(updated));
+		});
 	}
 	async createSpool(body: Json): Promise<Spool> {
 		const created = await postJson<Json>('/spool', body);
