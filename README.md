@@ -58,3 +58,25 @@ If the new client misbehaves on your setup, set `SPOOLMAN_LEGACY_CLIENT=TRUE` to
 the previous one. Both ship in every release and talk to the same API, so your data is
 untouched either way — but please [report the problem](https://github.com/OlyForge3D/Spoolman/issues)
 so it can be fixed.
+
+## NFC reader integration
+
+`POST /api/v1/tag/scan` with `{"uid":"E0040108662F6FBC"}` performs UID lookup without
+changing inventory. `matched_spool_id` and `matched_filament_id` are always present;
+both are null for an unknown tag. A matched spool or filament is embedded in the response.
+Link explicitly with `POST /api/v1/spool/{id}/tag` or
+`POST /api/v1/filament/{id}/tag` and `{"uid":"..."}`. Unlink with
+`DELETE /api/v1/spool/{id}/tag/{uid}` or the corresponding filament route.
+Links persist in the database, not the ephemeral reader registry.
+
+UIDs are uppercase hex without separators. Case, separators and an optional `0x` prefix
+are normalized, but **byte order is preserved**. ISO15693/NFC-V clients must submit the
+eight-byte UID MSB first (`E0` first), consistently across scan, link and unlink.
+CoreNFC's displayed ISO15693 identifier uses this order; an adapter whose reader returns
+wire-order bytes must reverse them before sending. Do not retry lookup using both orders:
+they are distinct database keys, and existing links are not migrated automatically.
+
+Linking the same UID to the same target is idempotent (201). Linking it to a different
+target returns 409 and the current `spool_id` or `filament_id`; it never silently moves
+the tag. Unlink the existing owner explicitly before linking elsewhere. Invalid hex or
+odd-length UIDs return 400; missing/empty/oversized request fields return 422.
