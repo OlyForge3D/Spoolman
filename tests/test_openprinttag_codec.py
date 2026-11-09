@@ -610,6 +610,13 @@ def test_unsorted_indefinite_maps_skip_unknown_fields(meta: bytes) -> None:
         b"\x32\x0a\x02text/plainab\x56\x01\x02Tcd",  # type on final continuation
         b"\x32\x0a\x02text/plainab\x16\x00\x02cd",  # final chunk lacks ME
         b"\xd1\x01\x02Tab",  # MB set on a subsequent record
+        b"\x57\x00\x00",  # reserved TNF
+        b"\x50\x01\x00T",  # empty TNF with type
+        b"\x50\x00\x01x",  # empty TNF with payload
+        b"\x58\x00\x00\x01x",  # empty TNF with ID
+        b"\x55\x01\x00T",  # unknown TNF with type
+        b"\x51\x00\x00",  # well-known TNF without type
+        b"\x52\x00\x00",  # media TNF without type
     ],
 )
 def test_malformed_records_after_opt_prevent_enrichment(tail: bytes) -> None:
@@ -628,3 +635,10 @@ def test_valid_chunked_record_after_opt_is_supported() -> None:
 def test_bytes_after_message_end_are_rejected() -> None:
     record = _ndef_short_record("application/vnd.openprinttag", _cbor_payload({8: 0, 9: 0}))
     assert tags_decode.decode("openprinttag", _nfcv_memory(record + b"\x00")) is None
+
+
+@pytest.mark.parametrize("tail", [b"\x50\x00\x00", b"\x55\x00\x02ab"])
+def test_valid_empty_and_unknown_records_after_opt_are_supported(tail: bytes) -> None:
+    payload = _cbor_payload({8: 0, 9: 0, 11: "Brand"})
+    record = bytes([0x92, 28, len(payload)]) + b"application/vnd.openprinttag" + payload
+    assert decode_nfcv_memory(_nfcv_memory(record + tail)).brand_name == "Brand"

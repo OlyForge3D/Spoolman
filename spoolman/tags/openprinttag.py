@@ -120,6 +120,9 @@ _TLV_THREE_BYTE_LENGTH = 0xFF
 # NDEF record TNF (Type Name Format): Media-type, per RFC 2046
 _NDEF_TNF_MEDIA_TYPE = 0x02
 _NDEF_TNF_UNCHANGED = 0x06
+_NDEF_TNF_EMPTY = 0x00
+_NDEF_TNF_UNKNOWN = 0x05
+_NDEF_TNF_RESERVED = 0x07
 
 
 @dataclass
@@ -291,6 +294,18 @@ def _valid_chunk_header(header: int, type_length: int, *, in_chunk: bool) -> boo
     return tnf != _NDEF_TNF_UNCHANGED
 
 
+def _valid_record_lengths(header: int, type_length: int, id_length: int, payload_length: int) -> bool:
+    """Enforce the TNF-specific empty/unknown/typed record constraints."""
+    tnf = header & 0x07
+    if tnf == _NDEF_TNF_RESERVED:
+        return False
+    if tnf == _NDEF_TNF_EMPTY:
+        return type_length == id_length == payload_length == 0 and not header & 0x20
+    if tnf in (_NDEF_TNF_UNKNOWN, _NDEF_TNF_UNCHANGED):
+        return type_length == 0
+    return type_length > 0
+
+
 def _read_ndef_record(ndef_data: bytes, pos: int, *, in_chunk: bool) -> tuple[int, bytes, bytes, int] | None:
     """Read one bounded NDEF record, returning its header, type, payload and end."""
     header = ndef_data[pos]
@@ -312,7 +327,7 @@ def _read_ndef_record(ndef_data: bytes, pos: int, *, in_chunk: bool) -> tuple[in
         id_length = ndef_data[pos]
         pos += 1
     end = pos + type_length + id_length + payload_length
-    if end > len(ndef_data):
+    if end > len(ndef_data) or not _valid_record_lengths(header, type_length, id_length, payload_length):
         return None
     record_type = ndef_data[pos : pos + type_length]
     pos += type_length + id_length
