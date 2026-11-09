@@ -119,6 +119,7 @@ _TLV_THREE_BYTE_LENGTH = 0xFF
 
 # NDEF record TNF (Type Name Format): Media-type, per RFC 2046
 _NDEF_TNF_MEDIA_TYPE = 0x02
+_NDEF_TNF_UNCHANGED = 0x06
 
 
 @dataclass
@@ -280,18 +281,28 @@ def _read_ndef_length(ndef_data: bytes, pos: int, *, short_record: bool) -> tupl
     return int.from_bytes(ndef_data[pos : pos + 4], "big"), pos + 4
 
 
+def _valid_chunk_header(header: int, type_length: int, *, in_chunk: bool) -> bool:
+    """Validate unrelated chunk sequences without reassembling their payloads."""
+    if header & 0x20 and header & 0x40:
+        return False
+    tnf = header & 0x07
+    if in_chunk:
+        return tnf == _NDEF_TNF_UNCHANGED and type_length == 0 and not header & 0x88
+    return tnf != _NDEF_TNF_UNCHANGED
+
+
 def _parse_ndef_records(ndef_data: bytes) -> bytes | None:
     """Minimal NDEF parser that returns the payload of the application/vnd.openprinttag record.
 
     Handles short and standard NDEF records. Anything it cannot read is treated as no record.
     """
     pos = 0
+    in_chunk = False
     while pos < len(ndef_data):
         header = ndef_data[pos]
         pos += 1
 
-        if header & 0x20:  # OpenPrintTag forbids chunked records.
-            return None
+        chunk_follows = bool(header & 0x20)
         message_end = bool(header & 0x40)
         short_record = bool(header & 0x10)
         id_present = bool(header & 0x08)
@@ -301,6 +312,8 @@ def _parse_ndef_records(ndef_data: bytes) -> bytes | None:
             break
         type_length = ndef_data[pos]
         pos += 1
+        if not _valid_chunk_header(header, type_length, in_chunk=in_chunk):
+            return None
 
         length_result = _read_ndef_length(ndef_data, pos, short_record=short_record)
         if length_result is None:
@@ -325,8 +338,9 @@ def _parse_ndef_records(ndef_data: bytes) -> bytes | None:
         pos += payload_length
 
         if tnf == _NDEF_TNF_MEDIA_TYPE and record_type == OPENPRINTTAG_MIME.encode("ascii"):
-            return bytes(payload)
+            return None if chunk_follows else bytes(payload)
 
+        in_chunk = chunk_follows
         if message_end:
             break
 
@@ -398,6 +412,8 @@ def decode_payload(payload: bytes, nfc_tag_uid: bytes | None = None) -> OpenPrin
         raise ValueError("Invalid main region offset in OpenPrintTag meta section")
     if type(aux_offset) is not int or not meta_size <= aux_offset < len(payload):
         aux_offset = None  # the aux section is optional; a bad offset just means there isn't one
+    if aux_offset == main_offset:
+        raise ValueError("Overlapping main and aux regions in OpenPrintTag meta section")
 
     # Parse main section
     main_end = aux_offset if aux_offset is not None and aux_offset > main_offset else len(payload)

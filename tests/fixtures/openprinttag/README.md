@@ -20,3 +20,8 @@ the format has no on-wire version field. In `prusa_test01_data.bin`, offsets 35.
 are the final MIME record header `52 1c f5`, offsets 38..65 are the MIME type,
 and offsets 66..310 are its 245-byte CBOR payload. Tests extract these fixed offsets
 independently of Spoolman's NDEF parser to verify the mobile payload-only transport.
+
+The pinned official `utils/rec_info.py --show-data --opt-check --tag-uid E0040108662F6FBC`
+also validates `prusa_test01_data.bin`: both `validate.errors` and `opt_check.errors` are
+empty, and its derived instance UUID is `bf63e92d-9ca5-53d7-9fab-ffdd0240c585`.
+Only the recommended `nominal_full_length` and `actual_full_length` fields are absent.

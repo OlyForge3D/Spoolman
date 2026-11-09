@@ -555,3 +555,46 @@ def test_invalid_ndef_framing_is_not_decoded(corruption: str) -> None:
     else:
         raw[5] += 10
     assert tags_decode.decode("openprinttag", bytes(raw)) is None
+
+
+def test_unrelated_chunked_record_can_precede_openprinttag() -> None:
+    # First chunk: MB+CF+SR, MIME text/plain. Final chunk: SR, TNF unchanged.
+    unrelated = b"\xb2\x0a\x02text/plainab\x16\x00\x02cd"
+    payload = _cbor_payload({8: 0, 9: 0, 11: "Brand"})
+    opt_record = bytes([0x52, 28, len(payload)]) + b"application/vnd.openprinttag" + payload
+    data = decode_nfcv_memory(_nfcv_memory(unrelated + opt_record))
+    assert data.brand_name == "Brand"
+    assert data.material_type == "PLA"
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        b"\xb2\x0a\x02text/plainab",  # no continuation before OPT
+        b"\x16\x00\x02cd",  # continuation without a first chunk
+        b"\xb2\x0a\x02text/plainab\x16\x01\x02Tcd",  # continuation has a type
+        b"\xb2\x0a\x02text/plainab\x96\x00\x02cd",  # continuation starts a message
+        b"\xf2\x0a\x02text/plainab",  # CF and ME together
+    ],
+)
+def test_malformed_chunk_sequence_cannot_hide_openprinttag(prefix: bytes) -> None:
+    payload = _cbor_payload({8: 0, 9: 0})
+    record = bytes([0x52, 28, len(payload)]) + b"application/vnd.openprinttag" + payload
+    assert tags_decode.decode("openprinttag", _nfcv_memory(prefix + record)) is None
+
+
+def test_overlapping_main_aux_offsets_are_refused() -> None:
+    meta = cbor2.dumps({0: 16, 2: 16})
+    payload = meta.ljust(16, b"\x00") + cbor2.dumps({8: 0, 9: 0})
+    assert tags_decode.decode("openprinttag", payload) is None
+
+
+@pytest.mark.parametrize("meta", [b"\xa0", b"\xbf\xff"])
+def test_unsorted_indefinite_maps_skip_unknown_fields(meta: bytes) -> None:
+    # Main: {11:"Brand", 999:["a",1], 9:0, 8:0, 10:"Test"}, noncanonical order.
+    main = bytes.fromhex("bf0b654272616e641903e79f616101ff090008000a6454657374ff")
+    data = decode_payload(meta + main + b"\x00\xff")
+    assert data.brand_name == "Brand"
+    assert data.material_name == "Test"
+    assert data.material_class == "FFF"
+    assert data.material_type == "PLA"
