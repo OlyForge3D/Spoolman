@@ -598,3 +598,33 @@ def test_unsorted_indefinite_maps_skip_unknown_fields(meta: bytes) -> None:
     assert data.material_name == "Test"
     assert data.material_class == "FFF"
     assert data.material_type == "PLA"
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        b"",  # missing final ME
+        b"\x52",  # truncated record
+        b"\x32\x0a\x02text/plainab",  # unterminated unrelated chunk
+        b"\x56\x00\x02cd",  # continuation without a first chunk
+        b"\x32\x0a\x02text/plainab\x56\x01\x02Tcd",  # type on final continuation
+        b"\x32\x0a\x02text/plainab\x16\x00\x02cd",  # final chunk lacks ME
+        b"\xd1\x01\x02Tab",  # MB set on a subsequent record
+    ],
+)
+def test_malformed_records_after_opt_prevent_enrichment(tail: bytes) -> None:
+    payload = _cbor_payload({8: 0, 9: 0})
+    record = bytes([0x92, 28, len(payload)]) + b"application/vnd.openprinttag" + payload
+    assert tags_decode.decode("openprinttag", _nfcv_memory(record + tail)) is None
+
+
+def test_valid_chunked_record_after_opt_is_supported() -> None:
+    payload = _cbor_payload({8: 0, 9: 0, 11: "Brand"})
+    record = bytes([0x92, 28, len(payload)]) + b"application/vnd.openprinttag" + payload
+    tail = b"\x32\x0a\x02text/plainab\x56\x00\x02cd"
+    assert decode_nfcv_memory(_nfcv_memory(record + tail)).brand_name == "Brand"
+
+
+def test_bytes_after_message_end_are_rejected() -> None:
+    record = _ndef_short_record("application/vnd.openprinttag", _cbor_payload({8: 0, 9: 0}))
+    assert tags_decode.decode("openprinttag", _nfcv_memory(record + b"\x00")) is None

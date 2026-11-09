@@ -192,3 +192,26 @@ async def test_payload_cannot_replace_filament_link(tmp_path: Path):
         assert response.json()["created"] is False
         assert (await client.get("/api/v1/spool")).json() == []
         assert (await client.get("/api/v1/filament")).headers["x-total-count"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_malformed_record_after_opt_cannot_create_inventory(tmp_path: Path):
+    memory = bytearray((Path(__file__).parent / "fixtures/openprinttag/prusa_test01_data.bin").read_bytes())
+    memory[35] &= ~0x40  # OPT record no longer ends the message.
+    memory[6:8] = (303 + 4).to_bytes(2, "big")
+    memory[311:311] = b"\x56\x00\x01\x00"  # stray continuation after a valid OPT record
+    async with tag_client(tmp_path / "tags.db") as client:
+        body = {"uid": UID, "format": "openprinttag", "payload_b64": base64.b64encode(memory).decode(), "create": True}
+        response = await client.post("/api/v1/tag/scan", json=body)
+        assert response.status_code == 200
+        assert "decoded" not in response.json()
+        assert response.json()["created"] is False
+        assert (await client.get("/api/v1/spool")).json() == []
+        assert (await client.get("/api/v1/filament")).json() == []
+
+        filament_id = (await client.post("/api/v1/filament", json={"density": 1.24, "diameter": 1.75})).json()["id"]
+        assert (await client.post(f"/api/v1/filament/{filament_id}/tag", json={"uid": UID})).status_code == 201
+        response = await client.post("/api/v1/tag/scan", json=body)
+        assert response.json()["matched_filament_id"] == filament_id
+        assert response.json()["created"] is False
+        assert "decoded" not in response.json()

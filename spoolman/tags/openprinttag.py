@@ -291,59 +291,55 @@ def _valid_chunk_header(header: int, type_length: int, *, in_chunk: bool) -> boo
     return tnf != _NDEF_TNF_UNCHANGED
 
 
-def _parse_ndef_records(ndef_data: bytes) -> bytes | None:
-    """Minimal NDEF parser that returns the payload of the application/vnd.openprinttag record.
+def _read_ndef_record(ndef_data: bytes, pos: int, *, in_chunk: bool) -> tuple[int, bytes, bytes, int] | None:
+    """Read one bounded NDEF record, returning its header, type, payload and end."""
+    header = ndef_data[pos]
+    pos += 1
+    if pos >= len(ndef_data):
+        return None
+    type_length = ndef_data[pos]
+    pos += 1
+    if not _valid_chunk_header(header, type_length, in_chunk=in_chunk):
+        return None
+    length_result = _read_ndef_length(ndef_data, pos, short_record=bool(header & 0x10))
+    if length_result is None:
+        return None
+    payload_length, pos = length_result
+    id_length = 0
+    if header & 0x08:
+        if pos >= len(ndef_data):
+            return None
+        id_length = ndef_data[pos]
+        pos += 1
+    end = pos + type_length + id_length + payload_length
+    if end > len(ndef_data):
+        return None
+    record_type = ndef_data[pos : pos + type_length]
+    pos += type_length + id_length
+    return header, record_type, ndef_data[pos:end], end
 
-    Handles short and standard NDEF records. Anything it cannot read is treated as no record.
-    """
+
+def _parse_ndef_records(ndef_data: bytes) -> bytes | None:
+    """Return the first OPT payload only after validating the whole NDEF message."""
     pos = 0
     in_chunk = False
+    selected = None
     while pos < len(ndef_data):
-        header = ndef_data[pos]
-        pos += 1
-
-        chunk_follows = bool(header & 0x20)
-        message_end = bool(header & 0x40)
-        short_record = bool(header & 0x10)
-        id_present = bool(header & 0x08)
-        tnf = header & 0x07
-
-        if pos >= len(ndef_data):
-            break
-        type_length = ndef_data[pos]
-        pos += 1
-        if not _valid_chunk_header(header, type_length, in_chunk=in_chunk):
+        first_record = pos == 0
+        record = _read_ndef_record(ndef_data, pos, in_chunk=in_chunk)
+        if record is None:
             return None
-
-        length_result = _read_ndef_length(ndef_data, pos, short_record=short_record)
-        if length_result is None:
-            break
-        payload_length, pos = length_result
-
-        id_length = 0
-        if id_present:
-            if pos >= len(ndef_data):
-                break
-            id_length = ndef_data[pos]
-            pos += 1
-
-        if pos + type_length + id_length + payload_length > len(ndef_data):
+        header, record_type, payload, pos = record
+        if bool(header & 0x80) != first_record:
             return None
-        record_type = ndef_data[pos : pos + type_length]
-        pos += type_length
-
-        pos += id_length  # skip ID
-
-        payload = ndef_data[pos : pos + payload_length]
-        pos += payload_length
-
-        if tnf == _NDEF_TNF_MEDIA_TYPE and record_type == OPENPRINTTAG_MIME.encode("ascii"):
-            return None if chunk_follows else bytes(payload)
-
-        in_chunk = chunk_follows
-        if message_end:
-            break
-
+        in_chunk = bool(header & 0x20)
+        if header & 0x07 == _NDEF_TNF_MEDIA_TYPE and record_type == OPENPRINTTAG_MIME.encode("ascii"):
+            if in_chunk:
+                return None
+            if selected is None:
+                selected = payload
+        if header & 0x40:
+            return selected if pos == len(ndef_data) else None
     return None
 
 
