@@ -297,7 +297,14 @@ def _decode_openprinttag(payload: bytes, uid_bytes: bytes | None) -> DecodedTag 
     from spoolman.tags import openprinttag as openprinttag_codec  # noqa: PLC0415
 
     try:
-        data = openprinttag_codec.decode_nfcv_memory(payload, nfc_tag_uid=uid_bytes)
+        # A CBOR map starts with major type 5 (including indefinite maps). Full NFC-V
+        # memory starts with E1, so a failed memory decode is never retried as bare CBOR.
+        decoder = (
+            openprinttag_codec.decode_payload
+            if payload and payload[0] >> 5 == _MAJOR_MAP
+            else openprinttag_codec.decode_nfcv_memory
+        )
+        data = decoder(payload, nfc_tag_uid=uid_bytes)
     except ValueError:
         logger.debug("Could not decode payload as OpenPrintTag", exc_info=True)
         return None

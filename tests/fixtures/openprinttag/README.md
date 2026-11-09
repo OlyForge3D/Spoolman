@@ -13,3 +13,10 @@ builders produce.
   companion `01_info.yaml`/`01_input.yaml` are the ground truth the matching unit tests
   assert against (declared `tag_uid: E0040108662F6FBC`, expected field values, and
   spec-derived UUIDs from that repo's `utils/opt_check.py`).
+
+The interoperability contract is pinned to official source commit
+[`060e420892d66c062c8af440c97701aab96bac79`](https://github.com/OpenPrintTag/openprinttag-specification/tree/060e420892d66c062c8af440c97701aab96bac79);
+the format has no on-wire version field. In `prusa_test01_data.bin`, offsets 35..37
+are the final MIME record header `52 1c f5`, offsets 38..65 are the MIME type,
+and offsets 66..310 are its 245-byte CBOR payload. Tests extract these fixed offsets
+independently of Spoolman's NDEF parser to verify the mobile payload-only transport.

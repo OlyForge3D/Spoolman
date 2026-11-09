@@ -1,5 +1,6 @@
 """HTTP tag contracts against a disposable, file-backed SQLite database."""
 
+import base64
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -109,3 +110,85 @@ async def test_invalid_uid_rejected_without_database_mutation(tmp_path: Path, ui
         assert response.status_code == status
         assert (await client.get("/api/v1/spool")).json() == []
         assert (await client.get("/api/v1/filament")).json() == []
+
+
+def official_payload() -> bytes:
+    """Extract the independently specified MIME payload from Prusa's 01_data.bin."""
+    raw = (Path(__file__).parent / "fixtures/openprinttag/prusa_test01_data.bin").read_bytes()
+    assert raw[35:38] == bytes.fromhex("521cf5")
+    assert raw[38:66] == b"application/vnd.openprinttag"
+    return raw[66:311]
+
+
+@pytest.mark.asyncio
+async def test_payload_enrichment_and_explicit_creation_are_separate(tmp_path: Path):
+    async with tag_client(tmp_path / "tags.db") as client:
+        body = {"uid": UID, "format": "openprinttag", "payload_b64": base64.b64encode(official_payload()).decode()}
+        response = await client.post("/api/v1/tag/scan", json=body)
+        assert response.status_code == 200
+        decoded = response.json()["decoded"]
+        assert decoded["name"] == "PLA Prusa Galaxy Black"
+        assert decoded["material"] == "PLA"
+        assert decoded["vendor_name"] == "Prusament"
+        assert decoded["instance_uuid"] == "bf63e92d-9ca5-53d7-9fab-ffdd0240c585"
+        assert response.json()["matched_spool_id"] is None
+        assert response.json()["created"] is False
+        assert (await client.get("/api/v1/spool")).json() == []
+        assert (await client.get("/api/v1/filament")).json() == []
+
+        created = await client.post("/api/v1/tag/scan", json={**body, "create": True})
+        assert created.status_code == 200
+        assert created.json()["created"] is True
+        spool_id = created.json()["matched_spool_id"]
+        for payload in [body["payload_b64"], "not-base64", base64.b64encode(b"\xa0").decode()]:
+            scan = await client.post("/api/v1/tag/scan", json={**body, "payload_b64": payload, "create": True})
+            assert scan.status_code == 200
+            assert scan.json()["matched_spool_id"] == spool_id
+            assert scan.json()["created"] is False
+        assert (await client.get("/api/v1/spool")).headers["x-total-count"] == "1"
+        assert (await client.get("/api/v1/filament")).headers["x-total-count"] == "1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload", [b"\xa0", b"\xa0\xa1\x08", b'{"type":"OpenPrintTag"}', b"\x00", b"\xa0\xd8\x1c\xa0"]
+)
+async def test_failed_enrichment_never_creates_inventory(tmp_path: Path, payload: bytes):
+    async with tag_client(tmp_path / "tags.db") as client:
+        response = await client.post(
+            "/api/v1/tag/scan",
+            json={
+                "uid": UID,
+                "format": "openprinttag",
+                "payload_b64": base64.b64encode(payload).decode(),
+                "create": True,
+            },
+        )
+        assert response.status_code == 200
+        assert response.json()["created"] is False
+        assert response.json()["matched_spool_id"] is None
+        assert "decoded" not in response.json()
+        assert (await client.get("/api/v1/spool")).json() == []
+        assert (await client.get("/api/v1/filament")).json() == []
+
+
+@pytest.mark.asyncio
+async def test_payload_cannot_replace_filament_link(tmp_path: Path):
+    async with tag_client(tmp_path / "tags.db") as client:
+        filament_id = (await client.post("/api/v1/filament", json={"density": 1.24, "diameter": 1.75})).json()["id"]
+        assert (await client.post(f"/api/v1/filament/{filament_id}/tag", json={"uid": UID})).status_code == 201
+        response = await client.post(
+            "/api/v1/tag/scan",
+            json={
+                "uid": UID,
+                "format": "openprinttag",
+                "payload_b64": base64.b64encode(official_payload()).decode(),
+                "create": True,
+            },
+        )
+        assert response.status_code == 200
+        assert response.json()["matched_filament_id"] == filament_id
+        assert response.json()["matched_spool_id"] is None
+        assert response.json()["created"] is False
+        assert (await client.get("/api/v1/spool")).json() == []
+        assert (await client.get("/api/v1/filament")).headers["x-total-count"] == "1"

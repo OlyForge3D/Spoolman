@@ -36,6 +36,7 @@ from spoolman.tags.openprinttag import (
     _decode_cbor_map,
     _parse_ndef_records,
     decode_nfcv_memory,
+    decode_payload,
     uuid5_bytes,
 )
 
@@ -494,3 +495,63 @@ def test_uid_reported_with_e0_last_is_read_in_specification_order() -> None:
     data = decode_nfcv_memory(raw, nfc_tag_uid=reader_order)
 
     assert data.effective_instance_uuid == str(uuid5_bytes(UUID_NS_INSTANCE, spec_order))
+
+
+def test_official_mime_payload_matches_full_memory_decode() -> None:
+    """The official 01_data.bin MIME record starts at 35, with its payload at 66."""
+    raw = (_FIXTURES_DIR / "prusa_test01_data.bin").read_bytes()
+    assert raw[35:38] == bytes.fromhex("521cf5")
+    assert raw[38:66] == b"application/vnd.openprinttag"
+    payload = raw[66:311]
+    uid = bytes.fromhex("E0040108662F6FBC")
+    assert decode_payload(payload, uid) == decode_nfcv_memory(raw, uid)
+    decoded = tags_decode.decode("OpenPrintTag", payload, uid)
+    assert decoded is not None
+    assert decoded.name == "PLA Prusa Galaxy Black"
+    assert decoded.instance_uuid == "bf63e92d-9ca5-53d7-9fab-ffdd0240c585"
+
+
+@pytest.mark.parametrize("offset", [True, False, -1, 0, 1, 1000, "4"])
+def test_main_offset_cannot_point_inside_meta_or_outside_payload(offset: object) -> None:
+    payload = cbor2.dumps({0: offset}) + cbor2.dumps({8: 0, 9: 0})
+    assert tags_decode.decode("openprinttag", payload) is None
+
+
+@pytest.mark.parametrize("payload", [b"\xa0", b"\xa0\xa1\x08", b'{"format":"OpenPrintTag"}'])
+def test_missing_or_malformed_main_section_cannot_decode(payload: bytes) -> None:
+    assert tags_decode.decode("openprinttag", payload) is None
+
+
+def test_aux_before_main_and_leftover_region_padding_are_supported() -> None:
+    # Explicit offsets are relative to the MIME payload, not the NDEF message.
+    meta = cbor2.dumps({0: 32, 2: 16})
+    aux = bytes.fromhex("bf00187bff")  # indefinite map {0: 123}
+    payload = meta.ljust(16, b"\x00") + aux.ljust(16, b"\xff") + cbor2.dumps({11: "Brand", 8: 0, 9: 0})
+    data = decode_payload(payload)
+    assert data.brand_name == "Brand"
+    assert data.consumed_weight == 123
+
+
+def test_truncated_main_cannot_consume_aux_bytes() -> None:
+    meta = cbor2.dumps({2: 8})
+    payload = meta + bytes.fromhex("a208000b64") + cbor2.dumps({0: 123})
+    assert len(meta) == 3
+    assert tags_decode.decode("openprinttag", payload) is None
+
+
+@pytest.mark.parametrize("size", [True, -1, 0, 1, 1000, "4"])
+def test_declared_main_region_size_bounds_cbor(size: object) -> None:
+    payload = cbor2.dumps({1: size}) + cbor2.dumps({8: 0, 9: 0})
+    assert tags_decode.decode("openprinttag", payload) is None
+
+
+@pytest.mark.parametrize("corruption", ["chunked", "record-length", "tlv-length"])
+def test_invalid_ndef_framing_is_not_decoded(corruption: str) -> None:
+    raw = bytearray(_build_tag({8: 0, 9: 0}))
+    if corruption == "chunked":
+        raw[6] |= 0x20
+    elif corruption == "record-length":
+        raw[8] += 10
+    else:
+        raw[5] += 10
+    assert tags_decode.decode("openprinttag", bytes(raw)) is None

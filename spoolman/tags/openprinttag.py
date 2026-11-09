@@ -87,7 +87,9 @@ _MAX_CBOR_DEPTH = 8
 
 # Meta section field keys
 META_MAIN_REGION_OFFSET = 0
+META_MAIN_REGION_SIZE = 1
 META_AUX_REGION_OFFSET = 2
+META_AUX_REGION_SIZE = 3
 
 # Main section field keys (only the ones decoded below)
 MF_INSTANCE_UUID = 0
@@ -254,6 +256,8 @@ def _find_ndef_payload(raw_bytes: bytes) -> bytes | None:
             tlv_len = (raw_bytes[pos] << 8) | raw_bytes[pos + 1]
             pos += 2
 
+        if pos + tlv_len > len(raw_bytes):
+            return None
         if tag == _TLV_NDEF_MESSAGE:
             return _parse_ndef_records(raw_bytes[pos : pos + tlv_len])
 
@@ -286,6 +290,8 @@ def _parse_ndef_records(ndef_data: bytes) -> bytes | None:
         header = ndef_data[pos]
         pos += 1
 
+        if header & 0x20:  # OpenPrintTag forbids chunked records.
+            return None
         message_end = bool(header & 0x40)
         short_record = bool(header & 0x10)
         id_present = bool(header & 0x08)
@@ -308,6 +314,8 @@ def _parse_ndef_records(ndef_data: bytes) -> bytes | None:
             id_length = ndef_data[pos]
             pos += 1
 
+        if pos + type_length + id_length + payload_length > len(ndef_data):
+            return None
         record_type = ndef_data[pos : pos + type_length]
         pos += type_length
 
@@ -356,6 +364,28 @@ def decode_nfcv_memory(raw_bytes: bytes, nfc_tag_uid: bytes | None = None) -> Op
     if payload is None:
         raise ValueError("Could not find OpenPrintTag NDEF record in tag memory")
 
+    return decode_payload(payload, nfc_tag_uid)
+
+
+def _region_end(meta: dict, size_key: int, start: int, limit: int) -> int:
+    """Bound a section to its declared allocation and the next region/payload end."""
+    size = meta.get(size_key, limit - start)
+    if type(size) is not int or size <= 0 or start + size > limit:
+        raise ValueError("Invalid region size in OpenPrintTag meta section")
+    return start + size
+
+
+def decode_payload(payload: bytes, nfc_tag_uid: bytes | None = None) -> OpenPrintTagData:
+    """Decode the CBOR payload of an application/vnd.openprinttag MIME record.
+
+    Mobile NDEF APIs expose this payload directly, without the capability container,
+    TLV or NDEF headers. Offsets remain relative to its beginning, exactly as on-tag.
+
+    Raises:
+        ValueError: If the meta or main section cannot be parsed.
+        TypeError: If a known field has an invalid value type.
+
+    """
     data = OpenPrintTagData(nfc_tag_uid=_spec_order_uid(nfc_tag_uid))
 
     # Parse meta section (first CBOR object in payload)
@@ -364,20 +394,23 @@ def decode_nfcv_memory(raw_bytes: bytes, nfc_tag_uid: bytes | None = None) -> Op
     main_offset = meta.get(META_MAIN_REGION_OFFSET, meta_size)
     aux_offset = meta.get(META_AUX_REGION_OFFSET)
 
-    if not isinstance(main_offset, int) or main_offset < 0:
+    if type(main_offset) is not int or not meta_size <= main_offset < len(payload):
         raise ValueError("Invalid main region offset in OpenPrintTag meta section")
-    if not isinstance(aux_offset, int) or aux_offset < 0:
+    if type(aux_offset) is not int or not meta_size <= aux_offset < len(payload):
         aux_offset = None  # the aux section is optional; a bad offset just means there isn't one
 
     # Parse main section
-    if main_offset < len(payload):
-        main_data, _ = _decode_cbor_map(payload[main_offset:])
-        _populate_main_fields(data, main_data)
+    main_end = aux_offset if aux_offset is not None and aux_offset > main_offset else len(payload)
+    main_end = _region_end(meta, META_MAIN_REGION_SIZE, main_offset, main_end)
+    main_data, _ = _decode_cbor_map(payload[main_offset:main_end])
+    _populate_main_fields(data, main_data)
 
     # Parse aux section if present
     if aux_offset is not None and aux_offset < len(payload):
         try:
-            aux_data, _ = _decode_cbor_map(payload[aux_offset:])
+            aux_end = main_offset if main_offset > aux_offset else len(payload)
+            aux_end = _region_end(meta, META_AUX_REGION_SIZE, aux_offset, aux_end)
+            aux_data, _ = _decode_cbor_map(payload[aux_offset:aux_end])
             if AUX_CONSUMED_WEIGHT in aux_data:
                 data.consumed_weight = _number(aux_data[AUX_CONSUMED_WEIGHT])
         except (TypeError, ValueError):

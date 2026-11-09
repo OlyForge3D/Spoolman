@@ -39,9 +39,8 @@ router = APIRouter(
 
 # ruff: noqa: D103
 
-# Tag contents are carried through untouched and never decoded, so the only thing worth
-# constraining is size: an unbounded payload is an unbounded websocket broadcast to every
-# subscriber, from an unauthenticated endpoint.
+# Raw contents are echoed unchanged even when decoding fails. Bound the payload before
+# decoding and websocket broadcast to every subscriber.
 PAYLOAD_MAX_LENGTH = 8192
 
 
@@ -110,7 +109,10 @@ class TagScanParameters(BaseModel):
         description=(
             "The tag's raw contents, base64-encoded, if the agent read them. Accepted and carried "
             "into the broadcast untouched. If `format` names a format Spoolman knows how to read, "
-            "it is also decoded server-side and returned in `decoded`."
+            "it is also decoded server-side and returned in `decoded`. For `openprinttag`, send "
+            "the CBOR payload of the application/vnd.openprinttag MIME record (as exposed by "
+            "CoreNFC), or a full NFC-V memory dump including capability container and NDEF TLV. "
+            "A serialized NDEF message alone and legacy JSON text are not supported payloads."
         ),
     )
     create: bool = Field(
