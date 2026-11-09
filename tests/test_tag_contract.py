@@ -1,6 +1,7 @@
 """HTTP tag contracts against a disposable, file-backed SQLite database."""
 
 import base64
+import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -13,6 +14,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from spoolman.api.v1 import filament, spool, tag
 from spoolman.database import models
 from spoolman.database.database import get_db_session
+from spoolman.tags import decode as tag_decode
 
 UID = "E0040108662F6FBC"
 
@@ -215,3 +217,57 @@ async def test_malformed_record_after_opt_cannot_create_inventory(tmp_path: Path
         assert response.json()["matched_filament_id"] == filament_id
         assert response.json()["created"] is False
         assert "decoded" not in response.json()
+
+
+@pytest.mark.asyncio
+async def test_actual_swift_writer_payload_through_codec_and_scan(tmp_path: Path):
+    fixture = json.loads((Path(__file__).parent / "fixtures/openprinttag/printfarmer_swift_pla.json").read_text())
+    raw = bytes.fromhex(fixture["payload_hex"])
+    assert base64.b64decode(fixture["payload_b64"], validate=True) == raw
+    decoded = tag_decode.decode("openprinttag", raw, bytes.fromhex(fixture["uid"]))
+    assert decoded is not None
+    for field, value in fixture["decoded"].items():
+        assert getattr(decoded, field) == value
+    assert decoded.weight is None  # The writer provides actual, not nominal, weight.
+
+    path = tmp_path / "swift-tags.db"
+    body = {"uid": fixture["uid"], "format": "openprinttag", "payload_b64": fixture["payload_b64"]}
+    async with tag_client(path) as client:
+        plain = await client.post("/api/v1/tag/scan", json=body)
+        assert plain.status_code == 200
+        assert plain.json()["decoded"] == fixture["decoded"]
+        assert plain.json()["matched_spool_id"] is None
+        assert plain.json()["created"] is False
+        assert (await client.get("/api/v1/spool")).json() == []
+        assert (await client.get("/api/v1/filament")).json() == []
+
+        created = await client.post("/api/v1/tag/scan", json={**body, "create": True})
+        assert created.status_code == 200
+        assert created.json()["created"] is True
+        spool_id = created.json()["matched_spool_id"]
+        spool_data = created.json()["spool"]
+        assert spool_data["initial_weight"] == 1000
+        assert spool_data["spool_weight"] == 200
+        assert spool_data["filament"]["material"] == "PLA"
+        assert spool_data["filament"]["color_hex"] == "FF0000"
+        assert spool_data["filament"]["density"] == 1.24
+        assert spool_data["filament"]["diameter"] == 1.75
+        assert spool_data["filament"].get("weight") is None
+
+    async with tag_client(path) as client:
+        # A conflicting payload enriches the response, not the authoritative linked row.
+        original = (await client.get(f"/api/v1/spool/{spool_id}")).json()
+        enriched = await client.post(
+            "/api/v1/tag/scan",
+            json={**body, "create": True, "payload_b64": base64.b64encode(official_payload()).decode()},
+        )
+        assert enriched.status_code == 200
+        assert enriched.json()["matched_spool_id"] == spool_id
+        assert enriched.json()["created"] is False
+        assert enriched.json()["decoded"]["name"] == "PLA Prusa Galaxy Black"
+        assert (await client.get(f"/api/v1/spool/{spool_id}")).json() == original
+        again = await client.post("/api/v1/tag/scan", json={**body, "create": True})
+        assert again.json()["matched_spool_id"] == spool_id
+        assert again.json()["created"] is False
+        assert (await client.get("/api/v1/spool")).headers["x-total-count"] == "1"
+        assert (await client.get("/api/v1/filament")).headers["x-total-count"] == "1"
