@@ -39,9 +39,8 @@ router = APIRouter(
 
 # ruff: noqa: D103
 
-# Tag contents are carried through untouched and never decoded, so the only thing worth
-# constraining is size: an unbounded payload is an unbounded websocket broadcast to every
-# subscriber, from an unauthenticated endpoint.
+# Raw contents are echoed unchanged even when decoding fails. Bound the payload before
+# decoding and websocket broadcast to every subscriber.
 PAYLOAD_MAX_LENGTH = 8192
 
 
@@ -52,9 +51,9 @@ class TagLinkParameters(BaseModel):
         min_length=1,
         max_length=UID_MAX_LENGTH * 2,  # room for separators; the normalized UID is what must fit
         description=(
-            "The tag's hardware UID, in whatever shape the reader reports it. Separators (:, -, _, "
-            "spaces) are stripped and the result is uppercased before storing, so every spelling of "
-            "one physical tag resolves to the same tag."
+            "The tag's hardware UID. Separators (:, -, _, spaces) are stripped and the result is "
+            "uppercased. Byte order is preserved: ISO15693 readers must send the 8-byte UID in "
+            "MSB-first order (E0 first), consistently for scan, link and unlink."
         ),
         examples=["04:a2:b3:c4:d5:e6:f7", "04A2B3C4D5E6F7"],
     )
@@ -74,7 +73,8 @@ class TagScanParameters(BaseModel):
         min_length=1,
         max_length=UID_MAX_LENGTH * 2,  # room for separators; the normalized UID is what must fit
         description=(
-            "The scanned tag's UID, case insensitive. Separators can be included if desired but are not necessary."
+            "The scanned tag's UID, case insensitive; separators are optional. Byte order is "
+            "preserved. ISO15693 readers must send the 8-byte UID MSB first (E0 first)."
         ),
         examples=["04-A2-B3-C4-D5-E6-F7", "04a2b3c4d5e6f7"],
     )
@@ -109,7 +109,10 @@ class TagScanParameters(BaseModel):
         description=(
             "The tag's raw contents, base64-encoded, if the agent read them. Accepted and carried "
             "into the broadcast untouched. If `format` names a format Spoolman knows how to read, "
-            "it is also decoded server-side and returned in `decoded`."
+            "it is also decoded server-side and returned in `decoded`. For `openprinttag`, send "
+            "the CBOR payload of the application/vnd.openprinttag MIME record (as exposed by "
+            "CoreNFC), or a full NFC-V memory dump including capability container and NDEF TLV. "
+            "A serialized NDEF message alone and legacy JSON text are not supported payloads."
         ),
     )
     create: bool = Field(

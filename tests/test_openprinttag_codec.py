@@ -36,6 +36,7 @@ from spoolman.tags.openprinttag import (
     _decode_cbor_map,
     _parse_ndef_records,
     decode_nfcv_memory,
+    decode_payload,
     uuid5_bytes,
 )
 
@@ -494,3 +495,150 @@ def test_uid_reported_with_e0_last_is_read_in_specification_order() -> None:
     data = decode_nfcv_memory(raw, nfc_tag_uid=reader_order)
 
     assert data.effective_instance_uuid == str(uuid5_bytes(UUID_NS_INSTANCE, spec_order))
+
+
+def test_official_mime_payload_matches_full_memory_decode() -> None:
+    """The official 01_data.bin MIME record starts at 35, with its payload at 66."""
+    raw = (_FIXTURES_DIR / "prusa_test01_data.bin").read_bytes()
+    assert raw[35:38] == bytes.fromhex("521cf5")
+    assert raw[38:66] == b"application/vnd.openprinttag"
+    payload = raw[66:311]
+    uid = bytes.fromhex("E0040108662F6FBC")
+    assert decode_payload(payload, uid) == decode_nfcv_memory(raw, uid)
+    decoded = tags_decode.decode("OpenPrintTag", payload, uid)
+    assert decoded is not None
+    assert decoded.name == "PLA Prusa Galaxy Black"
+    assert decoded.instance_uuid == "bf63e92d-9ca5-53d7-9fab-ffdd0240c585"
+
+
+@pytest.mark.parametrize("offset", [True, False, -1, 0, 1, 1000, "4"])
+def test_main_offset_cannot_point_inside_meta_or_outside_payload(offset: object) -> None:
+    payload = cbor2.dumps({0: offset}) + cbor2.dumps({8: 0, 9: 0})
+    assert tags_decode.decode("openprinttag", payload) is None
+
+
+@pytest.mark.parametrize("payload", [b"\xa0", b"\xa0\xa1\x08", b'{"format":"OpenPrintTag"}'])
+def test_missing_or_malformed_main_section_cannot_decode(payload: bytes) -> None:
+    assert tags_decode.decode("openprinttag", payload) is None
+
+
+def test_aux_before_main_and_leftover_region_padding_are_supported() -> None:
+    # Explicit offsets are relative to the MIME payload, not the NDEF message.
+    meta = cbor2.dumps({0: 32, 2: 16})
+    aux = bytes.fromhex("bf00187bff")  # indefinite map {0: 123}
+    payload = meta.ljust(16, b"\x00") + aux.ljust(16, b"\xff") + cbor2.dumps({11: "Brand", 8: 0, 9: 0})
+    data = decode_payload(payload)
+    assert data.brand_name == "Brand"
+    assert data.consumed_weight == 123
+
+
+def test_truncated_main_cannot_consume_aux_bytes() -> None:
+    meta = cbor2.dumps({2: 8})
+    payload = meta + bytes.fromhex("a208000b64") + cbor2.dumps({0: 123})
+    assert len(meta) == 3
+    assert tags_decode.decode("openprinttag", payload) is None
+
+
+@pytest.mark.parametrize("size", [True, -1, 0, 1, 1000, "4"])
+def test_declared_main_region_size_bounds_cbor(size: object) -> None:
+    payload = cbor2.dumps({1: size}) + cbor2.dumps({8: 0, 9: 0})
+    assert tags_decode.decode("openprinttag", payload) is None
+
+
+@pytest.mark.parametrize("corruption", ["chunked", "record-length", "tlv-length"])
+def test_invalid_ndef_framing_is_not_decoded(corruption: str) -> None:
+    raw = bytearray(_build_tag({8: 0, 9: 0}))
+    if corruption == "chunked":
+        raw[6] |= 0x20
+    elif corruption == "record-length":
+        raw[8] += 10
+    else:
+        raw[5] += 10
+    assert tags_decode.decode("openprinttag", bytes(raw)) is None
+
+
+def test_unrelated_chunked_record_can_precede_openprinttag() -> None:
+    # First chunk: MB+CF+SR, MIME text/plain. Final chunk: SR, TNF unchanged.
+    unrelated = b"\xb2\x0a\x02text/plainab\x16\x00\x02cd"
+    payload = _cbor_payload({8: 0, 9: 0, 11: "Brand"})
+    opt_record = bytes([0x52, 28, len(payload)]) + b"application/vnd.openprinttag" + payload
+    data = decode_nfcv_memory(_nfcv_memory(unrelated + opt_record))
+    assert data.brand_name == "Brand"
+    assert data.material_type == "PLA"
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        b"\xb2\x0a\x02text/plainab",  # no continuation before OPT
+        b"\x16\x00\x02cd",  # continuation without a first chunk
+        b"\xb2\x0a\x02text/plainab\x16\x01\x02Tcd",  # continuation has a type
+        b"\xb2\x0a\x02text/plainab\x96\x00\x02cd",  # continuation starts a message
+        b"\xf2\x0a\x02text/plainab",  # CF and ME together
+    ],
+)
+def test_malformed_chunk_sequence_cannot_hide_openprinttag(prefix: bytes) -> None:
+    payload = _cbor_payload({8: 0, 9: 0})
+    record = bytes([0x52, 28, len(payload)]) + b"application/vnd.openprinttag" + payload
+    assert tags_decode.decode("openprinttag", _nfcv_memory(prefix + record)) is None
+
+
+def test_overlapping_main_aux_offsets_are_refused() -> None:
+    meta = cbor2.dumps({0: 16, 2: 16})
+    payload = meta.ljust(16, b"\x00") + cbor2.dumps({8: 0, 9: 0})
+    assert tags_decode.decode("openprinttag", payload) is None
+
+
+@pytest.mark.parametrize("meta", [b"\xa0", b"\xbf\xff"])
+def test_unsorted_indefinite_maps_skip_unknown_fields(meta: bytes) -> None:
+    # Main: {11:"Brand", 999:["a",1], 9:0, 8:0, 10:"Test"}, noncanonical order.
+    main = bytes.fromhex("bf0b654272616e641903e79f616101ff090008000a6454657374ff")
+    data = decode_payload(meta + main + b"\x00\xff")
+    assert data.brand_name == "Brand"
+    assert data.material_name == "Test"
+    assert data.material_class == "FFF"
+    assert data.material_type == "PLA"
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        b"",  # missing final ME
+        b"\x52",  # truncated record
+        b"\x32\x0a\x02text/plainab",  # unterminated unrelated chunk
+        b"\x56\x00\x02cd",  # continuation without a first chunk
+        b"\x32\x0a\x02text/plainab\x56\x01\x02Tcd",  # type on final continuation
+        b"\x32\x0a\x02text/plainab\x16\x00\x02cd",  # final chunk lacks ME
+        b"\xd1\x01\x02Tab",  # MB set on a subsequent record
+        b"\x57\x00\x00",  # reserved TNF
+        b"\x50\x01\x00T",  # empty TNF with type
+        b"\x50\x00\x01x",  # empty TNF with payload
+        b"\x58\x00\x00\x01x",  # empty TNF with ID
+        b"\x55\x01\x00T",  # unknown TNF with type
+        b"\x51\x00\x00",  # well-known TNF without type
+        b"\x52\x00\x00",  # media TNF without type
+    ],
+)
+def test_malformed_records_after_opt_prevent_enrichment(tail: bytes) -> None:
+    payload = _cbor_payload({8: 0, 9: 0})
+    record = bytes([0x92, 28, len(payload)]) + b"application/vnd.openprinttag" + payload
+    assert tags_decode.decode("openprinttag", _nfcv_memory(record + tail)) is None
+
+
+def test_valid_chunked_record_after_opt_is_supported() -> None:
+    payload = _cbor_payload({8: 0, 9: 0, 11: "Brand"})
+    record = bytes([0x92, 28, len(payload)]) + b"application/vnd.openprinttag" + payload
+    tail = b"\x32\x0a\x02text/plainab\x56\x00\x02cd"
+    assert decode_nfcv_memory(_nfcv_memory(record + tail)).brand_name == "Brand"
+
+
+def test_bytes_after_message_end_are_rejected() -> None:
+    record = _ndef_short_record("application/vnd.openprinttag", _cbor_payload({8: 0, 9: 0}))
+    assert tags_decode.decode("openprinttag", _nfcv_memory(record + b"\x00")) is None
+
+
+@pytest.mark.parametrize("tail", [b"\x50\x00\x00", b"\x55\x00\x02ab"])
+def test_valid_empty_and_unknown_records_after_opt_are_supported(tail: bytes) -> None:
+    payload = _cbor_payload({8: 0, 9: 0, 11: "Brand"})
+    record = bytes([0x92, 28, len(payload)]) + b"application/vnd.openprinttag" + payload
+    assert decode_nfcv_memory(_nfcv_memory(record + tail)).brand_name == "Brand"

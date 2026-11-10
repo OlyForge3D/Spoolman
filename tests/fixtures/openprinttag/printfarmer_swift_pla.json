@@ -1,0 +1,18 @@
+{
+  "source": "PrintFarmer Swift NFCTagParser.createOpenPrintTagPayload and golden-byte XCTest",
+  "spec_commit": "060e420892d66c062c8af440c97701aab96bac79",
+  "uid": "E0040108662F6FBC",
+  "mime": "application/vnd.openprinttag",
+  "payload_hex": "A0A6080009000A63504C4111FB408F40000000000012FB40690000000000001343FF0000",
+  "payload_b64": "oKYIAAkACmNQTEER+0CPQAAAAAAAEvtAaQAAAAAAABND/wAA",
+  "decoded": {
+    "material_class": "FFF",
+    "material": "PLA",
+    "name": "PLA",
+    "color_hex": "ff0000",
+    "diameter": 1.75,
+    "initial_weight": 1000.0,
+    "spool_weight": 200.0,
+    "instance_uuid": "bf63e92d-9ca5-53d7-9fab-ffdd0240c585"
+  }
+}

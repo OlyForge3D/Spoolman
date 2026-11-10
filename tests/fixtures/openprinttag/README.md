@@ -13,3 +13,36 @@ builders produce.
   companion `01_info.yaml`/`01_input.yaml` are the ground truth the matching unit tests
   assert against (declared `tag_uid: E0040108662F6FBC`, expected field values, and
   spec-derived UUIDs from that repo's `utils/opt_check.py`).
+
+The interoperability contract is pinned to official source commit
+[`060e420892d66c062c8af440c97701aab96bac79`](https://github.com/OpenPrintTag/openprinttag-specification/tree/060e420892d66c062c8af440c97701aab96bac79);
+the format has no on-wire version field. In `prusa_test01_data.bin`, offsets 35..37
+are the final MIME record header `52 1c f5`, offsets 38..65 are the MIME type,
+and offsets 66..310 are its 245-byte CBOR payload. Tests extract these fixed offsets
+independently of Spoolman's NDEF parser to verify the mobile payload-only transport.
+
+The pinned official `utils/rec_info.py --show-data --opt-check --tag-uid E0040108662F6FBC`
+also validates `prusa_test01_data.bin`: both `validate.errors` and `opt_check.errors` are
+empty, and its derived instance UUID is `bf63e92d-9ca5-53d7-9fab-ffdd0240c585`.
+Only the recommended `nominal_full_length` and `actual_full_length` fields are absent.
+
+## Swift writer interoperability fixture
+
+`printfarmer_swift_pla.json` contains the exact bytes supplied by PrintFarmer's Swift
+`NFCTagParser.createOpenPrintTagPayload` and its golden-byte XCTest, not bytes generated
+by Spoolman's tests. The corrected base64 is asserted against the supplied hex.
+The MIME payload has an empty meta map and main fields
+`{8: 0, 9: 0, 10: "PLA", 17: 1000.0, 18: 200.0, 19: h'FF0000'}`.
+
+`test_actual_swift_writer_payload_through_codec_and_scan` exercises those bytes through
+Spoolman's actual codec and HTTP routes, including read-only enrichment, explicit creation,
+database reopen, repeated creation requests and conflicting enrichment of an existing link.
+Actual full weight becomes the spool's initial weight; nominal filament weight is absent.
+The decoded color is `ff0000`, while the persisted filament's standard color normalization
+returns `FF0000`.
+
+The pinned official reference reader also accepts these exact bytes with
+`rec_info.py --unhex --config-file data/config_noroot.yaml --show-data --opt-check --tag-uid E0040108662F6FBC`:
+both validation/error lists are empty and the derived instance UUID matches the fixture.
+It warns about absent recommended fields, absent optional aux region, and underivable
+brand/material/package UUIDs. These are software fixtures, not a physical NFC capture.

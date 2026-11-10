@@ -61,7 +61,9 @@ def normalize_uid(uid: str) -> str:
     """Normalize a tag UID to its canonical form: uppercase hex, no separators.
 
     Accepts any separator style and any case, plus an optional ``0x`` prefix, so a
-    reader-side agent never has to care which shape its NFC library produces.
+    reader-side agent never has to care which spelling its NFC library produces.
+    Byte order is preserved, not inferred. ISO15693 callers must use MSB-first order
+    (eight bytes, E0 first) consistently for scan, link and unlink.
 
     Args:
         uid: The UID as reported by a reader, e.g. ``04:a2:b3:c4``, ``04-A2-B3-C4`` or
